@@ -120,7 +120,8 @@ def run_qa_pipeline(model_name: str, filter_inputs=True, single_input=True, samp
     # MARK: define head mask here
     head_mask = np.ones(ATT_SIZE[:2])
     head_mask[0][9], head_mask[0][11], head_mask[1][2], head_mask[7][8] = 0, 0, 0, 0
-    
+    head_mask = None
+
     res, pipeline_running_counter, fed_data_len = None, 0, len(fed_data)
     total_elem_count = 0
     print("Among all inputs {}/{} are selected.".format(fed_data_len, len(associated_data)))
@@ -307,8 +308,11 @@ def get_sparsities(params_path: str, sparsity_bar=0.025, layer_aggregration='mea
                 sparsity_table.at[threshold, 'layer_{}_head_{}'.format(
                     layer_idx, head_idx)] = spars_per_head
 
-        sparsity_table.at[threshold, 'all'] = np.mean(all_sparsity.flatten())
+        sparsity_table.at[threshold, 'all'] = np.mean([all_sparsity[0][9], all_sparsity[0][11], all_sparsity[1][2], all_sparsity[7][8]])
         sparsity_table.at[threshold, 'em'] = total_score / qa_pair_count
+
+        with open("head_sparsity.csv", "w+", newline='') as f:
+            f.write(sparsity_table.to_string())
 
     return sparsity_table
 
@@ -748,10 +752,10 @@ if __name__ == '__main__':
     if args['sparsity']:
         # compute sparsity, temperarily broken
         stat_filtered_spars = get_sparsities('filtered_params/static')
-        dyna_filtered_spars = get_sparsities('filtered_params/dyna')
+        dyna_filtered_spars = get_sparsities('filtered_params/useless_heads')
         print(stat_filtered_spars, dyna_filtered_spars)
         plot_em_sparsity({'static': stat_filtered_spars, 'dynamic': dyna_filtered_spars})
-        plot_sparsity_change(stat_filtered_spars, attached_title='(dynamic threshold)')
+        plot_sparsity_change(dyna_filtered_spars, attached_title='')
 
     if args['otf_distribution']:
         plot_dist_token_dynamic("csarron/roberta-base-squad-v1", 100, sparsity_bar=0.0, att_threshold=att_threshold, samples=samples, scale='log', attached_title='(per_token)')
