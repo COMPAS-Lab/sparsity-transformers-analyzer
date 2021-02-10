@@ -191,7 +191,7 @@ def plot_heatmap(data, sparsity_bar=0.025, auto_scale=False, binarize=True, laye
         plt.close(fig)
 
 
-def plot_atten_dist_per_token(data, bin_step, attn_max=None, attn_min=None, sparse_hist=None, scale='log', attached_title='', model_name='', ylim=(0.2, 1)):
+def plot_atten_dist_per_token(data, bin_step, attn_max=None, attn_min=None, sparse_hist=None, scale='log', attached_fname='', model_name='', ylim=(0.2, 1)):
     """
     plotting the attention histogram per token, stacking all plots together.
     accepted data: a list of attention matrices, with each as [layer, head, length, length]
@@ -201,7 +201,8 @@ def plot_atten_dist_per_token(data, bin_step, attn_max=None, attn_min=None, spar
     attn_max and attn_min are not required when data is a list of matrice
     """
     offset = 1e-8
-    hist_x_start, hist_x_end = log(offset, 10), log(1, 10)
+    hist_x_start, hist_x_end = log(offset, 10), log(10, 10)
+    # hist_x_start, hist_x_end = -10, 10
     if scale == 'linear':
         offset = 0.0
 
@@ -210,7 +211,7 @@ def plot_atten_dist_per_token(data, bin_step, attn_max=None, attn_min=None, spar
     if type(data) is list:
         for inst in data:
             inst_attn_hist = np.apply_along_axis(
-                lambda x: np.histogram(x + offset, attn_bins, range=(0.0, 1.0))[0], -1,  inst)
+                lambda x: np.histogram(x + offset, attn_bins)[0], -1,  inst)
             inst_attn_max, inst_attn_min = \
                 np.amax(inst, axis=(-2, -1)), np.amin(inst, axis=(-2, -1))
 
@@ -231,7 +232,7 @@ def plot_atten_dist_per_token(data, bin_step, attn_max=None, attn_min=None, spar
     
     for layer_idx, layer in enumerate(attn_hists):
         print("plotting layer {}...".format(layer_idx))
-        for head_idx, head in enumerate(layer):
+        for head_idx, head in tqdm(enumerate(layer)):
             fig = plt.figure()
             gs = gridspec.GridSpec(nrows=1, ncols=2, width_ratios=[8.5, 1.5], figure=fig)
             curr_ax = fig.add_subplot(gs[0, 0])
@@ -280,13 +281,13 @@ def plot_atten_dist_per_token(data, bin_step, attn_max=None, attn_min=None, spar
             if scale == 'log':
                 curr_ax.set_xlim([10 ** hist_x_start - 10 ** (hist_x_start-1), 1])
             else:
-                curr_ax.set_xlim([0, 0.02])
+                curr_ax.set_xlim([hist_x_start, hist_x_end])
 
-            fig.suptitle("Histogram for layer {} head {}(per token){}".format(
-                layer_idx, head_idx, attached_title), fontsize=16, y=0.93)
+            fig.suptitle("Histogram for layer {} head {}(per token)".format(
+                layer_idx, head_idx), fontsize=16, y=0.93)
             fig.tight_layout(pad=1.5)
             plt.savefig(
-                RES_FIG_PATH+'at_hist_per_token_layer_{}_head_{}.png'.format(layer_idx, head_idx), dpi=160)
+                RES_FIG_PATH+'at_hist_per_token_layer_{}_head_{}_{}.png'.format(layer_idx, head_idx, attached_fname), dpi=160)
             plt.clf()
             plt.close(fig)
 
