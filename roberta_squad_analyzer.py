@@ -158,11 +158,12 @@ def run_qa_pipeline(model_name: str, filter_inputs=True, single_input=True, samp
             res['mean'] = np.concatenate((res['mean'], agg_func(np.mean)), axis=0)
             res['std'] = np.concatenate((res['std'], agg_func(np.std)), axis=0)
             res['sparsity'] = np.add(res['sparsity'], add_func(get_spars))
-            res['q'] += q_prbs
-            res['k'] += k_prbs
-            res['v'] += v_prbs
-            res['scrs'] += scrs_prbs
-            res['att_out'] += att_out_prbs
+            if sample_inputs > 0:
+                res['q'] += q_prbs
+                res['k'] += k_prbs
+                res['v'] += v_prbs
+                res['scrs'] += scrs_prbs
+                res['att_out'] += att_out_prbs
 
         # collect attentions
         if sample_inputs > 0:
