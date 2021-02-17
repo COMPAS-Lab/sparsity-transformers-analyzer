@@ -8,3 +8,11 @@ for bit_wid in "${bit_lst[@]}"; do
     tar -cvf params_all_${bit_wid}.tar.gz params/*_all.npy
     rm params/*_all.npy
 done
+
+declare -a thres_lst=("1" "01" "005" "001" "0008" "0004" "0002" "0001")
+for thres in "${thres_lst[@]}"; do
+    python -W ignore roberta_base_analyzer.py -e -at 0.${thres}
+    # python -W ignore roberta_sst2_analyzer.py -e -aq ${bit_wid}.0
+    tar -cvf params_all_0_${thres}.tar.gz params/*_all.npy
+    rm params/*_all.npy
+done

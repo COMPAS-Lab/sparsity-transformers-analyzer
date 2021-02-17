@@ -21,7 +21,7 @@ import random
 import functools
 import operator
 from subprocess import call
-from math import isnan, fsum, log
+from math import isnan, fsum, log, exp
 from textwrap import wrap
 import urllib.request
 import json
@@ -158,11 +158,11 @@ def run_qa_pipeline(model_name: str, filter_inputs=True, single_input=True, samp
             res['mean'] = np.concatenate((res['mean'], agg_func(np.mean)), axis=0)
             res['std'] = np.concatenate((res['std'], agg_func(np.std)), axis=0)
             res['sparsity'] = np.add(res['sparsity'], add_func(get_spars))
-            # res['q'] += q_prbs
-            # res['k'] += k_prbs
-            # res['v'] += v_prbs
-            # res['scrs'] += scrs_prbs
-            # res['att_out'] += att_out_prbs
+            res['q'] += q_prbs
+            res['k'] += k_prbs
+            res['v'] += v_prbs
+            res['scrs'] += scrs_prbs
+            res['att_out'] += att_out_prbs
 
         # collect attentions
         if sample_inputs > 0:
@@ -243,16 +243,16 @@ def get_hstates_attens(model_name: str, force_reinfer=False, filter_inputs=True,
             all_mean = np.load(att_stat_file)
             all_std = np.load(att_stat_file)
             all_sparsity = np.load(att_stat_file)
-        # with open(q_path, 'rb') as q_file: 
-        #     for i in range(atten_len): q.append(np.load(q_file))
-        # with open(k_path, 'rb') as k_file: 
-        #     for i in range(atten_len): k.append(np.load(k_file))
-        # with open(v_path, 'rb') as v_file: 
-        #     for i in range(atten_len): v.append(np.load(v_file))
-        # with open(scrs_path, 'rb') as scrs_file: 
-        #     for i in range(atten_len): scrs.append(np.load(scrs_file))
-        # with open(att_out_path, 'rb') as att_out_file: 
-        #     for i in range(atten_len): att_out.append(np.load(att_out_file))
+        with open(q_path, 'rb') as q_file: 
+            for i in range(atten_len): q.append(np.load(q_file))
+        with open(k_path, 'rb') as k_file: 
+            for i in range(atten_len): k.append(np.load(k_file))
+        with open(v_path, 'rb') as v_file: 
+            for i in range(atten_len): v.append(np.load(v_file))
+        with open(scrs_path, 'rb') as scrs_file: 
+            for i in range(atten_len): scrs.append(np.load(scrs_file))
+        with open(att_out_path, 'rb') as att_out_file: 
+            for i in range(atten_len): att_out.append(np.load(att_out_file))
             
     # extract parameters from model
     else:
@@ -638,29 +638,30 @@ def plot_dist_token_dynamic(model_name, bin_step, sparsity_bar=0.025, att_thresh
     #         plt.close(fig)
 
 
-def plot_sparsity_change(data, attached_title=''):
+def plot_sparsity_change(data, per_layer_analysis=False, attached_title=''):
     '''
     plot sparsity change for different sparsity dropout threshold
     '''
     att_threshold = [float(i) for i in data.index.tolist()]
-    for layer_idx in range(0, 12):
-        print('plotting curve for sparsities...')
-        fig, ax = plt.subplots(3, 4, figsize=(21, 12))
-        for head_idx in range(0, 12):
-            curr_ax = ax[int(head_idx/4), int(head_idx % 4)]
-            curr_ax.plot(att_threshold, data['layer_{}_head_{}'.format(
-                layer_idx, head_idx)].tolist(), color='C0', marker='s')
-            curr_ax.set_title('head {}'.format(head_idx))
-            curr_ax.grid(linestyle='--', color='grey', alpha=0.6)
-            curr_ax.set_ylim([0.0, 1.01])
-            curr_ax.set_xlim(0.0, max(att_threshold)+0.01)
+    if per_layer_analysis:
+        for layer_idx in range(0, 12):
+            print('plotting curve for sparsities...')
+            fig, ax = plt.subplots(3, 4, figsize=(21, 12))
+            for head_idx in range(0, 12):
+                curr_ax = ax[int(head_idx/4), int(head_idx % 4)]
+                curr_ax.plot(att_threshold, data['layer_{}_head_{}'.format(
+                    layer_idx, head_idx)].tolist(), color='C0', marker='s')
+                curr_ax.set_title('head {}'.format(head_idx))
+                curr_ax.grid(linestyle='--', color='grey', alpha=0.6)
+                curr_ax.set_ylim([0.0, 1.01])
+                curr_ax.set_xlim(0.0, max(att_threshold)+0.01)
 
-        fig.suptitle('Sparsity for Different Thresholds for Layer {} {}'.format(
-            layer_idx, attached_title), fontsize=21, y=0.99)
-        fig.tight_layout()
-        plt.savefig(RES_FIG_PATH+'spars_change_layer{}.png'.format(layer_idx), dpi=600)
-        plt.clf()
-        plt.close(fig)
+            fig.suptitle('Sparsity for Different Thresholds for Layer {} {}'.format(
+                layer_idx, attached_title), fontsize=21, y=0.99)
+            fig.tight_layout()
+            plt.savefig(RES_FIG_PATH+'spars_change_layer{}.png'.format(layer_idx), dpi=600)
+            plt.clf()
+            plt.close(fig)
 
     # plot sparsity/accu vs threshold
     fig, ax1 = plt.subplots()
@@ -683,13 +684,13 @@ def plot_sparsity_change(data, attached_title=''):
     ax2.set_ylim([20, 110])
 
     ax2.set_xscale('linear')
-    ax2.set_xlim([0, 1.2])
+    ax2.set_xlim([-0.0001, 0.006])
     fig.suptitle(
         'Sparsity and Accuracy vs. Sparsity Dropping Threshold {}'.format(attached_title))
     fig.tight_layout()
     plt.grid(linestyle='--', alpha=0.5, color='grey')
     plt.legend(handles=patches, loc='upper left')
-    plt.savefig(RES_FIG_PATH+'sparse_accu.png', dpi=600)
+    plt.savefig(RES_FIG_PATH+'sparse_accu.pdf')
     plt.close(fig)
 
 
@@ -728,7 +729,7 @@ def plot_em_sparsity(sparsity_data: dict, second_axis_data={}, attached_title=''
     fig.tight_layout()
     plt.legend(handles=patches, loc='lower left', **kwargs)
     plt.grid(linestyle='--', alpha=0.5, color='grey')
-    plt.savefig(RES_FIG_PATH+'perplexity_vs_sparsity{}.pdf'.format(append_to_fname))
+    plt.savefig(RES_FIG_PATH+'perf_vs_sparsity{}.pdf'.format(append_to_fname))
     plt.close(fig)
 
 def plot_em_sparsity_error_rate(sparsity_data: dict, attached_title='', append_to_fname='', **kwargs):
@@ -820,7 +821,7 @@ if __name__ == '__main__':
 
     if args['evaluation']:
         em_score, h_states, attens, att_max, att_min, att_mean, att_std, att_sparsity, _, _, _, _, _ = \
-            get_hstates_attens(model_name, filter_inputs=False, force_reinfer=False,
+            get_hstates_attens(model_name, filter_inputs=False, force_reinfer=True,
                                single_input=False, layer_aggregration='mean', att_threshold=att_threshold, hs_threshold=hs_threshold, sample_inputs=samples, att_quant_bits=att_quant_bits, hstate_quant_bits=hstate_quant_bits)
         em_str = 'EM={:.2f}'.format(em_score*100)
 
@@ -836,8 +837,8 @@ if __name__ == '__main__':
         stat_features.to_csv('stat_features_unfiltered.csv', sep=',')
 
         # plot histogram for all layers and all heads
-        plot_dist(attens, bin_step=100, sparsity_bar=0.0005,
-                  layer_aggregration='None', attached_title=em_str)
+        # plot_dist(attens, bin_step=100, sparsity_bar=0.0005,
+        #           layer_aggregration='None', attached_title=em_str)
         # # plot histogram for a certain head in a certain layer
         # plot_dist(attens, bin_step=200, sparsity_bar=0.0005,
         #           single_head_idx=(0, 0), attached_title=em_str)
@@ -851,6 +852,13 @@ if __name__ == '__main__':
         # tv.plot_pipeline_features(v, 'v_out')
         # tv.plot_pipeline_features(scrs, 'scrs_out')
         # tv.plot_pipeline_features(att_out, 'att_out')
+
+        scrs_summax = np.concatenate([np.sum(np.exp(scr - np.amax(scr, axis=-1, keepdims=True)), axis=-1) for scr in scrs], axis=-1)
+        scrs_meansum = np.mean(scrs_summax)
+        print("scrs_meansum: ", scrs_meansum)
+
+        # tv.plot_atten_dist_per_token(attens, 200, scale='log', attached_fname='attention', ylim=(0.2, 1))
+        # tv.plot_atten_dist_per_token(scrs, 400, scale='linear', attached_fname='scrs', ylim=(0.5, 1))
 
         effective_seq_len = [i.shape[-1] for i in attens]
         effective_h_states = [np.squeeze(h_states[:, i, :effective_seq_len[i], :]) for i in range(h_states.shape[1])]
@@ -883,7 +891,7 @@ if __name__ == '__main__':
                                         'RoBERTa SST-2': roberta_sa_spars, \
                                         'RoBERTa MLM': roberta_mlm_spars, \
                                         'BERT MLM': bert_mlm_spars}, append_to_fname='', fontsize=15)
-        # plot_sparsity_change(stat_filtered_spars, attached_title='')
+        plot_sparsity_change(roberta_squad_spars, attached_title='roberta_squad')
 
         print(tv.search_sparse_em_drop(roberta_squad_spars, 0.8))
         # print(tv.search_sparse_em_drop(roberta_mlm_spars, 0.8))
