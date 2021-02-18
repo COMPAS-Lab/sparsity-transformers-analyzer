@@ -783,6 +783,71 @@ def plot_stat_features(stat_features, features_to_plot=['max', 'min', 'std']):
     plt.close(fig)
 
 
+def max_profiling(model_name: str, activation_name: str, samples=-1, force_reinfer=False):
+    '''
+    profiling max value per head of one of the activations: scrs,
+    '''
+    qa_pipeline = pipeline(
+        "question-answering",
+        model=model_name,
+        tokenizer=model_name,
+        device=-1
+    )
+
+    profile_path = PARAM_PATH + "{}_profile.npy".format(activation_name)
+    res = None
+
+    if os.path.isfile(profile_path) and not force_reinfer:
+        print("loading profile from ", profile_path)
+        with open(profile_path, "rb") as profile_file:
+            res = np.load(profile_file)
+
+    else:
+        print("Running pipeline...")
+        data = parse_squad_json()
+        associated_data = []
+        for context in data.keys():
+            context_ques_pair = []
+            for ques in data[context]:
+                context_ques_pair.append(
+                    {'context': context, 'question': ques['question'], 'answers': ques['answers']})
+            associated_data.append(context_ques_pair)
+        
+        # fixed random seed to select same subsets of the instances every time for comparison
+        random.seed(123)
+        if samples > 0.0: 
+            associated_data = random.sample(sum(associated_data, []), samples)
+        else:
+            associated_data = sum(associated_data, [])
+        input_lens = [len(i['context']+i['question']) for i in associated_data]
+        print("QA string pair length: [{}, {}]".format(min(input_lens), max(input_lens)))
+        pipeline_running_counter, fed_data_len = 0, len(associated_data)
+
+        # MARK: define head mask here
+        head_mask = np.ones(ATT_SIZE[:2])
+        head_mask[0][9], head_mask[0][11], head_mask[1][2], head_mask[7][8] = 0, 0, 0, 0
+        head_mask = None
+
+        # run the prediction, calculate and store the hist
+        for qa_pair in associated_data:
+            print("running pipeline iter {}/{}...".format(pipeline_running_counter, fed_data_len))
+            prediction = qa_pipeline(
+                {'context': qa_pair['context'], 'question': qa_pair['question']}, max_seq_len=320, head_mask=head_mask)
+            pipeline_running_counter += 1
+            q_prbs, k_prbs, v_prbs, scrs_prbs, att_out_prbs = prediction['pipeline_prbs']
+            dat = {'q': q_prbs, 'k': k_prbs, 'v': v_prbs, 'scrs': scrs_prbs, 'att_out': att_out_prbs}
+            res = np.ones((ATT_SIZE[:2])) * float('-inf')
+            for i in dat[activation_name]:
+                temp = np.amax(i, axis=(-2, -1))
+                res = np.maximum(res, temp)
+
+        with open(profile_path, "wb+") as profile_file:
+                np.save(profile_file, res)
+
+    print('profiling result:', res)
+    return res
+        
+
 if __name__ == '__main__':
     model_name = 'csarron/roberta-base-squad-v1'
     # model_name = 'csarron/bert-base-uncased-squad-v1'
@@ -812,6 +877,8 @@ if __name__ == '__main__':
                             required=False, help="base for attention quantization")
     arg_parser.add_argument("-hq", "--hstate_quant_bits", default=0.0,
                             required=False, help="base for hidden states quantization")
+    arg_parser.add_argument("-p", "--profile", default=False, action='store_true',
+                            required=False, help='profile the max of a given activation')
 
     args = vars(arg_parser.parse_args())
     att_threshold = float(args['att_threshold'])
@@ -948,3 +1015,6 @@ if __name__ == '__main__':
                                                         'uniform-log-clamped-3-bit': quant_att_uniform_log_clamped, 
                                                     }, len(effective_attens))
         print(diver)
+
+    if args['profile']:
+        max_profiling(model_name, 'scrs', samples=samples, force_reinfer=True)
