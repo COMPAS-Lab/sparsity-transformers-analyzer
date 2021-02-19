@@ -685,7 +685,7 @@ def plot_sparsity_change(data, per_layer_analysis=False, attached_title=''):
     ax2.set_ylim([20, 110])
 
     ax2.set_xscale('linear')
-    ax2.set_xlim([-0.0001, 0.006])
+    ax2.set_xlim([-0.0001, 0.1])
     fig.suptitle(
         'Sparsity and Accuracy vs. Sparsity Dropping Threshold {}'.format(attached_title))
     fig.tight_layout()
@@ -836,10 +836,15 @@ def max_profiling(model_name: str, activation_name: str, samples=-1, force_reinf
             pipeline_running_counter += 1
             q_prbs, k_prbs, v_prbs, scrs_prbs, att_out_prbs = prediction['pipeline_prbs']
             dat = {'q': q_prbs, 'k': k_prbs, 'v': v_prbs, 'scrs': scrs_prbs, 'att_out': att_out_prbs}
-            res = np.ones((ATT_SIZE[:2])) * float('-inf')
+            res = []
             for i in dat[activation_name]:
-                temp = np.amax(i, axis=(-2, -1))
-                res = np.maximum(res, temp)
+                temp = np.amax(i, axis=-1)
+                res.append(temp)
+
+        res = np.concatenate(res, axis=-1)
+        res = np.mean(res, axis=-1)
+
+        print("shape: ", res.shape)
 
         with open(profile_path, "wb+") as profile_file:
                 np.save(profile_file, res)
@@ -960,6 +965,9 @@ if __name__ == '__main__':
                                         'RoBERTa MLM': roberta_mlm_spars, \
                                         'BERT MLM': bert_mlm_spars}, append_to_fname='', fontsize=15)
         plot_sparsity_change(roberta_squad_spars, attached_title='roberta_squad')
+
+        roberta_squad_softmax_spars = get_sparsities('filtered_params/roberta-base-squad-softmax-sweep', avg_score=True)
+        plot_sparsity_change(roberta_squad_softmax_spars, attached_title='(softmax)')
 
         print(tv.search_sparse_em_drop(roberta_squad_spars, 0.8))
         # print(tv.search_sparse_em_drop(roberta_mlm_spars, 0.8))
