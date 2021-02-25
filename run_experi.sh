@@ -16,3 +16,10 @@ for thres in "${thres_lst[@]}"; do
     tar -cvf params_all_0_${thres}.tar.gz params/*_all.npy
     rm params/*_all.npy
 done
+
+for i in $(seq 0 10); do
+    yes | cp -rf params/maxscrs_profile_$i.npy params/maxscrs_profile.npy
+    python -W ignore roberta_squad_analyzer.py -e
+    tar -cvf params_all_${i}.tar.gz params/*_all.npy
+    rm params/*_all.npy
+done

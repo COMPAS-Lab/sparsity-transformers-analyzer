@@ -102,6 +102,8 @@ def run_qa_pipeline(model_name: str, filter_inputs=True, single_input=True, samp
         associated_data.append(context_ques_pair)
 
     associated_data = sum(associated_data, [])
+    # use latter 90% of the data for evaluation
+    associated_data = associated_data[int(len(associated_data)*0.1):]
     input_lens = [len(i['context']+i['question']) for i in associated_data]
     print("QA string pair length: [{}, {}]".format(min(input_lens), max(input_lens)))
 
@@ -791,16 +793,17 @@ def max_profiling(model_name: str, activation_name: str, samples=-1, force_reinf
         "question-answering",
         model=model_name,
         tokenizer=model_name,
-        device=-1
+        device=0
     )
 
     profile_path = PARAM_PATH + "{}_profile.npy".format(activation_name)
-    res = None
+    mean_res, max_res = None, None
 
     if os.path.isfile(profile_path) and not force_reinfer:
         print("loading profile from ", profile_path)
         with open(profile_path, "rb") as profile_file:
-            res = np.load(profile_file)
+            mean_res = np.load(profile_file)
+            max_res = np.load(profile_file)
 
     else:
         print("Running pipeline...")
@@ -814,8 +817,8 @@ def max_profiling(model_name: str, activation_name: str, samples=-1, force_reinf
             associated_data.append(context_ques_pair)
         
         # fixed random seed to select same subsets of the instances every time for comparison
-        random.seed(123)
         if samples > 0.0: 
+            associated_data = associated_data[:int(len(associated_data)*0.1)]
             associated_data = random.sample(sum(associated_data, []), samples)
         else:
             associated_data = sum(associated_data, [])
@@ -836,22 +839,45 @@ def max_profiling(model_name: str, activation_name: str, samples=-1, force_reinf
             pipeline_running_counter += 1
             q_prbs, k_prbs, v_prbs, scrs_prbs, att_out_prbs = prediction['pipeline_prbs']
             dat = {'q': q_prbs, 'k': k_prbs, 'v': v_prbs, 'scrs': scrs_prbs, 'att_out': att_out_prbs}
-            res = []
+            mean_res = []
             for i in dat[activation_name]:
                 temp = np.amax(i, axis=-1)
-                res.append(temp)
+                mean_res.append(temp)
 
-        res = np.concatenate(res, axis=-1)
-        res = np.mean(res, axis=-1)
+        mean_res = np.concatenate(mean_res, axis=-1)
+        # plt.hist(res[0][0], bins=50, weights=[1.0/(res.shape[-1])]*res.shape[-1])
 
-        print("shape: ", res.shape)
+        # figs, axes = plt.subplots(12, 12, sharey=True, figsize=(12, 12))
+        # from itertools import product
+        # for i, j in product(range(12), range(12)):
+        #     ax = axes[i, j]
+        #     ax.hist(mean_res[i][j], bins=50)
+
+        # plt.show()
+        max_res = np.amax(mean_res, axis=-1)
+        mean_res = np.mean(mean_res, axis=-1)
+
+        print("shape: ", mean_res.shape)
 
         with open(profile_path, "wb+") as profile_file:
-                np.save(profile_file, res)
+            np.save(profile_file, mean_res)
+            np.save(profile_file, max_res)
 
-    print('profiling result:', res)
-    return res
-        
+    print('profiling result:', mean_res)
+    return mean_res, max_res
+
+def generate_max_score_profiling_mean_to_max(mean_profile, max_profile, step_size=10):
+    step = (max_profile - mean_profile) / float(step_size)
+    profiles = [mean_profile]
+    for i in range(step_size-1):
+        print(i+1)
+        profiles.append(mean_profile + (i+1) * step)
+    profiles.append(max_profile)
+
+    for idx, profile in enumerate(profiles):
+        profile_path = PARAM_PATH + "maxscrs_profile_{}.npy".format(idx)
+        with open(profile_path, "wb+") as profile_file:
+            np.save(profile_file, profile)
 
 if __name__ == '__main__':
     model_name = 'csarron/roberta-base-squad-v1'
@@ -993,7 +1019,7 @@ if __name__ == '__main__':
 
     if args['quant_visualize']:
         em_score, h_states, attens, att_max, att_min, att_mean, att_std, att_sparsity, _, _, _, _, _ = \
-            get_hstates_attens(model_name, filter_inputs=False, force_reinfer=False,
+            get_hstates_attens(model_name, filter_inputs=False, force_reinfer=True,
                                single_input=False, layer_aggregration='mean', att_threshold=att_threshold, hs_threshold=hs_threshold, sample_inputs=samples)
         em_str = 'EM={:.2f}'.format(em_score*100)
         # quantization
@@ -1025,4 +1051,5 @@ if __name__ == '__main__':
         print(diver)
 
     if args['profile']:
-        max_profiling(model_name, 'scrs', samples=samples, force_reinfer=True)
+        mean, max = max_profiling(model_name, 'scrs', samples=samples, force_reinfer=False)
+        generate_max_score_profiling_mean_to_max(mean, max)
