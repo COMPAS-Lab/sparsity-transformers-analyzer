@@ -841,7 +841,8 @@ def max_profiling(model_name: str, activation_name: str, samples=-1, force_reinf
             dat = {'q': q_prbs, 'k': k_prbs, 'v': v_prbs, 'scrs': scrs_prbs, 'att_out': att_out_prbs}
             mean_res = []
             for i in dat[activation_name]:
-                temp = np.amax(i, axis=-1)
+                temp = np.sort(i, axis=-1)
+                temp = temp[:,:,:,int(i.shape[-1]*0.8)]
                 mean_res.append(temp)
 
         mean_res = np.concatenate(mean_res, axis=-1)
