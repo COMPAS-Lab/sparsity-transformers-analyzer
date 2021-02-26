@@ -211,3 +211,10 @@ if __name__ == '__main__':
     #                     ori_label_offset={'SST/MLM':[0.35, -4], 'SQuAD': [0.35, -4]}, 
     #                     second_axis_data={'RoBERTa-MLM': roberta_mlm_thres_sweep}
     #                     )
+
+    # max score profile sweeping
+    profile_without_prune = get_em_quantbits('./quantized_params/embedded_prune_softmax/sweep_max_profile_without_pruning', avg_score=True)
+    profile_prune = get_em_quantbits('./quantized_params/embedded_prune_softmax/sweep_max_profile_with_pruning', avg_score=True)
+    tv.plot_sweep_maxscrs({'without_pruning': profile_without_prune, 
+                            'pruning': profile_prune}, 
+                            append_to_fname='_sweep_profile_maxscrs')

@@ -771,6 +771,42 @@ def plot_em_quant(sparsity_data: dict, bin_em=None, ori_em=None, ori_label_offse
     plt.close(fig)
 
 
+def plot_sweep_maxscrs(sparsity_data: dict, bin_em=None, ori_em=None, ori_label_offset=None, ylabel='accuracy', attached_title='', normalize_score=False, append_to_fname='', reverse_y=False, yscale='linear', ylims=None, percent=True, **kwargs):
+    fig, ax = plt.subplots(figsize=(6, 4))
+    # plt.xticks(fontsize=15)
+    patches = []
+    ax.set_xlabel("(profiled max(s) - mean(max(s))) / (max(max(s)) - mean(max(s)))")
+    ax.set_ylabel(ylabel)
+    ax.set_yscale(yscale)
+    ax.invert_xaxis()
+
+    for idx, (data_label, data) in enumerate(sparsity_data.items()):
+        quant_bits = [int(i) for i in data.index]    
+        patches.append(mpatches.Patch(color='C{}'.format(idx), label=data_label))
+        scores = data['em']/data['em'].max() if normalize_score else data['em']
+        if percent: scores = scores * 100
+        ax.plot(quant_bits, scores,
+                color='C{}'.format(idx), marker='s', markersize=4, alpha=0.65)
+    
+    if ori_em is not None: 
+        for k in ori_em.keys():
+            ax.axhline(ori_em[k], linestyle='--', color='black', alpha=0.5)
+            if ori_label_offset is not None:
+                ax.text(ori_label_offset[k][0], ori_em[k]+ori_label_offset[k][1], k, fontsize=8, va='center', ha='center')
+
+    # for label in ax.yaxis.get_majorticklabels(): label.set_fontsize(15)
+    if reverse_y: ax.invert_yaxis()
+    ax.invert_xaxis()
+
+    # ax.set_ylim([70, 90])
+    # fig.suptitle(
+    #     'Accuracy vs. Sparsity {}'.format(attached_title))
+    fig.tight_layout()
+    ax.legend(handles=patches, loc='upper left')
+    ax.grid(linestyle='--', alpha=0.5, color='grey')
+    fig.savefig(RES_FIG_PATH+'performance_vs_maxscrs{}.pdf'.format(append_to_fname))
+    plt.close(fig)
+
 def plot_em_clamp_thres(sparsity_data: dict, ori_em=None, ori_label_offset=None, second_axis_data={}, second_axis_ori_em=None, second_axis_ori_label_offset=None, attached_title='', normalize_score=False, append_to_fname='', reverse_y=False, percent=True, **kwargs):
     # plot em vs. quant
     fig, ax = plt.subplots(figsize=(5.2, 3.6))

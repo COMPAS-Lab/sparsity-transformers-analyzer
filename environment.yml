@@ -2,12 +2,15 @@ name: nlp
 channels:
   - defaults
 dependencies:
-  - tensorflow-gpu
-  - pandas
-  - numpy
-  - scikit-learn
+  - python=3.8
   - torchvision
   - pytorch
-  - jupyterlab
+  - cudatoolkit=10.2
+  - torchaudio
+  - notebook
+  - ipython
   - matplotlib
+  - pylint
   - autopep8
+  - rope
+  - scipy

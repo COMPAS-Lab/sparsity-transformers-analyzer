@@ -482,7 +482,7 @@ def plot_dist_token_dynamic(model_name, bin_step, sparsity_bar=0.025, att_thresh
         "question-answering",
         model=model_name,
         tokenizer=model_name,
-        device=-1
+        device=0
     )
 
     def get_bin_edges(bin_step):
@@ -868,11 +868,9 @@ def max_profiling(model_name: str, activation_name: str, samples=-1, force_reinf
 
 def generate_max_score_profiling_mean_to_max(mean_profile, max_profile, step_size=10):
     step = (max_profile - mean_profile) / float(step_size)
-    profiles = [mean_profile]
-    for i in range(step_size-1):
-        print(i+1)
-        profiles.append(mean_profile + (i+1) * step)
-    profiles.append(max_profile)
+    profiles = [mean_profile] + \
+                [mean_profile + (i+1) * step for i in range(step_size-1)] + \
+                [max_profile]
 
     for idx, profile in enumerate(profiles):
         profile_path = PARAM_PATH + "maxscrs_profile_{}.npy".format(idx)
