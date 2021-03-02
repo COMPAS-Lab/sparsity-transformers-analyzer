@@ -26,6 +26,7 @@ from textwrap import wrap
 import urllib.request
 import json
 from itertools import compress, product
+from tqdm import tqdm
 
 RES_FIG_PATH = "./res_fig/"
 PARAM_PATH = "./params/"
@@ -75,7 +76,9 @@ def parse_squad_json(squad_ver='v1.1'):
 #         ""
 #     )
 
-def run_qa_pipeline(model_name: str, filter_inputs=True, single_input=True, sample_inputs=-1, att_threshold=0.0, hs_threshold=0.0, att_quant_bits=0.0, hstate_quant_bits=0.0):
+def run_qa_pipeline(model_name: str, filter_inputs=True, single_input=True, sample_inputs=-1, \
+                    att_threshold=0.0, hs_threshold=0.0, att_quant_bits=0.0, hstate_quant_bits=0.0, \
+                    scrs_thresholds=None):
     '''
     run question answering pipeline. 
     filter inputs: filter out the question-context pairs that have lengths out of 
@@ -135,7 +138,10 @@ def run_qa_pipeline(model_name: str, filter_inputs=True, single_input=True, samp
     for qa_pair in fed_data:
         print("running pipeline iter {}/{}...".format(pipeline_running_counter, fed_data_len))
         prediction = qa_pipeline(
-            {'context': qa_pair['context'], 'question': qa_pair['question']}, max_seq_len=MAX_SEQ_LEN, att_threshold=att_threshold, hs_threshold=hs_threshold, head_mask=head_mask, quantize_att_bits=att_quant_bits, quantize_hstate_bits=hstate_quant_bits)
+            {'context': qa_pair['context'], 'question': qa_pair['question']}, max_seq_len=MAX_SEQ_LEN, 
+                att_threshold=att_threshold, hs_threshold=hs_threshold, head_mask=head_mask, 
+                quantize_att_bits=att_quant_bits, quantize_hstate_bits=hstate_quant_bits, 
+                scrs_thresholds=scrs_thresholds)
         em_score = max(compute_exact(prediction['answer'], gold_ans)
                        for gold_ans in qa_pair['answers'])
         att_array = prediction['attentions']
@@ -202,7 +208,9 @@ def run_qa_pipeline(model_name: str, filter_inputs=True, single_input=True, samp
     return res
 
 
-def get_hstates_attens(model_name: str, force_reinfer=False, filter_inputs=True, single_input=True, sample_inputs=-1, layer_aggregration='mean', att_threshold=0.0, hs_threshold = 0.0, att_quant_bits = 0.0, hstate_quant_bits = 0.0):
+def get_hstates_attens(model_name: str, force_reinfer=False, filter_inputs=True, single_input=True, \
+                        sample_inputs=-1, layer_aggregration='mean', att_threshold=0.0, hs_threshold = 0.0, \
+                        att_quant_bits = 0.0, hstate_quant_bits = 0.0, scrs_thresholds=None):
     '''
     get the hidden state and attention from pipeline result. 
     The model_name should be a valid Huggingface transformer model. 
@@ -263,7 +271,7 @@ def get_hstates_attens(model_name: str, force_reinfer=False, filter_inputs=True,
         predictions = run_qa_pipeline(
             model_name, filter_inputs=filter_inputs, single_input=single_input, \
             sample_inputs=sample_inputs, att_threshold=att_threshold, hs_threshold=hs_threshold, \
-            att_quant_bits=att_quant_bits, hstate_quant_bits=hstate_quant_bits)
+            att_quant_bits=att_quant_bits, hstate_quant_bits=hstate_quant_bits, scrs_thresholds=scrs_thresholds)
 
         total_score, all_hidden_states, all_attentions, qa_pair_count, \
             all_max, all_min, all_mean, all_std, all_sparsity, q, k, v, scrs, att_out = \
@@ -785,10 +793,10 @@ def plot_stat_features(stat_features, features_to_plot=['max', 'min', 'std']):
     plt.close(fig)
 
 
-def max_profiling(model_name: str, activation_name: str, samples=-1, force_reinfer=False):
-    '''
-    profiling max value per head of one of the activations: scrs,
-    '''
+def run_qa_pipeline_for_profiling(model_name, activation_name: str, scrs_thres=None, param_thres=-1.0, samples=-1):
+
+    params_thres, att_sparsity = [], None
+
     qa_pipeline = pipeline(
         "question-answering",
         model=model_name,
@@ -796,87 +804,97 @@ def max_profiling(model_name: str, activation_name: str, samples=-1, force_reinf
         device=0
     )
 
-    profile_path = PARAM_PATH + "{}_profile.npy".format(activation_name)
-    mean_res, max_res = None, None
-
-    if os.path.isfile(profile_path) and not force_reinfer:
-        print("loading profile from ", profile_path)
-        with open(profile_path, "rb") as profile_file:
-            mean_res = np.load(profile_file)
-            max_res = np.load(profile_file)
-
+    print("Running pipeline...")
+    data = parse_squad_json()
+    associated_data = []
+    for context in data.keys():
+        context_ques_pair = []
+        for ques in data[context]:
+            context_ques_pair.append(
+                {'context': context, 'question': ques['question'], 'answers': ques['answers']})
+        associated_data.append(context_ques_pair)
+    
+    # fixed random seed to select same subsets of the instances every time for comparison
+    if samples > 0.0: 
+        associated_data = associated_data[:int(len(associated_data)*0.1)]
+        random.seed(1231)
+        associated_data = random.sample(sum(associated_data, []), samples)
     else:
-        print("Running pipeline...")
-        data = parse_squad_json()
-        associated_data = []
-        for context in data.keys():
-            context_ques_pair = []
-            for ques in data[context]:
-                context_ques_pair.append(
-                    {'context': context, 'question': ques['question'], 'answers': ques['answers']})
-            associated_data.append(context_ques_pair)
-        
-        # fixed random seed to select same subsets of the instances every time for comparison
-        if samples > 0.0: 
-            associated_data = associated_data[:int(len(associated_data)*0.1)]
-            associated_data = random.sample(sum(associated_data, []), samples)
-        else:
-            associated_data = sum(associated_data, [])
-        input_lens = [len(i['context']+i['question']) for i in associated_data]
-        print("QA string pair length: [{}, {}]".format(min(input_lens), max(input_lens)))
-        pipeline_running_counter, fed_data_len = 0, len(associated_data)
+        associated_data = sum(associated_data, [])
+    input_lens = [len(i['context']+i['question']) for i in associated_data]
+    print("QA string pair length: [{}, {}]".format(min(input_lens), max(input_lens)))
 
-        # MARK: define head mask here
-        head_mask = np.ones(ATT_SIZE[:2])
-        head_mask[0][9], head_mask[0][11], head_mask[1][2], head_mask[7][8] = 0, 0, 0, 0
-        head_mask = None
-
-        # run the prediction, calculate and store the hist
-        for qa_pair in associated_data:
-            print("running pipeline iter {}/{}...".format(pipeline_running_counter, fed_data_len))
-            prediction = qa_pipeline(
-                {'context': qa_pair['context'], 'question': qa_pair['question']}, max_seq_len=320, head_mask=head_mask)
-            pipeline_running_counter += 1
-            q_prbs, k_prbs, v_prbs, scrs_prbs, att_out_prbs = prediction['pipeline_prbs']
-            dat = {'q': q_prbs, 'k': k_prbs, 'v': v_prbs, 'scrs': scrs_prbs, 'att_out': att_out_prbs}
-            mean_res = []
+    # MARK: define head mask here
+    head_mask = np.ones(ATT_SIZE[:2])
+    head_mask[0][9], head_mask[0][11], head_mask[1][2], head_mask[7][8] = 0, 0, 0, 0
+    head_mask = None
+    
+    total_elem_count = 0
+    # run the prediction, calculate and store the hist
+    for qa_pair in tqdm(associated_data):
+        prediction = qa_pipeline(
+            {'context': qa_pair['context'], 'question': qa_pair['question']}, max_seq_len=320, head_mask=head_mask, scrs_thresholds=scrs_thres)
+        q_prbs, k_prbs, v_prbs, scrs_prbs, att_out_prbs = prediction['pipeline_prbs']
+        dat = {'q': q_prbs, 'k': k_prbs, 'v': v_prbs, 'scrs': scrs_prbs, 'att_out': att_out_prbs}
+        if param_thres >= 0.0:
             for i in dat[activation_name]:
                 temp = np.sort(i, axis=-1)
-                temp = temp[:,:,:,int(i.shape[-1]*0.8)]
-                mean_res.append(temp)
+                temp = temp[:,:,:,int(i.shape[-1]*param_thres)]
+                params_thres.append(temp)
 
-        mean_res = np.concatenate(mean_res, axis=-1)
-        # plt.hist(res[0][0], bins=50, weights=[1.0/(res.shape[-1])]*res.shape[-1])
+        def get_spars(x, axis): return x.shape[-1] ** 2 - np.count_nonzero(x[:, :, :x.shape[-1], :], axis=axis)
+        def add_func(f): return np.sum([f(i, axis=(-2, -1)) for i in prediction['attentions']], axis=0)
+        if att_sparsity is None:
+            att_sparsity = add_func(get_spars)
+        else:
+            att_sparsity = np.add(att_sparsity, add_func(get_spars))
+        
+        total_elem_count += sum([att.shape[-1] * att.shape[-1] for att in prediction['attentions']])
 
-        # figs, axes = plt.subplots(12, 12, sharey=True, figsize=(12, 12))
-        # from itertools import product
-        # for i, j in product(range(12), range(12)):
-        #     ax = axes[i, j]
-        #     ax.hist(mean_res[i][j], bins=50)
+    att_sparsity = att_sparsity.astype(float) / total_elem_count
+    return params_thres, att_sparsity
 
-        # plt.show()
-        max_res = np.amax(mean_res, axis=-1)
-        mean_res = np.mean(mean_res, axis=-1)
 
-        print("shape: ", mean_res.shape)
+def param_thres_profiling(model_name: str, activation_name: str, param_thres:float, samples=-1):
+    '''
+    profiling max value per head of one of the activations: scrs,
+    '''
 
-        with open(profile_path, "wb+") as profile_file:
-            np.save(profile_file, mean_res)
-            np.save(profile_file, max_res)
+    param_thres, _ = run_qa_pipeline_for_profiling(model_name, "scrs", param_thres=param_thres, samples=samples)
 
-    print('profiling result:', mean_res)
+    mean_res = np.concatenate(param_thres, axis=-1)
+    # plt.hist(res[0][0], bins=50, weights=[1.0/(res.shape[-1])]*res.shape[-1])
+
+    # figs, axes = plt.subplots(12, 12, sharey=True, figsize=(12, 12))
+    # from itertools import product
+    # for i, j in product(range(12), range(12)):
+    #     ax = axes[i, j]
+    #     ax.hist(mean_res[i][j], bins=50)
+
+    # plt.show()
+    max_res = np.amax(mean_res, axis=-1)
+    mean_res = np.mean(mean_res, axis=-1)
+
+    print("shape: ", mean_res.shape)
     return mean_res, max_res
 
-def generate_max_score_profiling_mean_to_max(mean_profile, max_profile, step_size=10):
-    step = (max_profile - mean_profile) / float(step_size)
-    profiles = [mean_profile] + \
-                [mean_profile + (i+1) * step for i in range(step_size-1)] + \
-                [max_profile]
 
-    for idx, profile in enumerate(profiles):
-        profile_path = PARAM_PATH + "maxscrs_profile_{}.npy".format(idx)
-        with open(profile_path, "wb+") as profile_file:
-            np.save(profile_file, profile)
+def search_maxscrs_thresholds(model_name, init_bound=0.8, target_sparsity=0.8, samples=100):
+    lower_bound, upper_bound = 0.0, init_bound
+    avg_spars = 0.0
+    while abs(avg_spars-target_sparsity) > 0.01:
+        curr_test_scrs_rate = (lower_bound + upper_bound) / 2.0
+        thres, _ = param_thres_profiling(model_name, 'scrs', curr_test_scrs_rate, samples=samples)
+        _, spars = run_qa_pipeline_for_profiling(model_name, activation_name='scrs', scrs_thres=thres, samples=samples)
+        avg_spars = np.mean(spars)
+        if avg_spars < target_sparsity:
+            lower_bound = curr_test_scrs_rate
+        else:
+            upper_bound = curr_test_scrs_rate
+
+        print("average sparsity: {:.4f}".format(avg_spars))
+
+    return thres
 
 if __name__ == '__main__':
     model_name = 'csarron/roberta-base-squad-v1'
@@ -885,6 +903,8 @@ if __name__ == '__main__':
     arg_parser = ag.ArgumentParser(description=__doc__)
     arg_parser.add_argument("-at", "--att_threshold", default=0.0,
                             required=False, help="set attention sparsity threshold")
+    arg_parser.add_argument("-st", "--scrs_thresholds", default=None,
+                            required=False, help="set scores sparsity threshold")
     arg_parser.add_argument("-ht", "--hs_threshold", default=0.0,
                             required=False, help="set hidden states sparsity threshold")
     arg_parser.add_argument("-d", "--distribution", default=False, action='store_true',
@@ -917,10 +937,15 @@ if __name__ == '__main__':
     hstate_quant_bits = float(args['hstate_quant_bits'])
     samples = int(args['samples'])
 
+    scrs_thresholds = None
+    if args['scrs_thresholds'] is str:
+        with open(args['scrs_thresholds'], 'rb') as f:
+            scrs_thresholds = np.load(f)
+
     if args['evaluation']:
         em_score, h_states, attens, att_max, att_min, att_mean, att_std, att_sparsity, _, _, _, _, _ = \
             get_hstates_attens(model_name, filter_inputs=False, force_reinfer=True,
-                               single_input=False, layer_aggregration='mean', att_threshold=att_threshold, hs_threshold=hs_threshold, sample_inputs=samples, att_quant_bits=att_quant_bits, hstate_quant_bits=hstate_quant_bits)
+                               single_input=False, layer_aggregration='mean', att_threshold=att_threshold, hs_threshold=hs_threshold, sample_inputs=samples, att_quant_bits=att_quant_bits, hstate_quant_bits=hstate_quant_bits, scrs_thresholds=scrs_thresholds)
         em_str = 'EM={:.2f}'.format(em_score*100)
 
     if args['distribution']:
@@ -1050,5 +1075,11 @@ if __name__ == '__main__':
         print(diver)
 
     if args['profile']:
-        mean, max = max_profiling(model_name, 'scrs', samples=samples, force_reinfer=False)
-        generate_max_score_profiling_mean_to_max(mean, max)
+        scrs_thres_path = PARAM_PATH + "scrs_threshold.npy"
+        
+        scrs_thres = search_maxscrs_thresholds(model_name, samples=samples)
+        with open(scrs_thres_path, 'wb+') as f:
+            np.save(scrs_thres, f)
+
+        print(scrs_thres)
+
