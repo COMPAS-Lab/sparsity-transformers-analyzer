@@ -151,12 +151,14 @@ def run_qa_pipeline(model_name: str, filter_inputs=True, single_input=True, samp
         # MARK: I am only getting values that are zero for the sparsity here. No specific sparsity bar.
         def get_spars(x, axis): 
             return x.shape[-1] ** 2 - np.count_nonzero(x[:, :, :x.shape[-1], :], axis=axis)
+        def get_scrs_spars(x, axis): 
+            return np.sum(np.isneginf(x), axis=axis)
         def agg_func(f): return np.stack([f(i, axis=(-2, -1)) for i in att_array], axis=0)
-        def add_func(f): return np.sum([f(i, axis=(-2, -1)) for i in att_array], axis=0)
+        def add_func(f, data): return np.sum([f(i, axis=(-2, -1)) for i in data], axis=0)
         if res is None:
             res = {'score': em_score, 'hidden_states': np.zeros(HS_SIZE),
                    'max': agg_func(np.amax), 'min': agg_func(np.amin), 'mean': agg_func(np.mean),
-                   'std': agg_func(np.std), 'sparsity': add_func(get_spars), 
+                   'std': agg_func(np.std), 'sparsity': add_func(get_spars, att_array), 'scrs_spars': add_func(get_scrs_spars, scrs_prbs), 
                    'q': q_prbs, 'k': k_prbs, 'v': v_prbs, 'scrs': scrs_prbs, 'att_out': att_out_prbs}
             res['attentions'] = [] if sample_inputs > 0 else np.zeros(ATT_SIZE)
         else:
@@ -165,7 +167,8 @@ def run_qa_pipeline(model_name: str, filter_inputs=True, single_input=True, samp
             res['min'] = np.concatenate((res['min'], agg_func(np.amin)), axis=0)
             res['mean'] = np.concatenate((res['mean'], agg_func(np.mean)), axis=0)
             res['std'] = np.concatenate((res['std'], agg_func(np.std)), axis=0)
-            res['sparsity'] = np.add(res['sparsity'], add_func(get_spars))
+            res['sparsity'] = np.add(res['sparsity'], add_func(get_spars, att_array))
+            res['scrs_spars'] = np.add(res['scrs_spars'], add_func(get_scrs_spars, scrs_prbs))
             if sample_inputs > 0:
                 res['q'] += q_prbs
                 res['k'] += k_prbs
@@ -204,6 +207,10 @@ def run_qa_pipeline(model_name: str, filter_inputs=True, single_input=True, samp
         print(prediction['answer'], em_score, res['score'] / pipeline_running_counter)
 
     res['sparsity'] = res['sparsity'].astype(float) / total_elem_count
+    res['scrs_spars'] = res['scrs_spars'].astype(float) / total_elem_count
+
+    print("attention sparsity: {:.4f}, att score sparsity: {:.4f}"\
+                .format(np.mean(res['sparsity']), np.mean(res['scrs_spars'])))
     res['qa_pair_len'] = fed_data_len
     return res
 
@@ -886,7 +893,9 @@ def search_maxscrs_thresholds(model_name, init_bound=0.8, target_sparsity=0.8, s
         curr_test_scrs_rate = (lower_bound + upper_bound) / 2.0
         thres, _ = param_thres_profiling(model_name, 'scrs', curr_test_scrs_rate, samples=samples)
         _, spars = run_qa_pipeline_for_profiling(model_name, activation_name='scrs', scrs_thres=thres, samples=samples)
-        avg_spars = np.mean(spars)
+        if avg_spars == np.mean(spars): break
+        else: avg_spars = np.mean(spars)
+
         if avg_spars < target_sparsity:
             lower_bound = curr_test_scrs_rate
         else:
@@ -937,8 +946,7 @@ if __name__ == '__main__':
     hstate_quant_bits = float(args['hstate_quant_bits'])
     samples = int(args['samples'])
 
-    scrs_thresholds = None
-    if args['scrs_thresholds'] is str:
+    if args['scrs_thresholds'] is not None:
         with open(args['scrs_thresholds'], 'rb') as f:
             scrs_thresholds = np.load(f)
 
@@ -1079,7 +1087,7 @@ if __name__ == '__main__':
         
         scrs_thres = search_maxscrs_thresholds(model_name, samples=samples)
         with open(scrs_thres_path, 'wb+') as f:
-            np.save(scrs_thres, f)
+            np.save(f, scrs_thres)
 
         print(scrs_thres)
 
