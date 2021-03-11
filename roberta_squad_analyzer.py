@@ -78,7 +78,7 @@ def parse_squad_json(squad_ver='v1.1'):
 
 def run_qa_pipeline(model_name: str, filter_inputs=True, single_input=True, sample_inputs=-1, \
                     att_threshold=0.0, hs_threshold=0.0, att_quant_bits=0.0, hstate_quant_bits=0.0, \
-                    scrs_thresholds=None):
+                    scrs_thresholds=None, scrs_max=None):
     '''
     run question answering pipeline. 
     filter inputs: filter out the question-context pairs that have lengths out of 
@@ -141,7 +141,7 @@ def run_qa_pipeline(model_name: str, filter_inputs=True, single_input=True, samp
             {'context': qa_pair['context'], 'question': qa_pair['question']}, max_seq_len=MAX_SEQ_LEN, 
                 att_threshold=att_threshold, hs_threshold=hs_threshold, head_mask=head_mask, 
                 quantize_att_bits=att_quant_bits, quantize_hstate_bits=hstate_quant_bits, 
-                scrs_thresholds=scrs_thresholds)
+                scrs_thresholds=scrs_thresholds, scrs_max=scrs_max)
         em_score = max(compute_exact(prediction['answer'], gold_ans)
                        for gold_ans in qa_pair['answers'])
         att_array = prediction['attentions']
@@ -217,7 +217,7 @@ def run_qa_pipeline(model_name: str, filter_inputs=True, single_input=True, samp
 
 def get_hstates_attens(model_name: str, force_reinfer=False, filter_inputs=True, single_input=True, \
                         sample_inputs=-1, layer_aggregration='mean', att_threshold=0.0, hs_threshold = 0.0, \
-                        att_quant_bits = 0.0, hstate_quant_bits = 0.0, scrs_thresholds=None):
+                        att_quant_bits = 0.0, hstate_quant_bits = 0.0, scrs_thresholds=None, scrs_max=None):
     '''
     get the hidden state and attention from pipeline result. 
     The model_name should be a valid Huggingface transformer model. 
@@ -278,7 +278,7 @@ def get_hstates_attens(model_name: str, force_reinfer=False, filter_inputs=True,
         predictions = run_qa_pipeline(
             model_name, filter_inputs=filter_inputs, single_input=single_input, \
             sample_inputs=sample_inputs, att_threshold=att_threshold, hs_threshold=hs_threshold, \
-            att_quant_bits=att_quant_bits, hstate_quant_bits=hstate_quant_bits, scrs_thresholds=scrs_thresholds)
+            att_quant_bits=att_quant_bits, hstate_quant_bits=hstate_quant_bits, scrs_thresholds=scrs_thresholds, scrs_max=scrs_max)
 
         total_score, all_hidden_states, all_attentions, qa_pair_count, \
             all_max, all_min, all_mean, all_std, all_sparsity, q, k, v, scrs, att_out = \
@@ -905,6 +905,15 @@ def search_maxscrs_thresholds(model_name, init_bound=0.8, target_sparsity=0.8, s
 
     return thres
 
+
+def profile_scrs_max(model_name, samples=100):
+    max_scrs, _ = run_qa_pipeline_for_profiling(model_name, 'scrs', param_thres=0.99, samples=samples)
+    mean_res = np.concatenate(max_scrs, axis=-1)
+    mean_res = np.mean(mean_res, axis=-1)
+
+    print(mean_res)
+    return mean_res
+
 if __name__ == '__main__':
     model_name = 'csarron/roberta-base-squad-v1'
     # model_name = 'csarron/bert-base-uncased-squad-v1'
@@ -914,6 +923,8 @@ if __name__ == '__main__':
                             required=False, help="set attention sparsity threshold")
     arg_parser.add_argument("-st", "--scrs_thresholds", default=None,
                             required=False, help="set scores sparsity threshold")
+    arg_parser.add_argument("-sm", "--scrs_max", default=None,
+                            required=False, help="set profiled max scores")
     arg_parser.add_argument("-ht", "--hs_threshold", default=0.0,
                             required=False, help="set hidden states sparsity threshold")
     arg_parser.add_argument("-d", "--distribution", default=False, action='store_true',
@@ -949,23 +960,27 @@ if __name__ == '__main__':
     if args['scrs_thresholds'] is not None:
         with open(args['scrs_thresholds'], 'rb') as f:
             scrs_thresholds = np.load(f)
+            
+    if args['scrs_max'] is not None:
+        with open(args['scrs_max'], 'rb') as f:
+            scrs_max = np.load(f)
 
     if args['evaluation']:
         em_score, h_states, attens, att_max, att_min, att_mean, att_std, att_sparsity, _, _, _, _, _ = \
             get_hstates_attens(model_name, filter_inputs=False, force_reinfer=True,
-                               single_input=False, layer_aggregration='mean', att_threshold=att_threshold, hs_threshold=hs_threshold, sample_inputs=samples, att_quant_bits=att_quant_bits, hstate_quant_bits=hstate_quant_bits, scrs_thresholds=scrs_thresholds)
+                               single_input=False, layer_aggregration='mean', att_threshold=att_threshold, hs_threshold=hs_threshold, sample_inputs=samples, att_quant_bits=att_quant_bits, hstate_quant_bits=hstate_quant_bits, scrs_thresholds=scrs_thresholds, scrs_max=scrs_max)
         em_str = 'EM={:.2f}'.format(em_score*100)
 
     if args['distribution']:
         em_score, h_states, attens, att_max, att_min, att_mean, att_std, att_sparsity, q, k, v, scrs, att_out = \
             get_hstates_attens(model_name, filter_inputs=False, force_reinfer=False,
                                single_input=False, layer_aggregration='mean', att_threshold=att_threshold, hs_threshold=hs_threshold, sample_inputs=samples, att_quant_bits=att_quant_bits, hstate_quant_bits=hstate_quant_bits)
-        em_str = 'EM={:.2f}'.format(em_score*100)
-        stat_features = get_stat_features(
-            {'max': att_max, 'min': att_min, 'mean': att_mean, 'std': att_std})
-        print(stat_features)
-        plot_stat_features(stat_features)
-        stat_features.to_csv('stat_features_unfiltered.csv', sep=',')
+        # em_str = 'EM={:.2f}'.format(em_score*100)
+        # stat_features = get_stat_features(
+        #     {'max': att_max, 'min': att_min, 'mean': att_mean, 'std': att_std})
+        # print(stat_features)
+        # plot_stat_features(stat_features)
+        # stat_features.to_csv('stat_features_unfiltered.csv', sep=',')
 
         # plot histogram for all layers and all heads
         # plot_dist(attens, bin_step=100, sparsity_bar=0.0005,
@@ -989,11 +1004,11 @@ if __name__ == '__main__':
         print("scrs_meansum: ", scrs_meansum)
 
         # tv.plot_atten_dist_per_token(attens, 200, scale='log', attached_fname='attention', ylim=(0.2, 1))
-        # tv.plot_atten_dist_per_token(scrs, 400, scale='linear', attached_fname='scrs', ylim=(0.5, 1))
+        tv.plot_atten_dist_per_token(scrs, 200, scale='linear', attached_fname='scrs', ylim=(0.4, 1))
 
-        effective_seq_len = [i.shape[-1] for i in attens]
-        effective_h_states = [np.squeeze(h_states[:, i, :effective_seq_len[i], :]) for i in range(h_states.shape[1])]
-        tv.plot_hstate_features(effective_h_states, attached_title='quant')
+        # effective_seq_len = [i.shape[-1] for i in attens]
+        # effective_h_states = [np.squeeze(h_states[:, i, :effective_seq_len[i], :]) for i in range(h_states.shape[1])]
+        # tv.plot_hstate_features(effective_h_states, attached_title='quant')
 
         # only plot heatmaps when distribution is available, temperarily broken
         if args['heatmap']:
@@ -1084,10 +1099,16 @@ if __name__ == '__main__':
 
     if args['profile']:
         scrs_thres_path = PARAM_PATH + "scrs_threshold.npy"
+        scrs_max_path = PARAM_PATH + "scrs_max.npy"
         
-        scrs_thres = search_maxscrs_thresholds(model_name, samples=samples)
-        with open(scrs_thres_path, 'wb+') as f:
-            np.save(f, scrs_thres)
+        # scrs_thres = search_maxscrs_thresholds(model_name, samples=samples)
+        # with open(scrs_thres_path, 'wb+') as f:
+        #     np.save(f, scrs_thres)
 
-        print(scrs_thres)
+        # print(scrs_thres)
 
+        scrs_max = profile_scrs_max(model_name, samples=samples)
+        with open(scrs_max_path, 'wb+') as f:
+            np.save(f, scrs_max)
+
+        print(scrs_max)

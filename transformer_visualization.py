@@ -202,11 +202,15 @@ def plot_atten_dist_per_token(data, bin_step, attn_max=None, attn_min=None, spar
     """
     offset = 1e-8
     hist_x_start, hist_x_end = log(offset, 10), log(10, 10)
-    # hist_x_start, hist_x_end = -10, 10
     if scale == 'linear':
-        offset = 0.0
+        hist_x_start = min([np.amin(i) for i in data])
+        hist_x_end = max([np.amax(i) for i in data])
+    # hist_x_start, hist_x_end = -10, 10
 
     attn_bins, attn_hists = get_bin_edges(bin_step, hist_x_start, hist_x_end, scale), None
+    atten_bar_width = [attn_bins[i] - attn_bins[i-1] for i in range(1, len(attn_bins))]
+
+    if scale == 'linear': offset = 0.0
 
     if type(data) is list:
         for inst in data:
@@ -228,7 +232,6 @@ def plot_atten_dist_per_token(data, bin_step, attn_max=None, attn_min=None, spar
         attn_hists = data
 
     print(attn_hists.shape)
-    atten_bar_width = [attn_bins[i] - attn_bins[i-1] for i in range(1, len(attn_bins))]
     
     for layer_idx, layer in enumerate(attn_hists):
         print("plotting layer {}...".format(layer_idx))
@@ -239,10 +242,13 @@ def plot_atten_dist_per_token(data, bin_step, attn_max=None, attn_min=None, spar
             curr_ax2 = curr_ax.twinx()
             alpha_val = 0.01
             for row in head:
-                curr_ax.plot(attn_bins[:-1], row, atten_bar_width,
-                             color='C0', linewidth=0.5, linestyle='-', alpha=alpha_val)
-                curr_ax2.plot(attn_bins[:-1], np.cumsum(row),
-                             color='C3', linewidth=0.5, linestyle='-', alpha=alpha_val)
+                actual_bin_range = (np.argmax(attn_bins > -10), np.argmax(attn_bins > 10))
+                x = attn_bins[actual_bin_range[0]:actual_bin_range[1]]
+                y = row[actual_bin_range[0]:actual_bin_range[1]]
+                curr_ax.plot(x, y,
+                            color='C0', linewidth=0.5, linestyle='-', alpha=alpha_val)
+                curr_ax2.plot(x, np.cumsum(y),
+                            color='C3', linewidth=0.5, linestyle='-', alpha=alpha_val)
 
             curr_ax.tick_params(labelsize=16)
             curr_ax.tick_params(axis='y', colors='C0')
@@ -281,7 +287,8 @@ def plot_atten_dist_per_token(data, bin_step, attn_max=None, attn_min=None, spar
             if scale == 'log':
                 curr_ax.set_xlim([10 ** hist_x_start - 10 ** (hist_x_start-1), 1])
             else:
-                curr_ax.set_xlim([hist_x_start, hist_x_end])
+                pass
+                # curr_ax.set_xlim([hist_x_start, hist_x_end])
 
             fig.suptitle("Histogram for layer {} head {}(per token)".format(
                 layer_idx, head_idx), fontsize=16, y=0.93)

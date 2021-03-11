@@ -78,6 +78,12 @@ if __name__ == '__main__':
     roberta_squad_quant_rank = get_em_quantbits('./quantized_params/roberta-squad-quant-rank', avg_score=True)
     roberta_squad_quant_uniform = get_em_quantbits('./quantized_params/roberta-squad-quant-uniform-slog-mean', avg_score=True)
     roberta_squad_quant_uniform_clamped = get_em_quantbits('./quantized_params/roberta-squad-quant-uniform-slog-mean-clamped', avg_score=True)
+    # roberta_squad_prune_score
+    roberta_squad_range_log_prune_score_original  = get_em_quantbits('./quantized_params/scores/roberta-squad-range-log-clamped-midval-original', avg_score=True)
+    roberta_squad_range_log_prune_score_quant_softmax = get_em_quantbits(\
+        './quantized_params/scores/roberta-squad-range-log-clamped-midval-prune-score-quantize-softmax', avg_score=True)
+    roberta_squad_range_log_prune_score_quant_exp = get_em_quantbits(\
+        './quantized_params/scores/roberta-squad-range-log-clamped-midval-prune-score-quantize-exp', avg_score=True)    
     tv.plot_em_quant({'RoBERTa SQuAD rank': roberta_squad_quant_rank}, break_start=15.9, break_end=9, append_to_fname="squad_rank_only")
 
     #bert_squad
@@ -125,16 +131,16 @@ if __name__ == '__main__':
     # roberta_squad_hquant_fixed5 = get_em_quantbits('./quantized_params/hidden_states/roberta-squad-hquant-fixed5', avg_score=True)
     # roberta_squad_hquant_fixed4 = get_em_quantbits('./quantized_params/hidden_states/roberta-squad-hquant-fixed4', avg_score=True)
 
-    # SQuAD
+    # SQuAD attention pruning quantization
     tv.plot_em_quant({
-                        # 'RoBERTa-linear': roberta_squad_quant_linear, \
-                        # 'RoBERTa-linear-pruned': roberta_squad_quant_linear_clamped, \
-                        'RoBERTa-log': roberta_squad_quant_log, \
-                        'RoBERTa-log-pruned': roberta_squad_quant_clamped_log_1e3, \
-                        'RoBERTa-uniform': roberta_squad_quant_uniform, \
-                        'RoBERTa-uniform-pruned': roberta_squad_quant_uniform_clamped, \
-                        # 'BERT-linear': bert_squad_quant_linear, \
-                        # 'BERT-linear-pruned': bert_squad_quant_linear_clamped, \
+                        'RoBERTa-linear': roberta_squad_quant_linear,
+                        'RoBERTa-linear-pruned': roberta_squad_quant_linear_clamped,
+                        'RoBERTa-log': roberta_squad_quant_log,
+                        'RoBERTa-log-pruned': roberta_squad_quant_clamped_log_1e3, 
+                        'RoBERTa-uniform': roberta_squad_quant_uniform,
+                        'RoBERTa-uniform-pruned': roberta_squad_quant_uniform_clamped,
+                        'BERT-linear': bert_squad_quant_linear,
+                        'BERT-linear-pruned': bert_squad_quant_linear_clamped,
                         'BERT-log': bert_squad_quant_log, 
                         'BERT-log-pruned': bert_squad_quant_log_clamped,
                         'BERT-uniform': bert_squad_quant_uniform, 
@@ -142,9 +148,18 @@ if __name__ == '__main__':
                         'RoBERTa-boolean': roberta_squad_quant_bin,
                         'BERT-boolean': bert_squad_quant_boolean,
                         }, 
-                        ori_em={'RoBERTa': roberta_squad_original_em, 'BERT': bert_squad_ori_em}, \
-                        ori_label_offset={'RoBERTa': [1.5, 1.7], 'BERT': [1.5, -2.5]},
-                        ylabel='EM score', break_end=9.5, append_to_fname='_squad')
+                        ori_em={'att-prune': roberta_squad_original_em, 'score-prune': 81.50}, \
+                        ori_label_offset={'att-prune': [1.5, 1.7], 'score-prune': [1.5, -2.5]},
+                        ylabel='EM score', break_end=9.5, append_to_fname='squad')
+    # SQuAD attention pruning quantization
+    tv.plot_em_quant({
+                        'prune attention': roberta_squad_range_log_prune_score_original, 
+                        'prune score quantize softmax': roberta_squad_range_log_prune_score_quant_softmax, 
+                        'prune score quantize exp': roberta_squad_range_log_prune_score_quant_exp, 
+                        }, 
+                        ori_em={'original': 81.50}, \
+                        ori_label_offset={'original': [1.5, 1.7]},
+                        ylabel='EM score', break_end=9.5, append_to_fname='_squad_att_vs_score_pr')
 
     print('roberta squad original: ', roberta_squad_original_em)
     print('roberta squad log clamped:', (roberta_squad_original_em - roberta_squad_quant_clamped_log_1e3['em'][3.0]*100)/roberta_squad_original_em)
