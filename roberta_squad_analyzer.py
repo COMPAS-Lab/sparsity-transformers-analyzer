@@ -625,7 +625,7 @@ def plot_dist_token_dynamic(model_name, bin_step, sparsity_bar=0.025, att_thresh
     tv.get_diversity(atten_hist, bin_step, all_max, all_min, model_name=model_name)
     tv.get_focused_token_mean_std(sparse_token_count, sparse_token_percentage, model_name)
     # exit()
-    tv.plot_atten_dist_per_token(atten_hist, bin_step, all_max, all_min, sparse_hist=sparse_hist, model_name=model_name)
+    tv.plot_dist_per_token(atten_hist, bin_step, all_max, all_min, sparse_hist=sparse_hist, model_name=model_name)
 
     # plot sparsity histogram when sampling:
     # if samples > 0:
@@ -956,11 +956,13 @@ if __name__ == '__main__':
     att_quant_bits = float(args['att_quant_bits'])
     hstate_quant_bits = float(args['hstate_quant_bits'])
     samples = int(args['samples'])
+    scrs_thresholds = None
+    scrs_max = None
 
     if args['scrs_thresholds'] is not None:
         with open(args['scrs_thresholds'], 'rb') as f:
             scrs_thresholds = np.load(f)
-            
+
     if args['scrs_max'] is not None:
         with open(args['scrs_max'], 'rb') as f:
             scrs_max = np.load(f)
@@ -974,7 +976,8 @@ if __name__ == '__main__':
     if args['distribution']:
         em_score, h_states, attens, att_max, att_min, att_mean, att_std, att_sparsity, q, k, v, scrs, att_out = \
             get_hstates_attens(model_name, filter_inputs=False, force_reinfer=False,
-                               single_input=False, layer_aggregration='mean', att_threshold=att_threshold, hs_threshold=hs_threshold, sample_inputs=samples, att_quant_bits=att_quant_bits, hstate_quant_bits=hstate_quant_bits)
+                               single_input=False, layer_aggregration='mean', att_threshold=att_threshold, hs_threshold=hs_threshold, sample_inputs=samples, att_quant_bits=att_quant_bits, hstate_quant_bits=hstate_quant_bits,
+                               scrs_thresholds=scrs_thresholds, scrs_max=scrs_max)
         # em_str = 'EM={:.2f}'.format(em_score*100)
         # stat_features = get_stat_features(
         #     {'max': att_max, 'min': att_min, 'mean': att_mean, 'std': att_std})
@@ -1003,8 +1006,8 @@ if __name__ == '__main__':
         scrs_meansum = np.mean(scrs_summax)
         print("scrs_meansum: ", scrs_meansum)
 
-        # tv.plot_atten_dist_per_token(attens, 200, scale='log', attached_fname='attention', ylim=(0.2, 1))
-        tv.plot_atten_dist_per_token(scrs, 200, scale='linear', attached_fname='scrs', ylim=(0.4, 1))
+        # tv.plot_dist_per_token(attens, 200, scale='log', attached_fname='attention', ylim=(0.2, 1))
+        tv.plot_dist_per_token(scrs, 50, scale='linear', attached_fname='scrs', xlim=(-10, 10), ylim=(0.4, 1))
 
         # effective_seq_len = [i.shape[-1] for i in attens]
         # effective_h_states = [np.squeeze(h_states[:, i, :effective_seq_len[i], :]) for i in range(h_states.shape[1])]

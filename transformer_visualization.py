@@ -12,7 +12,7 @@ from tqdm import tqdm
 from textwrap import wrap
 from scipy.spatial import distance
 from math import isnan, fsum, log, log2, ceil, floor
-from itertools import compress, product
+from itertools import compress, product, groupby
 
 RES_FIG_PATH = "./res_fig/"
 NUM_LAYERS = 12
@@ -191,7 +191,8 @@ def plot_heatmap(data, sparsity_bar=0.025, auto_scale=False, binarize=True, laye
         plt.close(fig)
 
 
-def plot_atten_dist_per_token(data, bin_step, attn_max=None, attn_min=None, sparse_hist=None, scale='log', attached_fname='', model_name='', ylim=(0.2, 1)):
+def plot_dist_per_token(data, bin_step, attn_max=None, attn_min=None, sparse_hist=None, \
+                            scale='log', attached_fname='', model_name='', xlim=None, ylim=(0.2, 1)):
     """
     plotting the attention histogram per token, stacking all plots together.
     accepted data: a list of attention matrices, with each as [layer, head, length, length]
@@ -204,8 +205,9 @@ def plot_atten_dist_per_token(data, bin_step, attn_max=None, attn_min=None, spar
     hist_x_start, hist_x_end = log(offset, 10), log(10, 10)
     if scale == 'linear':
         hist_x_start = min([np.amin(i) for i in data])
+        hist_x_start = -100 if np.isneginf(hist_x_start) else hist_x_start
         hist_x_end = max([np.amax(i) for i in data])
-    # hist_x_start, hist_x_end = -10, 10
+    hist_x_start, hist_x_end = -10, 10
 
     attn_bins, attn_hists = get_bin_edges(bin_step, hist_x_start, hist_x_end, scale), None
     atten_bar_width = [attn_bins[i] - attn_bins[i-1] for i in range(1, len(attn_bins))]
@@ -242,12 +244,12 @@ def plot_atten_dist_per_token(data, bin_step, attn_max=None, attn_min=None, spar
             curr_ax2 = curr_ax.twinx()
             alpha_val = 0.01
             for row in head:
-                actual_bin_range = (np.argmax(attn_bins > -10), np.argmax(attn_bins > 10))
-                x = attn_bins[actual_bin_range[0]:actual_bin_range[1]]
-                y = row[actual_bin_range[0]:actual_bin_range[1]]
-                curr_ax.plot(x, y,
+                # actual_bin_range = (np.argmax(attn_bins > -10), np.argmax(attn_bins > 10))
+                # x = attn_bins[actual_bin_range[0]:actual_bin_range[1]]
+                # y = row[actual_bin_range[0]:actual_bin_range[1]]
+                curr_ax.plot(attn_bins[:-1], row, 
                             color='C0', linewidth=0.5, linestyle='-', alpha=alpha_val)
-                curr_ax2.plot(x, np.cumsum(y),
+                curr_ax2.plot(attn_bins[:-1], np.cumsum(row),
                             color='C3', linewidth=0.5, linestyle='-', alpha=alpha_val)
 
             curr_ax.tick_params(labelsize=16)
@@ -286,15 +288,16 @@ def plot_atten_dist_per_token(data, bin_step, attn_max=None, attn_min=None, spar
 
             if scale == 'log':
                 curr_ax.set_xlim([10 ** hist_x_start - 10 ** (hist_x_start-1), 1])
+            elif xlim is None:
+                curr_ax.set_xlim([hist_x_start, hist_x_end])
             else:
-                pass
-                # curr_ax.set_xlim([hist_x_start, hist_x_end])
+                curr_ax.set_xlim(xlim)
 
-            fig.suptitle("Histogram for layer {} head {}(per token)".format(
+            fig.suptitle("Histogram for layer {} head {} (per token)".format(
                 layer_idx, head_idx), fontsize=16, y=0.93)
             fig.tight_layout(pad=1.5)
             plt.savefig(
-                RES_FIG_PATH+'at_hist_per_token_layer_{}_head_{}_{}.png'.format(layer_idx, head_idx, attached_fname), dpi=160)
+                RES_FIG_PATH+'hist_per_token_layer_{}_head_{}_{}.png'.format(layer_idx, head_idx, attached_fname))
             plt.clf()
             plt.close(fig)
 
