@@ -846,6 +846,7 @@ def run_qa_pipeline_for_profiling(model_name, activation_name: str, scrs_thres=N
         if param_thres >= 0.0:
             for i in dat[activation_name]:
                 temp = np.sort(i, axis=-1)
+                print("selecting {}/{}".format(int(i.shape[-1]*param_thres), i.shape[-1]))
                 temp = temp[:,:,:,int(i.shape[-1]*param_thres)]
                 params_thres.append(temp)
 
@@ -909,7 +910,7 @@ def search_maxscrs_thresholds(model_name, init_bound=0.8, target_sparsity=0.8, s
 def profile_scrs_max(model_name, samples=100):
     max_scrs, _ = run_qa_pipeline_for_profiling(model_name, 'scrs', param_thres=0.99, samples=samples)
     mean_res = np.concatenate(max_scrs, axis=-1)
-    mean_res = np.mean(mean_res, axis=-1)
+    mean_res = np.amax(mean_res, axis=-1)
 
     print(mean_res)
     return mean_res
