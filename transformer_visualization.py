@@ -775,7 +775,7 @@ def plot_em_quant(sparsity_data: dict, bin_em=None, ori_em=None, ori_label_offse
     # fig.suptitle(
     #     'Accuracy vs. Sparsity {}'.format(attached_title))
     # fig.tight_layout()
-    bax.legend(handles=patches, loc='lower left', bbox_to_anchor=(-0.01, 0.04))
+    bax.legend(handles=patches, loc='lower left', bbox_to_anchor=(-0.01, 0.1))
     bax.grid(linestyle='--', alpha=0.5, color='grey')
     fig.savefig(RES_FIG_PATH+'performance_vs_quantbits{}.pdf'.format(append_to_fname))
     plt.close(fig)

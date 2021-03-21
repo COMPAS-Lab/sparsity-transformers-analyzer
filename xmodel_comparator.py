@@ -88,7 +88,8 @@ if __name__ == '__main__':
     #     './quantized_params/scores/roberta-squad-range-linear-clamped-midval-prune-score-quantize-score-mean', avg_score=True)
     roberta_squad_range_linear_prune_score_quant_score = get_em_quantbits(\
         './quantized_params/scores/roberta-squad-range-linear-clamped-midval-prune-score-quantize-score-max', avg_score=True)
-
+    roberta_squad_range_log_prune_score_quant_score = get_em_quantbits(\
+        './quantized_params/scores/roberta-squad-range-log-clamped-midval-prune-score-quantize-score-max', avg_score=True)
     tv.plot_em_quant({'RoBERTa SQuAD rank': roberta_squad_quant_rank}, break_start=15.9, break_end=9, append_to_fname="squad_rank_only")
 
     #bert_squad
@@ -158,10 +159,11 @@ if __name__ == '__main__':
                         ylabel='EM score', break_end=9.5, append_to_fname='squad')
     # SQuAD attention pruning quantization
     tv.plot_em_quant({
-                        'prune attention': roberta_squad_range_log_prune_score_original, 
-                        'prune score quant softmax': roberta_squad_range_log_prune_score_quant_softmax, 
-                        'prune score quant exp': roberta_squad_range_log_prune_score_quant_exp, 
-                        'prune score quant score': roberta_squad_range_linear_prune_score_quant_score
+                        'original softmax, quant att(log)': roberta_squad_range_log_prune_score_original, 
+                        'prune score quant softmax (log)': roberta_squad_range_log_prune_score_quant_softmax, 
+                        'prune score quant exp (log)': roberta_squad_range_log_prune_score_quant_exp, 
+                        'prune score quant score (lin)': roberta_squad_range_linear_prune_score_quant_score, 
+                        'prune score quant score (log)': roberta_squad_range_log_prune_score_quant_score,
                         }, 
                         ori_em={'original': 81.50}, \
                         ori_label_offset={'original': [1.5, 1.7]},
