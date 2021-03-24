@@ -158,7 +158,7 @@ def run_qa_pipeline(model_name: str, filter_inputs=True, single_input=True, samp
         if res is None:
             res = {'score': em_score, 'hidden_states': np.zeros(HS_SIZE),
                    'max': agg_func(np.amax), 'min': agg_func(np.amin), 'mean': agg_func(np.mean),
-                   'std': agg_func(np.std), 'sparsity': add_func(get_spars, att_array), 'scrs_spars': add_func(get_scrs_spars, scrs_prbs), 
+                   'std': agg_func(np.std), 'sparsity': add_func(get_spars, att_array), 'scrs_spars': add_func(get_spars, scrs_prbs), 
                    'q': q_prbs, 'k': k_prbs, 'v': v_prbs, 'scrs': scrs_prbs, 'att_out': att_out_prbs}
             res['attentions'] = [] if sample_inputs > 0 else np.zeros(ATT_SIZE)
         else:
@@ -168,7 +168,7 @@ def run_qa_pipeline(model_name: str, filter_inputs=True, single_input=True, samp
             res['mean'] = np.concatenate((res['mean'], agg_func(np.mean)), axis=0)
             res['std'] = np.concatenate((res['std'], agg_func(np.std)), axis=0)
             res['sparsity'] = np.add(res['sparsity'], add_func(get_spars, att_array))
-            res['scrs_spars'] = np.add(res['scrs_spars'], add_func(get_scrs_spars, scrs_prbs))
+            res['scrs_spars'] = np.add(res['scrs_spars'], add_func(get_spars, scrs_prbs))
             if sample_inputs > 0:
                 res['q'] += q_prbs
                 res['k'] += k_prbs
@@ -800,7 +800,7 @@ def plot_stat_features(stat_features, features_to_plot=['max', 'min', 'std']):
     plt.close(fig)
 
 
-def run_qa_pipeline_for_profiling(model_name, activation_name: str, scrs_thres=None, param_thres=-1.0, samples=-1):
+def run_qa_pipeline_for_profiling(model_name, activation_name: str, scrs_thres=None, scrs_max=None, param_thres=-1.0, samples=-1):
 
     params_thres, att_sparsity = [], None
 
@@ -840,14 +840,14 @@ def run_qa_pipeline_for_profiling(model_name, activation_name: str, scrs_thres=N
     # run the prediction, calculate and store the hist
     for qa_pair in tqdm(associated_data):
         prediction = qa_pipeline(
-            {'context': qa_pair['context'], 'question': qa_pair['question']}, max_seq_len=320, head_mask=head_mask, scrs_thresholds=scrs_thres)
+            {'context': qa_pair['context'], 'question': qa_pair['question']}, max_seq_len=320, head_mask=head_mask, scrs_thresholds=scrs_thres, scrs_max=scrs_max)
         q_prbs, k_prbs, v_prbs, scrs_prbs, att_out_prbs = prediction['pipeline_prbs']
         dat = {'q': q_prbs, 'k': k_prbs, 'v': v_prbs, 'scrs': scrs_prbs, 'att_out': att_out_prbs}
         if param_thres >= 0.0:
             for i in dat[activation_name]:
                 temp = np.sort(i, axis=-1)
-                thres_index = int(i.shape[-1]*param_thres) if param_thres < 1.0 else -1
-                print("selecting {}/{}".format(thres_index, i.shape[-1]))
+                thres_index = int(i.shape[-1]*param_thres) if param_thres < 1.0 else int(0-param_thres)
+                tqdm.write("selecting {}/{}".format(thres_index, i.shape[-1]))
                 temp = temp[:,:,:,thres_index]
                 params_thres.append(temp)
 
@@ -864,12 +864,12 @@ def run_qa_pipeline_for_profiling(model_name, activation_name: str, scrs_thres=N
     return params_thres, att_sparsity
 
 
-def param_thres_profiling(model_name: str, activation_name: str, param_thres:float, samples=-1):
+def param_thres_profiling(model_name: str, activation_name: str, param_thres:float, samples=-1, scrs_max=None):
     '''
     profiling max value per head of one of the activations: scrs,
     '''
 
-    param_thres, _ = run_qa_pipeline_for_profiling(model_name, "scrs", param_thres=param_thres, samples=samples)
+    param_thres, _ = run_qa_pipeline_for_profiling(model_name, "scrs", param_thres=param_thres, samples=samples, scrs_max=scrs_max)
 
     mean_res = np.concatenate(param_thres, axis=-1)
     # plt.hist(res[0][0], bins=50, weights=[1.0/(res.shape[-1])]*res.shape[-1])
@@ -888,13 +888,13 @@ def param_thres_profiling(model_name: str, activation_name: str, param_thres:flo
     return mean_res, max_res
 
 
-def search_maxscrs_thresholds(model_name, init_bound=0.8, target_sparsity=0.8, samples=100):
+def search_maxscrs_thresholds(model_name, init_bound=0.9, target_sparsity=0.7, samples=100, scrs_max=None):
     lower_bound, upper_bound = 0.0, init_bound
     avg_spars = 0.0
     while abs(avg_spars-target_sparsity) > 0.01:
         curr_test_scrs_rate = (lower_bound + upper_bound) / 2.0
-        thres, _ = param_thres_profiling(model_name, 'scrs', curr_test_scrs_rate, samples=samples)
-        _, spars = run_qa_pipeline_for_profiling(model_name, activation_name='scrs', scrs_thres=thres, samples=samples)
+        thres, _ = param_thres_profiling(model_name, 'scrs', curr_test_scrs_rate, samples=samples, scrs_max=scrs_max)
+        _, spars = run_qa_pipeline_for_profiling(model_name, activation_name='scrs', scrs_thres=thres, scrs_max=scrs_max, samples=samples)
         if avg_spars == np.mean(spars): break
         else: avg_spars = np.mean(spars)
 
@@ -904,16 +904,16 @@ def search_maxscrs_thresholds(model_name, init_bound=0.8, target_sparsity=0.8, s
             upper_bound = curr_test_scrs_rate
 
         print("average sparsity: {:.4f}".format(avg_spars))
+        print("lower: {:.2f}, upper: {:.2f}".format(lower_bound, upper_bound))
 
     return thres
 
 
 def profile_scrs_max(model_name, samples=100):
-    max_scrs, _ = run_qa_pipeline_for_profiling(model_name, 'scrs', param_thres=0.9, samples=samples)
+    max_scrs, _ = run_qa_pipeline_for_profiling(model_name, 'scrs', param_thres=1, samples=samples)
     mean_res = np.concatenate(max_scrs, axis=-1)
     mean_res = np.amax(mean_res, axis=-1)
 
-    print(mean_res)
     return mean_res
 
 if __name__ == '__main__':
@@ -1009,7 +1009,7 @@ if __name__ == '__main__':
         print("scrs_meansum: ", scrs_meansum)
 
         # tv.plot_dist_per_token(attens, 200, scale='log', attached_fname='attention', ylim=(0.2, 1))
-        tv.plot_dist_per_token(scrs, 50, scale='linear', attached_fname='scrs', xlim=(-10, 10), ylim=(0.4, 1))
+        tv.plot_dist_per_token(scrs, 50, scale='linear', attached_fname='scrs', xlim=(0, 1), ylim=(0.4, 1))
 
         # effective_seq_len = [i.shape[-1] for i in attens]
         # effective_h_states = [np.squeeze(h_states[:, i, :effective_seq_len[i], :]) for i in range(h_states.shape[1])]
@@ -1106,14 +1106,15 @@ if __name__ == '__main__':
         scrs_thres_path = PARAM_PATH + "scrs_threshold.npy"
         scrs_max_path = PARAM_PATH + "scrs_max.npy"
         
-        # scrs_thres = search_maxscrs_thresholds(model_name, samples=samples)
-        # with open(scrs_thres_path, 'wb+') as f:
-        #     np.save(f, scrs_thres)
-
-        # print(scrs_thres)
-
-        scrs_max = profile_scrs_max(model_name, samples=samples)
-        with open(scrs_max_path, 'wb+') as f:
-            np.save(f, scrs_max)
+        if scrs_max is None:
+            scrs_max = profile_scrs_max(model_name, samples=samples)
+            with open(scrs_max_path, 'wb+') as f:
+                np.save(f, scrs_max)
 
         print(scrs_max)
+
+        scrs_thres = search_maxscrs_thresholds(model_name, target_sparsity=0.8, samples=samples, scrs_max=scrs_max)
+        with open(scrs_thres_path, 'wb+') as f:
+            np.save(f, scrs_thres)
+
+        print(scrs_thres)        

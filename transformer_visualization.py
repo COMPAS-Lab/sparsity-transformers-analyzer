@@ -207,7 +207,7 @@ def plot_dist_per_token(data, bin_step, attn_max=None, attn_min=None, sparse_his
         hist_x_start = min([np.amin(i) for i in data])
         hist_x_start = -100 if np.isneginf(hist_x_start) else hist_x_start
         hist_x_end = max([np.amax(i) for i in data])
-    hist_x_start, hist_x_end = -10, 10
+    hist_x_start, hist_x_end = 0, 1
 
     attn_bins, attn_hists = get_bin_edges(bin_step, hist_x_start, hist_x_end, scale), None
     atten_bar_width = [attn_bins[i] - attn_bins[i-1] for i in range(1, len(attn_bins))]

@@ -1,2 +1,5 @@
 *
 !.gitignore
+!*.md
+!scrs_threshold_*.npy
+!scrs_max_*.npy
