@@ -199,6 +199,7 @@ def run_qa_pipeline(model_name: str, filter_inputs=True, single_input=True, samp
 
     res['sparsity'] = res['sparsity'].astype(float) / total_elem_count
     res['qa_pair_len'] = fed_data_len
+
     return res
 
 
