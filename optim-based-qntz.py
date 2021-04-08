@@ -5,6 +5,7 @@ import sys
 import urllib
 from pprint import pprint
 from itertools import compress
+from tqdm import tqdm
 
 import random
 
@@ -23,6 +24,7 @@ DATA_PATH = "./data/"
 MAX_SEQ_LEN = 320
 ATT_SIZE = [12, 12, MAX_SEQ_LEN, MAX_SEQ_LEN]
 HS_SIZE = [ATT_SIZE[0]+1, 1, MAX_SEQ_LEN, 64*ATT_SIZE[1]]
+DEVICE="cuda:2"
 
 ####################################################################
 ####################################################################
@@ -74,8 +76,12 @@ def parse_squad_json(squad_ver='v1.1'):
                 for qa in pgraph["qas"]:
                     if (squad_ver == 'v1.1') or (squad_ver == "v2.0" and not qa["is_impossible"]):
                         answers = get_end_idx(qa['answers'], [pgraph["context"],]*len(qa["answers"]))
+                        gold_ans, ans_start, ans_end = [], [], []
                         for answer in answers:
-                            ques_per_paragraph.append({"question": qa["question"], "answers": answer["text"], "start_positions":answer["answer_start"], "end_positions":answer["answer_end"]})
+                            gold_ans.append(answer["text"])
+                            ans_start.append(answer["answer_start"])
+                            ans_end.append(answer["answer_end"])
+                        ques_per_paragraph.append({"question": qa["question"], "answers": gold_ans, "start_positions":ans_start, "end_positions":ans_end})
                 data[pgraph["context"]] = ques_per_paragraph
 
     return data
@@ -139,10 +145,10 @@ def run_qa_pipeline(qa_pipeline, filter_inputs=True, single_input=True, sample_i
     # run the prediction
     for qa_pair in fed_data:
         print("running pipeline iter {}/{}...".format(pipeline_running_counter, fed_data_len))
-        prediction = qa_pipeline(
+        prediction, loss = qa_pipeline(
             {'context': qa_pair['context'], 'question': qa_pair['question']}, max_seq_len=MAX_SEQ_LEN, att_threshold=att_threshold, hs_threshold=hs_threshold, head_mask=head_mask, quantize_att_bits=att_quant_bits, quantize_hstate_bits=hstate_quant_bits)
-        em_score = max(compute_exact(prediction['answer'], gold_ans)
-                       for gold_ans in qa_pair['answers'])
+        #pprint ({'context': qa_pair['context'], 'question': qa_pair['question'], "answer": qa_pair['answers']})
+        em_score = max(compute_exact(gold_ans, prediction['answer']) for gold_ans in qa_pair['answers'])
         att_array = prediction['attentions']
         q_prbs, k_prbs, v_prbs, scrs_prbs, att_out_prbs = prediction['pipeline_prbs']
 
@@ -209,59 +215,94 @@ def run_qa_pipeline(qa_pipeline, filter_inputs=True, single_input=True, sample_i
 def set_quantize(layers, pipeline):
 
     #TODO: set model name based on the model you are using. 
+    pipeline.model.qa_outputs.requires_grad=False
+    for layer_idx in range(13):
+        layer = pipeline.model.roberta.embeddings.parameters() if layer_idx == 0 else pipeline.model.roberta.encoder.layer[layer_idx-1].parameters()
+        for params in layer:
+            params.requires_grad=False
+
     for layer_idx in layers:
         pipeline.model.roberta.encoder.layer[layer_idx].attention.self.quantize = True
+        for params in pipeline.model.roberta.encoder.layer[layer_idx].attention.self.quantizer.parameters():
+            params.requires_grad=True
+            print (params.data)
     
     return pipeline
 
 def get_batch(fed_data, start_idx, end_idx):
 
     batch_data = {"context": [], "question": [], "start_positions": [], "end_positions":[], "answers": []}
-    print (start_idx, end_idx, len(fed_data))
-    pprint (fed_data[start_idx: min(end_idx, len(fed_data))])
+    #print (start_idx, end_idx, len(fed_data))
+    #pprint (fed_data[start_idx: min(end_idx, len(fed_data))])
     for qa_pair in fed_data[start_idx: min(end_idx, len(fed_data))]:
-        
-        for item in batch_data:
-            batch_data[item].append(qa_pair[item])
+
+        batch_data["context"].append(qa_pair["context"])
+        batch_data["question"].append(qa_pair["question"])
+        batch_data["start_positions"].append(qa_pair["start_positions"][0])
+        batch_data["end_positions"].append(qa_pair["end_positions"][0])
+        batch_data["answers"].append(qa_pair["answers"][0])
+        #for item in batch_data:
+            #batch_data[item].append(qa_pair[item])
     
-    batch_data["start_positions"] = torch.tensor(batch_data["start_positions"], dtype=torch.long).to("cuda:0")
-    batch_data["end_positions"] = torch.tensor(batch_data["end_positions"], dtype=torch.long).to("cuda:0")
+    batch_data["start_positions"] = torch.tensor(batch_data["start_positions"], dtype=torch.long).to(DEVICE)
+    batch_data["end_positions"] = torch.tensor(batch_data["end_positions"], dtype=torch.long).to(DEVICE)
     return batch_data
+
+def extract_ans(pred, gold_ans):
+
+    em_score = compute_exact(gold_ans, pred['answer'])
+    f1 = compute_f1(gold_ans, pred['answer'])
+    return pred["answer"], em_score, f1
 
 
 def train(qa_pipeline, fed_data):
-    optim = torch.optim.AdamW(qa_pipeline.model.parameters(), lr=0.001, weight_decay=0)
-    batch_size = 12
+    optim = torch.optim.AdamW(qa_pipeline.model.parameters(), lr=3e-5, weight_decay=1e-3)
+    batch_size = 20
     losses = []
-    res = {}
+    res = {"score":0, "num_instances":0, "preds": [], "f1":0}
 
-    qa_pipeline.model.to("cuda:0")
-
-    for start in range(0, len(fed_data), batch_size):
+    qa_pipeline.model.to(DEVICE)
+    for start in tqdm(range(0, len(fed_data), batch_size), desc="training"):
         batch_data = get_batch(fed_data, start, start+batch_size)
-        
         predictions, loss_batch = qa_pipeline(**batch_data)
-        print (f"loss = {loss_batch}")
-        sys.exit(0)
+        if isinstance(predictions, List):
+            for i, pred in enumerate(predictions):
+                answer, em_score, f1 = extract_ans(pred, batch_data["answers"][i])
+                res["score"] += em_score
+                res["f1"] += f1
+                res["num_instances"] += 1
+                res["preds"].append(answer)
+        else:
+            answer, em_score = extract_ans(predictions, batch_data["answers"][0])
+            res["score"] += em_score
+            res["f1"] += f1
+            res["num_instances"] += 1
+            res["preds"].append(answer)
+
         #process results/metrics
         optim.zero_grad()
         loss_batch.backward()
         optim.step()
-        losses.append(loss_batch.item())
-        
+        losses.append(loss_batch.detach().cpu().item())
+        #print (f"loss = {loss_batch}")
     
     return (res, losses)
 
 def train_quantizer(qa_pipline, num_epochs, filter_inputs=True, single_input=True, sample_inputs=-1):
 
     fed_data, associated_data = get_qa_trainset(filter_inputs, single_input, sample_inputs)
-
     losses = []
     for epoch in range(num_epochs):
         res, loss_epoch = train(qa_pipeline, fed_data)
-        losses.append(loss_epoch.mean().item())
-        #metrics
-    
+        losses.append(np.array(loss_epoch).mean().item())
+        print (f"Epoch {epoch} Loss: {losses[-1]}")
+        print (f"Epoch {epoch} EM: {res['score']/res['num_instances']}")
+        print (f"Epoch {epoch} F1: {res['f1']/res['num_instances']}")
+
+        for layer_idx in [0,]:
+            for params in pipeline.model.roberta.encoder.layer[layer_idx].attention.self.quantizer.parameters():
+                print (params.data)
+
     return (losses, res, qa_pipeline)
 
 
@@ -278,17 +319,17 @@ if __name__ == "__main__":
     data = parse_squad_json()
     qa_pipeline = pipeline(
         "question-answering",
-        model="roberta-base",
-        tokenizer="roberta-base",
-        device=0)
+        model="csarron/roberta-base-squad-v1",
+        tokenizer="csarron/roberta-base-squad-v1",
+        device=int(DEVICE[-1]))
 
     predictions = run_qa_pipeline(
             qa_pipeline, filter_inputs=False, single_input=False, \
             sample_inputs=args.samples, att_threshold=0.0, hs_threshold=0.0, \
             att_quant_bits=4.0, hstate_quant_bits=0.0)
         
-    pipeline = set_quantize(layers=[11,], pipeline=qa_pipeline)
-    train_quantizer(qa_pipeline, 1)
+    pipeline = set_quantize(layers=[0,], pipeline=qa_pipeline)
+    train_quantizer(qa_pipeline, 10, filter_inputs=False, single_input=False, sample_inputs=500)
     #test_quantizer(qa_pipeline)
     
 

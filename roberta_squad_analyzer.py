@@ -2,6 +2,7 @@
 roberta squad analyzer: analyzer sparsity of the roberta on squad 
 """
 
+from pprint import pprint 
 from transformers import pipeline
 from transformers import AutoConfig, AutoTokenizer, AutoModelForQuestionAnswering
 from transformers.data.metrics.squad_metrics import *
@@ -136,8 +137,9 @@ def run_qa_pipeline(model_name: str, filter_inputs=True, single_input=True, samp
         print("running pipeline iter {}/{}...".format(pipeline_running_counter, fed_data_len))
         prediction = qa_pipeline(
             {'context': qa_pair['context'], 'question': qa_pair['question']}, max_seq_len=MAX_SEQ_LEN, att_threshold=att_threshold, hs_threshold=hs_threshold, head_mask=head_mask, quantize_att_bits=att_quant_bits, quantize_hstate_bits=hstate_quant_bits)
-        em_score = max(compute_exact(prediction['answer'], gold_ans)
+        em_score = max(compute_exact(gold_ans, prediction['answer'])
                        for gold_ans in qa_pair['answers'])
+        #pprint ({'context': qa_pair['context'], 'question': qa_pair['question'], "answer": qa_pair["answers"]})
         att_array = prediction['attentions']
         q_prbs, k_prbs, v_prbs, scrs_prbs, att_out_prbs = prediction['pipeline_prbs']
 
