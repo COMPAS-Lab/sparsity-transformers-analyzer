@@ -493,7 +493,11 @@ def quantize_init(model, scheme="range-based-log", bits=3):
         offset_val = (cutpoints[0]+cutpoints[1])/2.0
         bounds = torch.FloatTensor([2**(i+min_exp) for i in cutpoints])
         for layer_idx in range(len(model.roberta.encoder.layer)):
-            model.roberta.encoder.layer[layer_idx].attention.self.quantizer.init_bounds(bounds=weights)
+            model.roberta.encoder.layer[layer_idx].attention.self.quantizer.init_bounds(bounds=bounds)
+
+    elif scheme=="bounds-random":
+        for layer_idx in range(len(model.roberta.encoder.layer)):
+            model.roberta.encoder.layer[layer_idx].attention.self.quantizer.init_bounds(bits=bits)
 
     return model
 
