@@ -486,10 +486,19 @@ def quantize_init(model, scheme="range-based-log", bits=3):
         for layer_idx in range(len(model.roberta.encoder.layer)):
             model.roberta.encoder.layer[layer_idx].attention.self.quantizer.init_weights(bits=bits)
 
+    elif scheme=="bounds":
+        min_exp, max_exp = np.log2(1e-3), np.log2(1.0) #Softmax maximum value
+        base = (max_exp-min_exp) / (2.0**bits - 1)
+        cutpoints = [0.0] + [(i+1)*base for i in range(int(2.0**bits-1))]
+        offset_val = (cutpoints[0]+cutpoints[1])/2.0
+        bounds = torch.FloatTensor([2**(i+min_exp) for i in cutpoints])
+        for layer_idx in range(len(model.roberta.encoder.layer)):
+            model.roberta.encoder.layer[layer_idx].attention.self.quantizer.init_bounds(bounds=weights)
+
     return model
 
 
-def set_quantize(layers, model):
+def set_quantize(layers, model, quantize=True):
 
     #TODO: set model name based on the model you are using. 
     #model.qa_outputs.requires_grad=False
@@ -501,7 +510,7 @@ def set_quantize(layers, model):
         p.requires_grad=False
 
     for layer_idx in layers:
-        model.roberta.encoder.layer[layer_idx].attention.self.quantize = True
+        model.roberta.encoder.layer[layer_idx].attention.self.quantize = quantize
         for params in model.roberta.encoder.layer[layer_idx].attention.self.quantizer.parameters():
             params.requires_grad=True
             print (layer_idx,":",params.data)
@@ -784,7 +793,7 @@ def main():
 
     #print (model)
     model = quantize_init(model, scheme=args.scheme, bits=3)
-    model = set_quantize(list(range(12)), model)
+    model = set_quantize(list(range(12)), model, quantize=True if "bounds" not in args.scheme  else "bounds")
     #print (model)
     #sys.exit(0)
 
