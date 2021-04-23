@@ -746,7 +746,7 @@ def plot_em_quant(sparsity_data: dict, bin_em=None, ori_em=None, ori_label_offse
     # plt.xticks(fontsize=15)
     patches = []
     bax = brokenaxes(xlims=((16.5, break_start), (break_end, 0.9)), ylims=ylims,
-                        left=0.12,right=0.98,top=0.975,bottom=0.15,wspace=0.1,hspace=0.05, 
+                        left=0.12,right=0.98,top=0.975,bottom=0.15,wspace=0.1,hspace=0.15, 
                         despine=False)
     bax.set_xlabel("#bits", labelpad=11)
     bax.set_ylabel(ylabel, labelpad=26)

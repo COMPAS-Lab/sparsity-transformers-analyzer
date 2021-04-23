@@ -1,0 +1,344 @@
+from math import ceil, floor, exp, log2, gcd
+import numpy as np
+import matplotlib.pyplot as plt
+import random
+
+# Helper functions:
+def log2Up(x):
+    return float(ceil(log2(x)))
+def log2Down(x):
+    return float(floor(log2(x)))
+
+def lcm(a: float, b: float):
+    return a*b/gcd(a, b)
+
+def dspToAlu(dsp, dtype: str):
+    return dsp / 2.0 if dtype == 'float32' else dsp
+
+class MatMulDimErr(Exception):
+    pass
+
+class DpuModel:
+    '''
+    This class is used to construct DPU hardware model which does AxB
+    '''
+    num_mults_per_dpu = 0
+    num_dpus = 0
+    a_w = 0
+    a_h = 0
+    b_w = 0
+    b_h = 0
+
+    COMP_LAT = 1.0
+    ADDER_LAT = 1.0
+    MULT_LAT = 1.0
+
+    ADDER_RES = 1
+    MULT_RES = 1
+    DIV_RES = 0
+    COMP_RES = 0
+
+    WORD_SIZE = 2
+
+    def __init__(self, a_h, a_w, b_h, b_w, blk_h, blk_w):
+        self.a_w = a_w
+        self.a_h = a_h
+        self.b_w = b_w
+        self.b_h = b_h
+        self.num_mults_per_dpu = blk_h
+        self.num_dpus = blk_w
+
+        if self.b_h != self.a_w:
+            raise MatMulDimErr("Error: mat mut dim mismatch")
+            
+
+    # derived parameters
+    def input_len_per_cycle(self): return self.num_mults_per_dpu
+    def num_wei_per_dpu(self): return float(ceil(self.b_w / self.num_dpus))
+    def num_grps_in_a(self): return float(ceil(self.a_w / self.input_len_per_cycle()))
+    def add_lat(self): return self.ADDER_LAT
+    def mult_lat(self): return self.MULT_LAT
+    def adder_tree_lat(self): 
+        return self.add_lat() * log2Up(self.input_len_per_cycle())
+
+    def elemul_addtree_lat(self): return self.mult_lat() + self.adder_tree_lat()
+    def dpu_lat(self): return self.elemul_addtree_lat() + self.add_lat()
+    def compute_lat(self):
+        input_cycles = self.num_grps_in_a() * self.num_wei_per_dpu() * self.a_h
+        return input_cycles + self.dpu_lat()
+    
+    def compute_lat_teardown(self):
+        input_cycles = self.num_grps_in_a() * self.num_wei_per_dpu() * self.a_h
+        adder_tree_cycles = self.elemul_addtree_lat()
+        adder_lat = self.add_lat()
+        return input_cycles, adder_tree_cycles, adder_lat
+
+    def compute_resource(self):
+        dpu_mults = self.num_mults_per_dpu * self.num_dpus
+        dpu_adders, rest_elems = 0.0, self.num_mults_per_dpu
+        while rest_elems > 0.0:
+            dpu_adders += float(2 ** int(log2Down(rest_elems)))
+            rest_elems -= float(2 ** int(log2Down(rest_elems)))
+
+        dpu_adders = (dpu_adders-1.0) * self.num_dpus
+        print(f"dpu mults: {dpu_mults}, dpu adders: {dpu_adders}")
+
+        mem_usage = self.b_w * self.b_h * self.WORD_SIZE * 8 / 1024.
+        return dpu_mults * self.MULT_RES + dpu_adders * self.ADDER_RES, mem_usage
+
+
+class BertModel:
+    '''
+    This class is used to construct bert hardware model
+    '''
+    exps = None
+    matmul_v_model = None
+    matmul_q_model = None
+    matmul_k_model = None
+    num_layers = 0.0
+    num_heads = 0.0
+    embd_size = 0.0
+    max_seq_len = 320.
+
+    COMP_LAT = 2.0
+    ADDER_LAT = 11.0
+    MULT_LAT = 8.0
+    DIV_LAT = 28
+
+    ADDER_RES = 2
+    MULT_RES = 2
+    DIV_RES = 0
+    COMP_RES = 0
+
+    WORD_SIZE = 2
+
+    def __init__(self, embd_size=768.0, num_layers=0.0, num_heads=0.0, read_exp_samples=False):
+        if read_exp_samples:
+            self.load_exp_out('./params/')
+            self.num_layers = self.exps[0].shape[0]
+            self.num_heads = self.exps[0].shape[1]
+        else:
+            self.num_layers = num_layers
+            self.num_heads = num_heads
+            
+        self.embd_size = embd_size
+        
+        if self.num_layers == 0 or self.num_heads == 0:
+            raise Exception("BertModel init error: lack of critical parameters")
+
+    def analyzer_void_columns(self):
+        if self.exps is None:
+            return 0.0
+        else:
+            num_void_columns = []
+            for inst in self.exps:
+                for layer in inst:
+                    for head in layer:
+                        num_void_columns.append((np.sum(np.sum(head, axis=0) == 0.), head.shape[-1]))
+        
+            print(np.mean([num_void_column/num_column for num_void_column, num_column in num_void_columns]))
+            return num_void_columns
+
+    def load_exp_out(self, path):
+        atten_path = path + "attentions_sampled.npy"
+        exp_path = path + "scrs_sampled.npy"
+        exps = []
+
+        with open(atten_path, "rb") as attention_file:
+            atten_len, _ = (np.load(attention_file))[0], []
+        
+        with open(exp_path, 'rb') as exps_file: 
+            for i in range(atten_len): exps.append(np.load(exps_file))
+
+        self.exps = exps
+
+    def probe_exps(self):
+        fig, ax = plt.subplots(1, 1, figsize=(24, 4))
+        indices = ["{}".format(i+1) for i in range(144)]
+        for i in range(144):
+            if i%12 == 6: indices[i] = "layer {}".format(int(i/12) + 1)
+
+        dat_sampled = random.sample(self.exps, 10)
+        for dat in dat_sampled:
+            print(dat.shape)
+            num_zeros = np.count_nonzero((dat == 0.), axis=-1) / dat.shape[-1]
+            
+            num_zeros = num_zeros.reshape((num_zeros.shape[0]*num_zeros.shape[1], num_zeros.shape[2]))
+            for i in range(num_zeros.shape[-1]):
+                ax.plot(indices, num_zeros[:, i], 'o', color='black', alpha=0.06, markersize=2)
+
+        ax.grid(linestyle='--', color='grey', alpha=0.4)
+        ax.margins(0.002)
+
+        ax.set_ylabel('#zeros in a row', fontsize=22)
+        for l in range(12):
+            ax.axvspan(l*12-0.5, l*12+12-0.5, alpha=0.2, facecolor='C{}'.format(l))
+        ax.set_xticklabels(indices, Fontsize=22)
+        for idx, tick in enumerate(ax.xaxis.get_major_ticks()):
+            if idx % 12 !=6:
+                tick.label1.set_visible(False)
+            else: tick.label1.set_visible(True)
+            
+        for idx, tick in enumerate(ax.yaxis.get_major_ticks()):
+            tick.label.set_fontsize(22)
+
+        # ax.legend(handles=patches, loc='upper right', ncol=1, fontsize=22)
+
+        fig.tight_layout()
+        fig.savefig('res_fig/exps_count_zeros.png')
+        plt.clf()
+
+    def softmax_resources(self, p1, p2, l3, quant_bits):
+        exp_resources = p1 * (2 ** quant_bits - 1) * self.COMP_RES
+        exp_mem = p1 * (2 ** quant_bits * self.num_heads) / 2.0
+
+        adder_tree_adders, rest_elems = 0.0, p1
+        while rest_elems > 1.0:
+            adder_tree_adders += float(2 ** int(log2Down(rest_elems)))
+            rest_elems -= float(2 ** int(log2Down(rest_elems)))
+
+        adder_tree_adders *= self.ADDER_RES
+
+        accu_mem = l3 * 2
+        # calculate exp out buffer
+        density = 0.3
+        exp_out_buffer = (np.ceil(self.max_seq_len / p1) - 1) * l3 * p1 * density
+
+        div_resources = p2 * self.DIV_RES
+
+        row_parallelism = np.ceil(self.max_seq_len / l3)
+        total_mem = row_parallelism * (exp_mem + accu_mem + exp_out_buffer) * self.WORD_SIZE / 1024
+        total_res = row_parallelism * (exp_resources + adder_tree_adders + 1 + div_resources)
+
+        return total_res, total_mem
+
+    def softmax_mem_teardown(self, p1, p2, l3, quant_bits):
+        exp_mem = p1 * (2 ** quant_bits * self.num_heads) / 2.0
+
+        accu_mem = l3 * 2
+        # calculate exp out buffer
+        density = 0.3
+        exp_out_buffer = (np.ceil(self.max_seq_len / p1) - 1) * l3 * p1 * density
+
+        row_parallelism = np.ceil(self.max_seq_len / l3)
+        exp_mem = row_parallelism * exp_mem * self.WORD_SIZE / 1024
+        accu_mem = row_parallelism * accu_mem * self.WORD_SIZE / 1024
+        exp_out_buffer = row_parallelism * exp_out_buffer * self.WORD_SIZE / 1024
+
+        return {'exp mem': exp_mem, "accu mem": accu_mem, "exp out buffer": exp_out_buffer}
+
+    def qp_exp_lat(self):
+        lut_decoder_lat = 0.0
+        lut_lat = 2.0
+        return self.COMP_LAT + lut_decoder_lat + lut_lat
+
+    def softmax_lat(self, exp_dat, p1=1., p2=1.):
+        '''
+        argument:
+        exp_dat - output of attention exponent func  
+        '''
+        adder_tree_stages = log2(p1)
+        row_itlve_len = exp_dat.shape[0]
+
+        a_cols = np.count_nonzero(exp_dat, axis=-1)
+        # padding zeros for unaligned parallel sub-cols
+        a_cols_1 = np.ceil(a_cols / p1)
+        a_cols_2 = np.ceil(a_cols / p2)
+        lat = self.qp_exp_lat()
+        lat += ((adder_tree_stages+1) * self.ADDER_LAT)
+        
+        #check parallelism eligibility
+        p2_consuming = np.amax(a_cols_2) * row_itlve_len
+        p1_producing = np.ceil(exp_dat.shape[-1] / p1) * row_itlve_len
+
+        if np.sum(a_cols) == 0:
+            return 0.0
+
+        if p1_producing < p2_consuming:
+            return float("inf")
+
+        if row_itlve_len <= self.ADDER_LAT: 
+            lat += self.ADDER_LAT * (np.max(a_cols_1) - 1)
+        else:
+            rows_remained = row_itlve_len
+            a_cols_1_copied = a_cols_1
+            # as the computation goes, the remained number of rows decreases
+            # as soon as the rest num of rows is smaller than adder latency,
+            # no rows can be interleaved to hide the latency any more.
+            while rows_remained > self.ADDER_LAT:
+                lat += self.ADDER_LAT + rows_remained - self.ADDER_LAT
+                a_cols_1_copied -= 1
+                rows_remained=np.sum(a_cols_1_copied > 0)
+            
+            if rows_remained > 0:
+                lat += self.ADDER_LAT * (np.max(a_cols_1_copied) - 1)
+
+        lat += self.DIV_LAT + np.sum(a_cols_2)
+
+        return lat
+
+    def baseline_softmax_resource(self, p, l):
+        exp_resource = self.MULT_RES + self.ADDER_RES
+        log_resource = self.ADDER_RES
+
+        tree_elems, rest_elems = 0.0, p
+        while rest_elems > 1.0:
+            tree_elems += float(2 ** int(log2Down(rest_elems)))
+            rest_elems -= float(2 ** int(log2Down(rest_elems)))
+        
+        res_all = (tree_elems + 1) * self.COMP_RES
+        res_all += self.ADDER_RES * p
+        res_all += exp_resource * p
+        res_all += (tree_elems + 1) * self.ADDER_RES
+        res_all += self.ADDER_RES * 2 * p
+        res_all += exp_resource * p
+        res_all += log_resource
+
+        row_parallelism = np.ceil(self.max_seq_len/l)
+        res_all *= row_parallelism
+
+        exp_lat = self.ADDER_LAT + self.MULT_LAT + 1 + 2
+        stg_2_lat = self.ADDER_LAT + exp_lat + log2Up(p) * self.ADDER_LAT + self.ADDER_LAT
+
+        exp_mem = 64
+        log_mem = 64 + 32
+        buffer_mem = p * stg_2_lat
+
+        mem_all = row_parallelism * (exp_mem * p * 2 + log_mem + buffer_mem) * self.WORD_SIZE / 1024
+
+        return res_all, mem_all
+
+
+    def baseline_softmax_lat(self, exp_dat, pa=4.):
+        exp_lat = self.ADDER_LAT + self.MULT_LAT + 1 + 2
+        ln_lat = 2 + self.ADDER_LAT
+        
+        stg_1_lat = log2Up(pa) * self.COMP_LAT
+        stg_1_lat += max(self.COMP_LAT, exp_dat.shape[-1]-1) * (ceil(exp_dat.shape[0] / pa) - 1)
+
+        stg_2_lat = self.ADDER_LAT + exp_lat + log2Up(pa) * self.ADDER_LAT + self.ADDER_LAT
+        stg_2_lat += max(self.ADDER_LAT, exp_dat.shape[-1]-1) * (ceil(exp_dat.shape[0] / pa) - 1)
+
+        stg_3_lat = ln_lat + self.ADDER_LAT + exp_lat
+        stg_3_lat += exp_dat.shape[0] * exp_dat.shape[-1]
+
+        pipeline_lat = stg_1_lat + stg_2_lat + stg_3_lat
+
+        return pipeline_lat
+
+    def matmul_lat_qkv_per_head(self, seq_len, blk=(64.0, 64.0)):
+        dpu_model = DpuModel(seq_len, self.embd_size,  self.embd_size, self.embd_size/self.num_heads, blk[0], blk[1])
+        return dpu_model.compute_lat()
+
+    def matmul_res_qkv_per_head(self, blk, seq_len=320):
+        dpu_model = DpuModel(seq_len, self.embd_size,  self.embd_size, self.embd_size/self.num_heads, blk[0], blk[1])
+        return dpu_model.compute_resource()
+
+    
+
+if __name__ == '__main__':
+    bert_hw_model = BertModel(read_exp_samples=True)
+    # bert_hw_model.probe_exps()
+
+    temp_lat = bert_hw_model.softmax_lat(bert_hw_model.exps[0][0, 0, :20, :20], p1=8, p2=16)
+    print(temp_lat)

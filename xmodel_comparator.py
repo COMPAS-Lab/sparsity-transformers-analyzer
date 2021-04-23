@@ -83,7 +83,7 @@ if __name__ == '__main__':
     roberta_squad_range_log_prune_score_quant_softmax = get_em_quantbits(\
         './quantized_params/scores/roberta-squad-range-log-clamped-midval-prune-score-quantize-softmax', avg_score=True)
     roberta_squad_range_log_prune_score_quant_exp = get_em_quantbits(\
-        './quantized_params/scores/roberta-squad-range-log-clamped-midval-prune-score-quantize-exp', avg_score=True)
+        './quantized_params/scores/roberta-squad-range-log-clamped-midval-prune-score-quantize-exp-new', avg_score=True)
     # roberta_squad_range_linear_prune_score_quant_score = get_em_quantbits(\
     #     './quantized_params/scores/roberta-squad-range-linear-clamped-midval-prune-score-quantize-score-mean', avg_score=True)
     roberta_squad_range_linear_prune_score_quant_score = get_em_quantbits(\
@@ -161,15 +161,17 @@ if __name__ == '__main__':
     tv.plot_em_quant({
                         'original softmax, quant att(log)': roberta_squad_range_log_prune_score_original, 
                         'prune score quant softmax (log)': roberta_squad_range_log_prune_score_quant_softmax, 
-                        'prune score quant exp (log)': roberta_squad_range_log_prune_score_quant_exp, 
-                        'prune score quant score (lin)': roberta_squad_range_linear_prune_score_quant_score, 
-                        'prune score quant score (log)': roberta_squad_range_log_prune_score_quant_score,
+                        'prune and quant exp (log)': roberta_squad_range_log_prune_score_quant_exp, 
+                        # 'prune score quant score (lin)': roberta_squad_range_linear_prune_score_quant_score, 
+                        'prune and quant score (log)': roberta_squad_range_log_prune_score_quant_score,
                         }, 
                         ori_em={'original': 81.50}, \
                         ori_label_offset={'original': [1.5, 1.7]},
+                        ylims=((40, 50), (65, 85)),
                         ylabel='EM score', break_end=9.5, append_to_fname='_squad_att_vs_score_pr')
 
     print('roberta squad original: ', roberta_squad_original_em)
+    print('roberta prune and quant exp log: ', (81.5 - roberta_squad_range_log_prune_score_quant_exp['em'][5.0]*100)/81.5)
     print('roberta squad log clamped:', (roberta_squad_original_em - roberta_squad_quant_clamped_log_1e3['em'][3.0]*100)/roberta_squad_original_em)
     print('bert squad log clamped:', (bert_squad_ori_em - bert_squad_quant_log_clamped['em'][3.0]*100)/bert_squad_ori_em)
 
