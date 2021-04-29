@@ -54,8 +54,18 @@ class DpuModel:
 
     # derived parameters
     def input_len_per_cycle(self): return self.num_mults_per_dpu
-    def num_wei_per_dpu(self): return float(ceil(self.b_w / self.num_dpus))
-    def num_grps_in_a(self): return float(ceil(self.a_w / self.input_len_per_cycle()))
+    def num_wei_per_dpu(self, ideal=False): 
+        if ideal:
+            return self.b_w / self.num_dpus
+        else:
+            return float(ceil(self.b_w / self.num_dpus))
+
+    def num_grps_in_a(self, ideal=False): 
+        if ideal:
+            return self.a_w / self.input_len_per_cycle()
+        else:
+            return float(ceil(self.a_w / self.input_len_per_cycle()))
+    
     def add_lat(self): return self.ADDER_LAT
     def mult_lat(self): return self.MULT_LAT
     def adder_tree_lat(self): 
@@ -63,8 +73,8 @@ class DpuModel:
 
     def elemul_addtree_lat(self): return self.mult_lat() + self.adder_tree_lat()
     def dpu_lat(self): return self.elemul_addtree_lat() + self.add_lat()
-    def compute_lat(self):
-        input_cycles = self.num_grps_in_a() * self.num_wei_per_dpu() * self.a_h
+    def compute_lat(self, ideal=False):
+        input_cycles = self.num_grps_in_a(ideal=ideal) * self.num_wei_per_dpu(ideal=ideal ) * self.a_h
         return input_cycles + self.dpu_lat()
     
     def compute_lat_teardown(self):
@@ -314,10 +324,10 @@ class BertModel:
         ln_lat = 2 + self.ADDER_LAT
         
         stg_1_lat = log2Up(pa) * self.COMP_LAT
-        stg_1_lat += max(self.COMP_LAT, exp_dat.shape[-1]-1) * (ceil(exp_dat.shape[0] / pa) - 1)
+        stg_1_lat += max(self.COMP_LAT, exp_dat.shape[0]-1) * (ceil(exp_dat.shape[-1] / pa) - 1)
 
         stg_2_lat = self.ADDER_LAT + exp_lat + log2Up(pa) * self.ADDER_LAT + self.ADDER_LAT
-        stg_2_lat += max(self.ADDER_LAT, exp_dat.shape[-1]-1) * (ceil(exp_dat.shape[0] / pa) - 1)
+        stg_2_lat += max(self.ADDER_LAT, exp_dat.shape[0]-1) * (ceil(exp_dat.shape[-1] / pa) - 1)
 
         stg_3_lat = ln_lat + self.ADDER_LAT + exp_lat
         stg_3_lat += exp_dat.shape[0] * exp_dat.shape[-1]
@@ -326,9 +336,9 @@ class BertModel:
 
         return pipeline_lat
 
-    def matmul_lat_qkv_per_head(self, seq_len, blk=(64.0, 64.0)):
+    def matmul_lat_qkv_per_head(self, seq_len, blk=(64.0, 64.0), ideal=False):
         dpu_model = DpuModel(seq_len, self.embd_size,  self.embd_size, self.embd_size/self.num_heads, blk[0], blk[1])
-        return dpu_model.compute_lat()
+        return dpu_model.compute_lat(ideal=ideal)
 
     def matmul_res_qkv_per_head(self, blk, seq_len=320):
         dpu_model = DpuModel(seq_len, self.embd_size,  self.embd_size, self.embd_size/self.num_heads, blk[0], blk[1])
