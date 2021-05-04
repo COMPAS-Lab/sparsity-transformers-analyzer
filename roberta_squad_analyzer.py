@@ -830,17 +830,12 @@ def run_qa_pipeline_for_profiling(model_name, activation_name: str, scrs_thres=N
         associated_data = sum(associated_data, [])
     input_lens = [len(i['context']+i['question']) for i in associated_data]
     print("QA string pair length: [{}, {}]".format(min(input_lens), max(input_lens)))
-
-    # MARK: define head mask here
-    head_mask = np.ones(ATT_SIZE[:2])
-    head_mask[0][9], head_mask[0][11], head_mask[1][2], head_mask[7][8] = 0, 0, 0, 0
-    head_mask = None
     
     total_elem_count = 0
     # run the prediction, calculate and store the hist
     for qa_pair in tqdm(associated_data):
         prediction = qa_pipeline(
-            {'context': qa_pair['context'], 'question': qa_pair['question']}, max_seq_len=320, head_mask=head_mask, scrs_thresholds=scrs_thres, scrs_max=scrs_max)
+            {'context': qa_pair['context'], 'question': qa_pair['question']}, max_seq_len=MAX_SEQ_LEN, head_mask=None, scrs_thresholds=scrs_thres, scrs_max=scrs_max)
         q_prbs, k_prbs, v_prbs, scrs_prbs, att_out_prbs = prediction['pipeline_prbs']
         dat = {'q': q_prbs, 'k': k_prbs, 'v': v_prbs, 'scrs': scrs_prbs, 'att_out': att_out_prbs}
         if param_thres >= 0.0:

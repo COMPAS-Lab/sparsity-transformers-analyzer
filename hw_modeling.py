@@ -38,7 +38,7 @@ class DpuModel:
     DIV_RES = 0
     COMP_RES = 0
 
-    WORD_SIZE = 2
+    WORD_SIZE = 1
 
     def __init__(self, a_h, a_w, b_h, b_w, blk_h, blk_w):
         self.a_w = a_w
@@ -91,9 +91,9 @@ class DpuModel:
             rest_elems -= float(2 ** int(log2Down(rest_elems)))
 
         dpu_adders = (dpu_adders-1.0) * self.num_dpus
-        print(f"dpu mults: {dpu_mults}, dpu adders: {dpu_adders}")
+        # print(f"dpu mults: {dpu_mults}, dpu adders: {dpu_adders}")
 
-        mem_usage = self.b_w * self.b_h * self.WORD_SIZE * 8 / 1024.
+        mem_usage = self.b_w * self.b_h * self.WORD_SIZE / 1024.
         return dpu_mults * self.MULT_RES + dpu_adders * self.ADDER_RES, mem_usage
 
 
@@ -112,11 +112,11 @@ class BertModel:
 
     COMP_LAT = 2.0
     ADDER_LAT = 11.0
-    MULT_LAT = 8.0
-    DIV_LAT = 28
+    MULT_LAT = 6.0
+    DIV_LAT = 15
 
     ADDER_RES = 2
-    MULT_RES = 2
+    MULT_RES = 1
     DIV_RES = 0
     COMP_RES = 0
 
@@ -337,6 +337,10 @@ class BertModel:
         return pipeline_lat
 
     def matmul_lat_qkv_per_head(self, seq_len, blk=(64.0, 64.0), ideal=False):
+        if self.exps is not None:
+            actual_seq_len = [i.shape[-1] for i in self.exps]
+            seq_len = np.mean(actual_seq_len)
+        
         dpu_model = DpuModel(seq_len, self.embd_size,  self.embd_size, self.embd_size/self.num_heads, blk[0], blk[1])
         return dpu_model.compute_lat(ideal=ideal)
 
