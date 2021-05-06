@@ -71,6 +71,15 @@ def set_seed(args):
 def to_list(tensor):
     return tensor.detach().cpu().tolist()
 
+def auxillary_loss(model):
+    loss = 0
+    for layer_idx in range(12):
+        l = model.module.roberta.encoder.layer[layer_idx].attention.self.quantizer.lower_bounds
+        u = model.module.roberta.encoder.layer[layer_idx].attention.self.quantizer.upper_bounds
+        for i in range(l.shape[0]):
+            constraint = 1e-3 if i==0 else u[i-1].data
+            loss += constraint - l[i]
+    return loss
 
 def train(args, train_dataset, model, tokenizer):
     """ Train the model """
@@ -211,6 +220,8 @@ def train(args, train_dataset, model, tokenizer):
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
 
+            if "bounds" in args.scheme: loss += (1e-4)*auxillary_loss(model)
+
             if args.fp16:
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
                     scaled_loss.backward()
@@ -226,6 +237,9 @@ def train(args, train_dataset, model, tokenizer):
 
                 optimizer.step()
                 scheduler.step()  # Update learning rate schedule
+                #for layer_idx in range(12):
+                    #model.module.roberta.encoder.layer[layer_idx].attention.self.quantizer.lower_bounds.data.clamp_(1e-3, 1)
+                    #model.module.roberta.encoder.layer[layer_idx].attention.self.quantizer.upper_bounds.data.clamp_(1e-3, 1)
                 model.zero_grad()
                 global_step += 1
 
@@ -473,12 +487,15 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
 
 def quantize_init(model, scheme="range-based-log", bits=3):
 
-    if scheme=="range-based-log":
+    if scheme=="no-quantize":
+        return model
+
+    elif scheme=="range-based-log":
         min_exp, max_exp = np.log2(1e-3), np.log2(1.0) #Softmax maximum value
         base = (max_exp-min_exp) / (2.0**bits - 1)
         cutpoints = [0.0] + [(i+1)*base for i in range(int(2.0**bits-1))]
         offset_val = (cutpoints[0]+cutpoints[1])/2.0
-        weights = torch.FloatTensor([2**(i+min_exp) for i in cutpoints])
+        weights = torch.DoubleTensor([2**(i+min_exp) for i in cutpoints])
         for layer_idx in range(len(model.roberta.encoder.layer)):
             model.roberta.encoder.layer[layer_idx].attention.self.quantizer.init_weights(weights)
 
@@ -512,6 +529,8 @@ def set_quantize(layers, model, quantize=True):
             #params.requires_grad=False
     for p in model.parameters():
         p.requires_grad=False
+
+    if quantize == False: return model
 
     for layer_idx in layers:
         model.roberta.encoder.layer[layer_idx].attention.self.quantize = quantize
@@ -710,6 +729,7 @@ def main():
 
     parser.add_argument("--threads", type=int, default=1, help="multiple threads for converting example to features")
     parser.add_argument("--scheme", type=str, default="range-based-log")
+    parser.add_argument("--bits", type=int, default=3)
 
     args = parser.parse_args()
     with open(args.output_dir+'/commandline_args.json', 'w') as f:
@@ -796,8 +816,16 @@ def main():
     )
 
     #print (model)
-    model = quantize_init(model, scheme=args.scheme, bits=3)
-    model = set_quantize(list(range(12)), model, quantize=True if "bounds" not in args.scheme  else "bounds")
+    #quantize_init creates the quantization parameters 
+    model = quantize_init(model, scheme=args.scheme, bits=args.bits)
+    #set_quantize fixes quantize variable in self attention to True in order to quantize the attention values
+    if args.scheme == "no-quantize": #baselines (without quantization)
+        quantize = False
+    elif "bounds" not in args.scheme: #setting values as parameters
+        quantize = True
+    else: #setting bounds as parameters
+        quantize = "bounds" 
+    model = set_quantize(list(range(12)), model, quantize=quantize)
     #print (model)
     #sys.exit(0)
 
