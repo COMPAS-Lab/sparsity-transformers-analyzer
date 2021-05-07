@@ -32,7 +32,7 @@ RES_FIG_PATH = "./res_fig/"
 PARAM_PATH = "./params/"
 DATA_PATH = "./data/"
 FILT_PARAM_PATH = "./filtered_params/"
-MAX_SEQ_LEN = 320
+MAX_SEQ_LEN = 512
 ATT_SIZE = [12, 12, MAX_SEQ_LEN, MAX_SEQ_LEN]
 HS_SIZE = [ATT_SIZE[0]+1, 1, MAX_SEQ_LEN, 64*ATT_SIZE[1]]
 
@@ -40,13 +40,21 @@ def screen_clear():
     _ = call('clear' if os.name == 'posix' else 'cls', shell=True)
 
 
-def parse_squad_json(squad_ver='v1.1'):
-    FILE_PATH = DATA_PATH+"dev-"+squad_ver+".json"
+def filter_seq_len(model_name: str, dat: str):
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenized_len = len(tokenizer(dat)['input_ids'])       
+    if(400 < tokenized_len): return True
+    else: return False
+
+
+def parse_squad_json(model_name: str, squad_ver='v1.1'):
+    DATSET = "dev"
+    FILE_PATH = DATA_PATH +DATSET + "-"+squad_ver+".json"
     if not os.path.isfile(FILE_PATH):
         # download json file from web
         print("SQuAD {} file not found, try to download it...".format(squad_ver))
-        url = "https://rajpurkar.github.io/SQuAD-explorer/dataset/dev-{}.json".format(
-            squad_ver)
+        url = "https://rajpurkar.github.io/SQuAD-explorer/dataset/{}-{}.json".format(
+            DATSET, squad_ver)
         data = (urllib.request.urlopen(url)).read()
         with open(FILE_PATH, "wb+") as out_file:
             out_file.write(data)
@@ -55,26 +63,24 @@ def parse_squad_json(squad_ver='v1.1'):
     with open(FILE_PATH, "r", encoding="utf-8") as data_file:
         squad_raw_data = json.load(data_file)["data"]
 
-        for topic in squad_raw_data:
+        for topic in tqdm(squad_raw_data):
             for pgraph in topic["paragraphs"]:
                 ques_per_paragraph = []
-                for qa in pgraph["qas"]:
-                    if (squad_ver == 'v1.1') or (squad_ver == "v2.0" and not qa["is_impossible"]):
-                        gold_ans = [answer['text'] for answer in qa['answers']
-                                    if normalize_answer(answer['text'])]
-                        if not gold_ans:
-                            gold_ans = [""]
-                        ques_per_paragraph.append(
-                            {"question": qa["question"], "answers": gold_ans})
+                if filter_seq_len(model_name, pgraph["context"]):
+                    for qa in pgraph["qas"]:
+                        if (squad_ver == 'v1.1') or (squad_ver == "v2.0" and not qa["is_impossible"]):
+                            gold_ans = [answer['text'] for answer in qa['answers']
+                                        if normalize_answer(answer['text'])]
+                            if not gold_ans:
+                                gold_ans = [""]
+                            ques_per_paragraph.append(
+                                {"question": qa["question"], "answers": gold_ans})
 
-                data[pgraph["context"]] = ques_per_paragraph
+                    data[pgraph["context"]] = ques_per_paragraph
 
+    print(f"total num of samples: {len(data)}")
     return data
 
-# def run_bert_wiki_pipeline():
-#     wiki_pipeline = pipeline(
-#         ""
-#     )
 
 def run_qa_pipeline(model_name: str, filter_inputs=True, single_input=True, sample_inputs=-1, \
                     att_threshold=0.0, hs_threshold=0.0, att_quant_bits=0.0, hstate_quant_bits=0.0, \
@@ -95,7 +101,7 @@ def run_qa_pipeline(model_name: str, filter_inputs=True, single_input=True, samp
     )
 
     print("Running pipeline...")
-    data = parse_squad_json()
+    data = parse_squad_json(model_name)
     associated_data = []
     for context in data.keys():
         context_ques_pair = []
@@ -540,7 +546,7 @@ def plot_dist_token_dynamic(model_name, bin_step, sparsity_bar=0.025, att_thresh
             sparse_token_percentage = np.load(hist_file)
     else:
         print("Running pipeline...")
-        data = parse_squad_json()
+        data = parse_squad_json(model_name)
         associated_data = []
         for context in data.keys():
             context_ques_pair = []
@@ -565,7 +571,7 @@ def plot_dist_token_dynamic(model_name, bin_step, sparsity_bar=0.025, att_thresh
         for qa_pair in associated_data:
             print("running pipeline iter {}/{}...".format(pipeline_running_counter, fed_data_len))
             prediction = qa_pipeline(
-                {'context': qa_pair['context'], 'question': qa_pair['question']}, max_seq_len=320, att_threshold=att_threshold, head_mask=head_mask)
+                {'context': qa_pair['context'], 'question': qa_pair['question']}, max_seq_len=MAX_SEQ_LEN, att_threshold=att_threshold, head_mask=head_mask)
             pipeline_running_counter += 1
             em_score = max(compute_exact(prediction['answer'], gold_ans)
                            for gold_ans in qa_pair['answers'])
@@ -812,7 +818,7 @@ def run_qa_pipeline_for_profiling(model_name, activation_name: str, scrs_thres=N
     )
 
     print("Running pipeline...")
-    data = parse_squad_json()
+    data = parse_squad_json(model_name)
     associated_data = []
     for context in data.keys():
         context_ques_pair = []
