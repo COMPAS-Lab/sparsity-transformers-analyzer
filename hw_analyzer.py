@@ -304,6 +304,79 @@ def compare_lat_res_models(bert_hw_model: BertModel, resource_type = ['dsp', 'me
         plt.cla()
 
 
+def compare_softmax_with_model_len(l_range = [200, 100, 50, 25], max_len_range = [128, 256, 320]):
+    '''
+    sweeping across multiple model size
+    '''
+    fsize = 9
+    fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+    matplotlib.rcParams.update({'xtick.labelsize': fsize})
+    matplotlib.rcParams.update({'ytick.labelsize': fsize})
+    matplotlib.rcParams['lines.markersize'] = 3
+
+    # define parallelism sweeping range
+    softmax_range = [2**i for i in range(8)]
+
+    def search_lowest_latency_in_bins(softmax_lat_lst: list, bin_width=100, resource_key='dsps'):
+        softmax_lat_lst.sort(key=lambda x: x[resource_key])
+        curr_bin, lst_idx = min([i[resource_key] for i in softmax_lat_lst]), 0
+        final_softmax_lat_lst = []
+        while curr_bin < max([i[resource_key] for i in softmax_lat_lst]):
+            temp_list = []
+            while curr_bin <= softmax_lat_lst[lst_idx][resource_key] < (curr_bin + bin_width) :
+                temp_list.append(softmax_lat_lst[lst_idx])
+                lst_idx += 1
+                if lst_idx >= len(softmax_lat_lst):
+                    break
+
+            temp_list.sort(key=lambda x: x['latency'])
+            if len(temp_list) > 0:
+                final_softmax_lat_lst.append(temp_list[0])
+            curr_bin += bin_width
+
+        return final_softmax_lat_lst
+
+    for max_len in max_len_range:
+        exp_path = f"params/scrs_sampled_{max_len}.npy"
+        att_path = f"params/attentions_sampled_{max_len}.npy"
+        bert_hw_model = BertModel(read_exp_samples=True, exp_sample_path=exp_path, att_sample_path=att_path)
+
+        softmax_lat_lst = []
+
+        for l, p in product(l_range, softmax_range):
+            temp_softmax_lats = None
+            for inst in bert_hw_model.exps:
+                num_layers, num_heads, num_rows, _ = inst.shape
+                heads = inst.reshape((num_layers * num_heads, num_rows, num_rows))
+
+                temp_heads_lats = np.array([bert_hw_model.softmax_lat(dat[:l], p1=p, p2=p) for dat in heads])
+                temp_softmax_lats = temp_heads_lats if temp_softmax_lats is None \
+                                            else np.concatenate([temp_softmax_lats, temp_heads_lats], axis=0)
+                    
+            temp_softmax_res = bert_hw_model.softmax_resources(p, p, l, 4)
+            temp_lats = np.mean(temp_softmax_lats)
+            softmax_lat_lst.append({'dsps': temp_softmax_res[0], 'mem': temp_softmax_res[1], 'latency': temp_lats})
+
+        softmax_lat_lst.sort(key=lambda x: x['dsps'])
+        final_softmax_lat_lst = search_lowest_latency_in_bins(softmax_lat_lst, resource_key='dsps')
+
+        # plot lines
+        if len(softmax_lat_lst) > 0:
+            ax.plot([i['dsps'] for i in final_softmax_lat_lst], [i['latency'] for i in final_softmax_lat_lst], 
+                        linestyle='-', color='C0', marker='s', linewidth=1, alpha=0.8)
+            ax.text(x=final_softmax_lat_lst[0]['dsp'] + 10, y=final_softmax_lat_lst[0]['latency'] + 10, s=f"len={max_len}")
+
+    ax.set_xlabel('DSP Usage', fontsize=fsize)
+    ax.set_ylabel('latency', fontsize=fsize)
+    ax.set_xlim(xmin=0)
+    ax.set_ylim(ymin=0)
+    ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
+
+    fig.tight_layout()
+    fig.savefig('res_fig/softmax_sweep_model_size.pdf')
+    plt.cla()
+
+
 def mem_teardown(bert_hw_model: BertModel):    
     fsize = 9
     fig, ax = plt.subplots(1, 1, figsize=(6, 5))
@@ -368,7 +441,8 @@ if __name__ == '__main__':
     # bert_hw_model.analyzer_void_columns()
     # compare_naive_softmax_heads(bert_hw_model)
     # compare_naive_softmax_parallel(bert_hw_model)
-    compare_lat_res_models(bert_hw_model, resource_type=['dsp'], l_range=np.arange(100, 2, -2), hw_modeling_type=["softmax", "baseline softmax", "value mvm"])
+    # compare_lat_res_models(bert_hw_model, resource_type=['dsp'], l_range=np.arange(100, 2, -2), hw_modeling_type=["softmax", "baseline softmax", "value mvm"])
     # mem_teardown(bert_hw_model)
     # v_compute_lat_teardown()
     # explore_p1_p2(bert_hw_model)
+    compare_softmax_with_model_len()

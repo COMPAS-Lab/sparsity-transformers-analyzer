@@ -122,9 +122,9 @@ class BertModel:
 
     WORD_SIZE = 2
 
-    def __init__(self, embd_size=768.0, num_layers=0.0, num_heads=0.0, read_exp_samples=False):
+    def __init__(self, embd_size=768.0, num_layers=0.0, num_heads=0.0, read_exp_samples=False, exp_sample_path='params/scrs_sampled.npy', att_sample_path='params/attentions_sampled.npy'):
         if read_exp_samples:
-            self.load_exp_out('./params/')
+            self.load_exp_out(exp_sample_path, att_sample_path)
             self.num_layers = self.exps[0].shape[0]
             self.num_heads = self.exps[0].shape[1]
         else:
@@ -149,9 +149,7 @@ class BertModel:
             print(np.mean([num_void_column/num_column for num_void_column, num_column in num_void_columns]))
             return num_void_columns
 
-    def load_exp_out(self, path):
-        atten_path = path + "attentions_sampled.npy"
-        exp_path = path + "scrs_sampled.npy"
+    def load_exp_out(self, exp_path, atten_path):
         exps = []
 
         with open(atten_path, "rb") as attention_file:

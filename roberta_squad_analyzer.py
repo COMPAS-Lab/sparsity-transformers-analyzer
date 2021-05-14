@@ -2,6 +2,7 @@
 roberta squad analyzer: analyzer sparsity of the roberta on squad 
 """
 
+from numpy.lib.function_base import append
 from transformers import pipeline
 from transformers import AutoConfig, AutoTokenizer, AutoModelForQuestionAnswering
 from transformers.data.metrics.squad_metrics import *
@@ -41,10 +42,13 @@ def screen_clear():
 
 
 def filter_seq_len(model_name: str, dat: str):
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    tokenized_len = len(tokenizer(dat)['input_ids'])       
-    if(400 < tokenized_len): return True
-    else: return False
+    if MAX_SEQ_LEN <= 400: 
+        return True
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenized_len = len(tokenizer(dat)['input_ids'])       
+        if(400 < tokenized_len): return True
+        else: return False
 
 
 def parse_squad_json(model_name: str, squad_ver='v1.1'):
@@ -66,11 +70,12 @@ def parse_squad_json(model_name: str, squad_ver='v1.1'):
         for topic in tqdm(squad_raw_data):
             for pgraph in topic["paragraphs"]:
                 ques_per_paragraph = []
-                if filter_seq_len(model_name, pgraph["context"]):
+                append_inst = filter_seq_len(model_name, pgraph["context"])
+                if append_inst:
                     for qa in pgraph["qas"]:
                         if (squad_ver == 'v1.1') or (squad_ver == "v2.0" and not qa["is_impossible"]):
                             gold_ans = [answer['text'] for answer in qa['answers']
-                                        if normalize_answer(answer['text'])]
+                                       if normalize_answer(answer['text'])]
                             if not gold_ans:
                                 gold_ans = [""]
                             ques_per_paragraph.append(
