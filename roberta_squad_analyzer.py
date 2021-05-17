@@ -33,7 +33,7 @@ RES_FIG_PATH = "./res_fig/"
 PARAM_PATH = "./params/"
 DATA_PATH = "./data/"
 FILT_PARAM_PATH = "./filtered_params/"
-MAX_SEQ_LEN = 512
+MAX_SEQ_LEN = 320
 ATT_SIZE = [12, 12, MAX_SEQ_LEN, MAX_SEQ_LEN]
 HS_SIZE = [ATT_SIZE[0]+1, 1, MAX_SEQ_LEN, 64*ATT_SIZE[1]]
 

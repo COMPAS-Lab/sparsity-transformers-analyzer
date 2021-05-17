@@ -184,7 +184,9 @@ def compare_lat_res_models(bert_hw_model: BertModel, resource_type = ['dsp', 'me
 
             temp_list.sort(key=lambda x: x['latency'])
             if len(temp_list) > 0:
-                final_softmax_lat_lst.append(temp_list[0])
+                if (len(final_softmax_lat_lst) < 1) or \
+                    (len(final_softmax_lat_lst) > 0 and temp_list[0]['latency'] < final_softmax_lat_lst[-1]['latency']):
+                    final_softmax_lat_lst.append(temp_list[0])
             curr_bin += bin_width
 
         return final_softmax_lat_lst
@@ -441,8 +443,8 @@ if __name__ == '__main__':
     # bert_hw_model.analyzer_void_columns()
     # compare_naive_softmax_heads(bert_hw_model)
     # compare_naive_softmax_parallel(bert_hw_model)
-    # compare_lat_res_models(bert_hw_model, resource_type=['dsp'], l_range=np.arange(100, 2, -2), hw_modeling_type=["softmax", "baseline softmax", "value mvm"])
+    compare_lat_res_models(bert_hw_model, resource_type=['dsp'], l_range=np.arange(100, 2, -2), hw_modeling_type=["softmax", "baseline softmax", "value mvm"])
     # mem_teardown(bert_hw_model)
     # v_compute_lat_teardown()
     # explore_p1_p2(bert_hw_model)
-    compare_softmax_with_model_len()
+    # compare_softmax_with_model_len()
