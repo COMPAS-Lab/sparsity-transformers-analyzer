@@ -346,6 +346,19 @@ class BertModel:
         dpu_model = DpuModel(seq_len, self.embd_size,  self.embd_size, self.embd_size/self.num_heads, blk[0], blk[1])
         return dpu_model.compute_resource()
 
+    def att_v_outer_product_intermediate_size(self):
+        if self.exps is not None:
+            per_inst_intermediate_size = []
+            for inst in self.exps:
+                inst_flatten = inst.reshape(-1, inst.shape[-2], inst.shape[-1])
+                col_density = np.sum((inst_flatten <= 0), axis=1)
+                intermediate_res_size = col_density * self.embd_size
+                total_size = np.sum(intermediate_res_size, axis=-1)
+                per_inst_intermediate_size += total_size.tolist()
+
+            return np.array(per_inst_intermediate_size)
+        else:
+            return None
     
 
 if __name__ == '__main__':

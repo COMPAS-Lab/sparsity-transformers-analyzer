@@ -5,8 +5,11 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.lines as mlines
 import random
+from textwrap import wrap
 
 from itertools import product
+
+from numpy.core.fromnumeric import size
 
 from hw_modeling import BertModel, DpuModel
 
@@ -127,33 +130,6 @@ def explore_p1_p2(bert_model):
 
     print(res_lat_mat)
             
-    
-    # for layer_idx, layer in enumerate(data):
-    #     fig, axs = plt.subplots(3, 4, figsize=(19, 12))
-    #     print("Plotting heatmap for layer {}...".format(layer_idx))
-    #     for head_idx, head in enumerate(layer[0]):
-    #         sparsity = (head <= sparsity_bar).sum() / head.flatten().shape[0]
-    #         info = 'head_{}, max: {:.4f}, min: {:.4f}, spars: {:.4f}, sparsity_bar: {:.4f}'.format(
-    #             head_idx, np.amax(head), np.amin(head), sparsity, sparsity_bar)
-    #         if binarize:
-    #             head = np.array((head > sparsity_bar)).astype("float")
-    #         ax = axs[int(head_idx/4), int(head_idx % 4)]
-    #         ax.invert_yaxis()
-    #         ax.xaxis.tick_top()
-    #         c = ax.pcolormesh(head) if auto_scale else ax.pcolormesh(
-    #             head, vmin=0.0, vmax=1.0)
-    #         fig.colorbar(c, ax=ax)
-    #         ax.set_title('\n'.join(wrap(info, 35)))
-
-    #     fig.suptitle('Heatmap of Layer {}\'s Attention per head (batch aggregation={}, {})'
-    #                  .format(layer_idx, layer_aggregration, attached_title), fontsize=21, y=0.99)
-    #     fig.tight_layout()
-    #     fig_path = RES_FIG_PATH+"auto_scale_" if auto_scale else RES_FIG_PATH
-    #     fig_path = fig_path+"bin_" if binarize else fig_path
-    #     plt.savefig(fig_path+'heatmap_layer{}.png'.format(layer_idx), dpi=600)
-    #     plt.clf()
-    #     plt.close(fig)
-
 
 def compare_lat_res_models(bert_hw_model: BertModel, resource_type = ['dsp', 'mem'], hw_modeling_type = ["softmax", "baseline softmax", "value mvm"], l_range = [200, 100, 50, 25]):
     '''
@@ -438,12 +414,69 @@ def v_compute_lat_teardown():
     plt.clf()
 
 
+def visualize_outer_product_intermediate_size(bert_hw_model: BertModel, word_size=16):
+    fsize = 9
+    fig, ax = plt.subplots(1, 1, figsize=(6, 5))
+    matplotlib.rcParams.update({'xtick.labelsize': fsize})
+    matplotlib.rcParams.update({'ytick.labelsize': fsize})
+
+    res = bert_hw_model.att_v_outer_product_intermediate_size()
+    res = res * word_size / 1024.0
+    ax.scatter(range(len(res)), res, color='C0', alpha=0.5, s=3)
+   
+    ax.set_xlabel('instances index', fontsize=fsize)
+    ax.set_ylabel('intermediate data size/Kbits', fontsize=fsize)
+    
+    ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
+    fig.tight_layout()
+    fig.savefig('res_fig/outer_prod_intermediate_size.pdf')
+    plt.clf()
+
+
+def visual_heatmap_exps(bert_hw_model: BertModel):
+    '''
+    Plot the heat map to visualize the relation between each subwords in the
+    self attention of each attention head in each layer
+
+    expected data shape: (#layers, #heads, length, length)
+    layers: layer_<0-11>
+    sparsity_bar: threshold for sparsity calculation
+    auto_scale: whether to auto scale the color bar
+    binarize: if true, all values > sparsity_bar will be 1 and < will be 0
+    '''
+    fig_path = "./res_fig/"
+    data = random.choice(bert_hw_model.exps)
+    for layer_idx, layer in enumerate(data):
+        fig, axs = plt.subplots(3, 4, figsize=(19, 12))
+        print("Plotting heatmap for layer {}...".format(layer_idx))
+        for head_idx, head in enumerate(layer):
+            sparsity = (head == 0.0).sum() / head.flatten().shape[0]
+            info = 'head_{}, max: {:.4f}, min: {:.4f}, sparsity: {:.4f}'.format(
+                head_idx, np.amax(head), np.amin(head), sparsity)
+            head = np.array((head > 0)).astype("float")
+            ax = axs[int(head_idx/4), int(head_idx % 4)]
+            
+            ax.invert_yaxis()
+            ax.xaxis.tick_top()
+            c = ax.pcolormesh(head)
+            fig.colorbar(c, ax=ax)
+            ax.set_title('\n'.join(wrap(info, 35)))
+
+        fig.suptitle('Heatmap of Layer {}\'s exp out per head'.format(layer_idx), fontsize=21, y=0.99)
+        fig.tight_layout()
+        plt.savefig(fig_path+'exp_heatmap_layer{}.png'.format(layer_idx), dpi=600)
+        plt.clf()
+        plt.close(fig)
+
+
 if __name__ == '__main__':
     bert_hw_model = BertModel(read_exp_samples=True)
     # bert_hw_model.analyzer_void_columns()
     # compare_naive_softmax_heads(bert_hw_model)
     # compare_naive_softmax_parallel(bert_hw_model)
-    compare_lat_res_models(bert_hw_model, resource_type=['dsp'], l_range=np.arange(100, 2, -2), hw_modeling_type=["softmax", "baseline softmax", "value mvm"])
+    # compare_lat_res_models(bert_hw_model, resource_type=['dsp'], l_range=np.arange(100, 2, -2), hw_modeling_type=["softmax", "baseline softmax", "value mvm"])
+    # visualize_outer_product_intermediate_size(bert_hw_model)
+    visual_heatmap_exps(bert_hw_model)
     # mem_teardown(bert_hw_model)
     # v_compute_lat_teardown()
     # explore_p1_p2(bert_hw_model)
