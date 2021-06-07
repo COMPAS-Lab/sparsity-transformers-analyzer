@@ -74,11 +74,11 @@ class DpuModel:
     def elemul_addtree_lat(self): return self.mult_lat() + self.adder_tree_lat()
     def dpu_lat(self): return self.elemul_addtree_lat() + self.add_lat()
     def compute_lat(self, ideal=False):
-        input_cycles = self.num_grps_in_a(ideal=ideal) * self.num_wei_per_dpu(ideal=ideal ) * self.a_h
+        input_cycles = self.num_grps_in_a(ideal=ideal) * self.num_wei_per_dpu(ideal=ideal) * self.a_h
         return input_cycles + self.dpu_lat()
     
-    def compute_lat_teardown(self):
-        input_cycles = self.num_grps_in_a() * self.num_wei_per_dpu() * self.a_h
+    def compute_lat_teardown(self, ideal=False):
+        input_cycles = self.num_grps_in_a(ideal=ideal) * self.num_wei_per_dpu(ideal=ideal) * self.a_h
         adder_tree_cycles = self.elemul_addtree_lat()
         adder_lat = self.add_lat()
         return input_cycles, adder_tree_cycles, adder_lat
@@ -317,18 +317,22 @@ class BertModel:
         return res_all, mem_all
 
 
-    def baseline_softmax_lat(self, exp_dat, pa=4.):
+    def baseline_softmax_lat(self, exp_dat=None, pa=4., exp_h=-1):
         exp_lat = self.ADDER_LAT + self.MULT_LAT + 1 + 2
         ln_lat = 2 + self.ADDER_LAT
+
+        dat_h = exp_h if exp_dat is None else exp_dat.shape[0]
+        dat_h = self.max_seq_len if dat_h < 0 else dat_h
+        dat_w = self.max_seq_len if exp_dat is None else exp_dat.shape[1]
         
         stg_1_lat = log2Up(pa) * self.COMP_LAT
-        stg_1_lat += max(self.COMP_LAT, exp_dat.shape[0]-1) * (ceil(exp_dat.shape[-1] / pa) - 1)
+        stg_1_lat += max(self.COMP_LAT, dat_h-1) * (ceil(dat_w / pa) - 1)
 
         stg_2_lat = self.ADDER_LAT + exp_lat + log2Up(pa) * self.ADDER_LAT + self.ADDER_LAT
-        stg_2_lat += max(self.ADDER_LAT, exp_dat.shape[0]-1) * (ceil(exp_dat.shape[-1] / pa) - 1)
+        stg_2_lat += max(self.ADDER_LAT, dat_h-1) * (ceil(dat_w / pa) - 1)
 
         stg_3_lat = ln_lat + self.ADDER_LAT + exp_lat
-        stg_3_lat += exp_dat.shape[0] * exp_dat.shape[-1]
+        stg_3_lat += dat_h * dat_w
 
         pipeline_lat = stg_1_lat + stg_2_lat + stg_3_lat
 
@@ -344,6 +348,19 @@ class BertModel:
 
     def matmul_res_qkv_per_head(self, blk, seq_len=320):
         dpu_model = DpuModel(seq_len, self.embd_size,  self.embd_size, self.embd_size/self.num_heads, blk[0], blk[1])
+        return dpu_model.compute_resource()
+    
+    def matmul_lat_qktrans_per_head(self, seq_len, blk=(64.0, 64.0), ideal=False):
+        if self.exps is not None:
+            actual_seq_len = [i.shape[-1] for i in self.exps]
+            seq_len = np.mean(actual_seq_len)
+        
+        dpu_model = DpuModel(seq_len, self.embd_size,  self.embd_size, seq_len, blk[0], blk[1])
+
+        return dpu_model.compute_lat_teardown(ideal=ideal)
+
+    def matmul_res_qktrans_per_head(self, blk, seq_len=320):
+        dpu_model = DpuModel(seq_len, self.embd_size,  self.embd_size, seq_len, blk[0], blk[1])
         return dpu_model.compute_resource()
 
     def att_v_outer_product_intermediate_size(self):
