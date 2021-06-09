@@ -340,11 +340,22 @@ class BertModel:
 
     def matmul_lat_qkv_per_head(self, seq_len, blk=(64.0, 64.0), ideal=False):
         if self.exps is not None:
+            print(__name__+": using acutal size of exp")
             actual_seq_len = [i.shape[-1] for i in self.exps]
-            seq_len = np.mean(actual_seq_len)
         
-        dpu_model = DpuModel(seq_len, self.embd_size,  self.embd_size, self.embd_size/self.num_heads, blk[0], blk[1])
-        return dpu_model.compute_lat(ideal=ideal)
+            in_cycles, adder_trees, adders = [], [], []
+            for l in actual_seq_len:
+                dpu_model = DpuModel(l, self.embd_size,  self.embd_size, self.embd_size/self.num_heads, blk[0], blk[1])
+                in_cycle, adder_tree, adder = dpu_model.compute_lat_teardown(ideal=ideal)
+                in_cycles.append(in_cycle)
+                adder_trees.append(adder_tree)
+                adders.append(adder)
+
+            return np.mean(in_cycles), np.mean(adder_trees), np.mean(adders)
+        else:
+            dpu_model = DpuModel(seq_len, self.embd_size,  self.embd_size, self.embd_size/self.num_heads, blk[0], blk[1])
+            return dpu_model.compute_lat_teardown(ideal=ideal)    
+
 
     def matmul_res_qkv_per_head(self, blk, seq_len=320):
         dpu_model = DpuModel(seq_len, self.embd_size,  self.embd_size, self.embd_size/self.num_heads, blk[0], blk[1])
@@ -352,12 +363,21 @@ class BertModel:
     
     def matmul_lat_qktrans_per_head(self, seq_len, blk=(64.0, 64.0), ideal=False):
         if self.exps is not None:
+            print(__name__+": using acutal size of exp")
             actual_seq_len = [i.shape[-1] for i in self.exps]
-            seq_len = np.mean(actual_seq_len)
-        
-        dpu_model = DpuModel(seq_len, self.embd_size,  self.embd_size, seq_len, blk[0], blk[1])
+            
+            in_cycles, adder_trees, adders = [], [], []
+            for l in actual_seq_len:
+                dpu_model = DpuModel(l, self.embd_size,  self.embd_size, seq_len, blk[0], blk[1])
+                in_cycle, adder_tree, adder = dpu_model.compute_lat_teardown(ideal=ideal)
+                in_cycles.append(in_cycle)
+                adder_trees.append(adder_tree)
+                adders.append(adder)
 
-        return dpu_model.compute_lat_teardown(ideal=ideal)
+            return np.mean(in_cycles), np.mean(adder_trees), np.mean(adders)
+        else:
+            dpu_model = DpuModel(seq_len, self.embd_size,  self.embd_size, seq_len, blk[0], blk[1])
+            return dpu_model.compute_lat_teardown(ideal=ideal)
 
     def matmul_res_qktrans_per_head(self, blk, seq_len=320):
         dpu_model = DpuModel(seq_len, self.embd_size,  self.embd_size, seq_len, blk[0], blk[1])
