@@ -486,6 +486,13 @@ def compare_mvm_ratio_with_latency_with_given_dsps(bert_hw_model: BertModel, dsp
                 mvm_blocks.append((h, w, desired_dsps, float(w)/h))
                 break
     
+    # flatten exps:
+    real_exp_data = []
+    for inst in bert_hw_model.exps:
+        num_layers, num_heads, num_rows, _ = inst.shape
+        real_exp = inst.reshape((num_layers * num_heads, num_rows, num_rows))
+        for h in real_exp: real_exp_data.append(h)
+
     res_wh, res_lat_ddl, res_relative_lat = [], [], []
     for mvm_block_height, mvm_block_width, actual_mvm_dsps, mvm_block_wh_ratio in mvm_blocks:
         max_softmax_dsp = dsps - actual_mvm_dsps
@@ -496,8 +503,8 @@ def compare_mvm_ratio_with_latency_with_given_dsps(bert_hw_model: BertModel, dsp
             bert_hw_model.matmul_lat_qktrans_per_head(320, blk=(mvm_block_height, mvm_block_width))
         qk_trans_lat = qk_trans_addertree + qk_trans_adder + bert_hw_model.DIV_LAT
 
-        # softmax_lat = np.mean([qk_trans_lat + bert_hw_model.baseline_softmax_lat(h, softmax_p) for h in bert_hw_model.exps])
-        softmax_lat = qk_trans_lat + bert_hw_model.baseline_softmax_lat(pa=softmax_p)
+        softmax_lat = np.mean([qk_trans_lat + bert_hw_model.baseline_softmax_lat(h, softmax_p) for h in real_exp_data])
+        # softmax_lat = qk_trans_lat + bert_hw_model.baseline_softmax_lat(pa=softmax_p)
 
         softmax_ddl = qktrans_incycle + sum(bert_hw_model.matmul_lat_qkv_per_head(320, blk=(mvm_block_height, mvm_block_width)))
 
@@ -539,8 +546,8 @@ def compare_mvm_ratio_with_latency_with_given_dsps(bert_hw_model: BertModel, dsp
     qktrans_incycle, qk_trans_addertree, qk_trans_adder = \
             bert_hw_model.matmul_lat_qktrans_per_head(320, blk=(mvm_block_height, mvm_block_width))
     qk_trans_lat = qk_trans_addertree + qk_trans_adder + bert_hw_model.DIV_LAT
-    # softmax_lat = [np.mean([qk_trans_lat + bert_hw_model.baseline_softmax_lat(h, p) for h in bert_hw_model.exps]) for p in softmax_possible_p]
-    softmax_lat = [qk_trans_lat + bert_hw_model.baseline_softmax_lat(pa=p) for p in softmax_possible_p]
+    softmax_lat = [np.mean([qk_trans_lat + bert_hw_model.baseline_softmax_lat(h, p) for h in real_exp_data]) for p in softmax_possible_p]
+    # softmax_lat = [qk_trans_lat + bert_hw_model.baseline_softmax_lat(pa=p) for p in softmax_possible_p]
     softmax_ddl = qktrans_incycle + sum(bert_hw_model.matmul_lat_qkv_per_head(320, blk=(mvm_block_height, mvm_block_width)))
     softmax_dsps = [bert_hw_model.baseline_softmax_resource(p, bert_hw_model.max_seq_len)[0] for p in softmax_possible_p]
     softmax_overhead = [(softmax_ddl - lat) for lat in softmax_lat]
@@ -589,8 +596,8 @@ def compare_mvm_ratio_delayed_v_with_latency_with_given_dsps(bert_hw_model:BertM
         softmax_p = range(2, mvm_block_width)
         softmax_possible_p = [p for p in softmax_p if bert_hw_model.baseline_softmax_resource(p, bert_hw_model.max_seq_len)[0] < max_softmax_dsp]
         softmax_p = softmax_possible_p[-1]
-        # softmax_stg1_incycle = np.mean([h.shape[-1] * ceil(float(h.shape[-1])/softmax_p) for h in bert_hw_model.exps])
-        softmax_stg1_incycle = bert_hw_model.max_seq_len * ceil(float(bert_hw_model.max_seq_len) / softmax_p)
+        softmax_stg1_incycle = np.mean([h.shape[-1] * ceil(float(h.shape[-1])/softmax_p) for h in bert_hw_model.exps])
+        # softmax_stg1_incycle = bert_hw_model.max_seq_len * ceil(float(bert_hw_model.max_seq_len) / softmax_p)
         softmax_lat = softmax_stg1_incycle + qk_trans_adder + qk_trans_addertree
 
         res_wh.append(mvm_block_wh_ratio)
@@ -639,10 +646,10 @@ def compare_mvm_ratio_delayed_v_with_latency_with_given_dsps(bert_hw_model:BertM
     q_incycle, q_addertree, q_adder = \
             bert_hw_model.matmul_lat_qkv_per_head(320, blk=(mvm_block_height, mvm_block_width))
     
-    # softmax_stg1_incycle = np.array([h.shape[-1] * np.ceil(float(h.shape[-1]) / softmax_possible_p) for h in bert_hw_model.exps])
-    # softmax_stg1_incycle = np.mean(softmax_stg1_incycle, axis=0)
+    softmax_stg1_incycle = np.array([h.shape[-1] * np.ceil(float(h.shape[-1]) / softmax_possible_p) for h in bert_hw_model.exps])
+    softmax_stg1_incycle = np.mean(softmax_stg1_incycle, axis=0)
 
-    softmax_stg1_incycle = bert_hw_model.max_seq_len * np.ceil(float(bert_hw_model.max_seq_len) / softmax_possible_p)
+    # softmax_stg1_incycle = bert_hw_model.max_seq_len * np.ceil(float(bert_hw_model.max_seq_len) / softmax_possible_p)
     softmax_lat = softmax_stg1_incycle + qk_trans_adder + qk_trans_addertree
 
     softmax_ddl = qktrans_incycle + q_incycle + q_incycle + qk_trans_addertree + qk_trans_adder
@@ -670,7 +677,8 @@ def compare_mvm_ratio_delayed_v_with_latency_with_given_dsps(bert_hw_model:BertM
 
 
 if __name__ == '__main__':
-    bert_hw_model = BertModel(read_exp_samples=False, num_layers=12, num_heads=12)
+    # bert_hw_model = BertModel(read_exp_samples=False, num_layers=12, num_heads=12)
+    bert_hw_model = BertModel(read_exp_samples=True)
     # bert_hw_model.analyzer_void_columns()
     # compare_naive_softmax_heads(bert_hw_model)
     # compare_naive_softmax_parallel(bert_hw_model)
