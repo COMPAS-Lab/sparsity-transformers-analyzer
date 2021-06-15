@@ -3,6 +3,7 @@ param_extractor: extracting parameters from RoBERTa model
 '''
 
 from transformers import pipeline
+from transformers.activations import gelu
 from transformers import AutoConfig, AutoTokenizer, AutoModel, AutoModelForQuestionAnswering
 from transformers.data.metrics.squad_metrics import *
 from FloatingFixedToHex import ffth
@@ -258,6 +259,8 @@ if __name__ == '__main__':
     embd_outputs = extract_attention_layer_inputs(qa_pipeline)
     for i_index, instance in enumerate(embd_outputs):
         for l_index, layer in enumerate(instance):
+            GELU_TEST = gelu(torch.Tensor(layer));
+            export_param([GELU_TEST], f"output_files/layer_{i_index}_GELU_TEST", f"uint32_t GELU_TEST_{i_index}"+"[320][SEQ_WIDTH] = {")
             export_param([layer], f"output_files/layer_{i_index}_inputs", f"uint32_t X_{i_index}"+"[320][SEQ_WIDTH] = {")
     
     # extract q, k, v, QK, and Z:
