@@ -161,8 +161,8 @@ def extract_qkv(inf_pipeline):
     predictions = qa_pipeline(simple_text_test[0], max_seq_len=MAX_SEQ_LEN)
 
     res = predictions['pipeline_prbs']
-    q_pr, k_pr, v_pr, softmax_input, att_x_value = predictions['pipeline_prbs']
-    return np.stack(q_pr, axis=0), np.stack(k_pr, axis=0), np.stack(v_pr, axis=0), np.stack(softmax_input, axis=0), np.stack(att_x_value , axis=0)
+    q_pr, k_pr, v_pr, softmax_input, att_x_value, fc_1_out, ln_1_out = predictions['pipeline_prbs']
+    return np.stack(q_pr, axis=0), np.stack(k_pr, axis=0), np.stack(v_pr, axis=0), np.stack(softmax_input, axis=0), np.stack(att_x_value , axis=0), np.stack(fc_1_out, axis=0), np.stack(ln_1_out, axis=0)
 
 if __name__ == '__main__':
     # model_name = "roberta-base"
@@ -264,7 +264,9 @@ if __name__ == '__main__':
             export_param([layer], f"output_files/layer_{i_index}_inputs", f"uint32_t X_{i_index}"+"[320][SEQ_WIDTH] = {")
     
     # extract q, k, v, QK, and Z:
-    q, k, v, softmax_input, att_x_value = extract_qkv(qa_pipeline)
+    # fc_1_value is the output of the first fully-connected layer
+    # ln_1_value is the output of the first layernorm 
+    q, k, v, softmax_input, att_x_value, fc_1_value, ln_1_value = extract_qkv(qa_pipeline)
     for i_index, instance in enumerate(q):
         for l_index, layer in enumerate(instance):
             export_3d_param(layer, f"output_files/q_inst{i_index}_layer{l_index}", "__uint32_t SW_Q[NUM_HEADS][SEQ_LEN][W_WIDTH_PER_HEAD] = {")
