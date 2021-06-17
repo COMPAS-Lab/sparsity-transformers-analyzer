@@ -9,6 +9,7 @@ from transformers.data.metrics.squad_metrics import *
 from FloatingFixedToHex import ffth
 
 import torch
+import transformers
 import numpy as np
 import random
 import csv
@@ -166,6 +167,7 @@ def extract_qkv(inf_pipeline):
 
 if __name__ == '__main__':
     # model_name = "roberta-base"
+    print(transformers.__file__)
     model_name = 'csarron/roberta-base-squad-v1'
 
     qa_pipeline = pipeline(
@@ -267,6 +269,7 @@ if __name__ == '__main__':
     # fc_1_value is the output of the first fully-connected layer
     # ln_1_value is the output of the first layernorm 
     q, k, v, softmax_input, att_x_value, fc_1_value, ln_1_value = extract_qkv(qa_pipeline)
+    print(fc_1_value.shape)
     for i_index, instance in enumerate(q):
         for l_index, layer in enumerate(instance):
             export_3d_param(layer, f"output_files/q_inst{i_index}_layer{l_index}", "__uint32_t SW_Q[NUM_HEADS][SEQ_LEN][W_WIDTH_PER_HEAD] = {")
@@ -282,3 +285,9 @@ if __name__ == '__main__':
     for i_index, instance in enumerate(att_x_value):
         for l_index, layer in enumerate(instance):
             export_3d_param(layer, f"output_files/a_inst{i_index}_layer{l_index}", "__uint32_t SW_A[NUM_HEADS][SEQ_LEN][W_WIDTH_PER_HEAD] = {")  
+    for i_index, instance in enumerate(fc_1_value):
+        for l_index, layer in enumerate(instance):
+            export_param([layer], f"output_files/fc1_inst{i_index}_layer{l_index}", "__uint32_t SW_FC1[SEQ_LEN][SEQ_WIDTH] = {")
+    for i_index, instance in enumerate(ln_1_value):
+        for l_index, layer in enumerate(instance):
+            export_param([layer], f"output_files/ln1_inst{i_index}_layer{l_index}", "__uint32_t SW_LN1[SEQ_LEN][SEQ_WIDTH] = {")
