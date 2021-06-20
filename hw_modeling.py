@@ -34,7 +34,7 @@ class DpuModel:
     MULT_LAT = 1.0
 
     ADDER_RES = 1
-    MULT_RES = 1
+    MULT_RES = 1/3
     DIV_RES = 0
     COMP_RES = 0
 

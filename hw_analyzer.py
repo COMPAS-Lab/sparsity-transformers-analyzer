@@ -470,7 +470,7 @@ def visual_heatmap_exps(bert_hw_model: BertModel):
         plt.close(fig)
 
 
-def compare_mvm_ratio_with_latency_with_given_dsps(bert_hw_model: BertModel, dsps=6840.0, mvm_dsp_percentage=0.70):
+def compare_mvm_ratio_with_latency_with_given_dsps(bert_hw_model: BertModel, dsps=6840.0, mvm_dsp_percentage=0.70, plot_res=True):
     '''
     dsps: actual dsp slices on the chip, regardless of the data type.
     MVM mapping: Q head->K head->QK head->V head 
@@ -514,24 +514,25 @@ def compare_mvm_ratio_with_latency_with_given_dsps(bert_hw_model: BertModel, dsp
         print(mvm_block_wh_ratio, actual_mvm_dsps)
         print(softmax_ddl, softmax_lat)
 
-    fsize = 9
-    fig, ax = plt.subplots(1, 1, figsize=(6, 4))
-    matplotlib.rcParams.update({'xtick.labelsize': fsize})
-    matplotlib.rcParams.update({'ytick.labelsize': fsize})
-    matplotlib.rcParams['lines.markersize'] = 3
+    if plot_res:
+        fsize = 9
+        fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        matplotlib.rcParams.update({'xtick.labelsize': fsize})
+        matplotlib.rcParams.update({'ytick.labelsize': fsize})
+        matplotlib.rcParams['lines.markersize'] = 3
 
-    ax.plot(res_wh[1:], res_lat_ddl[1:], linestyle='-', color='C0', marker='s', linewidth=1, alpha=0.8)
-    ax2 = ax.twinx()
-    ax2.plot(res_wh[1:], res_relative_lat[1:], linestyle='-', color='C1', marker='s', linewidth=1, alpha=0.8)
+        ax.plot(res_wh[1:], res_lat_ddl[1:], linestyle='-', color='C0', marker='s', linewidth=1, alpha=0.8)
+        ax2 = ax.twinx()
+        ax2.plot(res_wh[1:], res_relative_lat[1:], linestyle='-', color='C1', marker='s', linewidth=1, alpha=0.8)
 
-    ax.set_xlabel(r'$\frac{mvm\ block\ width}{mvm\ block\ height}$', fontsize=fsize)
-    ax.set_ylabel('deadline-softmax_lat', fontsize=fsize)
-    ax2.set_ylabel(r'$\frac{deadline-softmax\_lat}{deadline}$')
-    ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
+        ax.set_xlabel(r'$\frac{mvm\ block\ width}{mvm\ block\ height}$', fontsize=fsize)
+        ax.set_ylabel('deadline-softmax_lat', fontsize=fsize)
+        ax2.set_ylabel(r'$\frac{deadline-softmax\_lat}{deadline}$')
+        ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
 
-    fig.tight_layout()
-    fig.savefig('res_fig/softmax_ddl_head_by_head.pdf')
-    plt.cla()
+        fig.tight_layout()
+        fig.savefig('res_fig/softmax_ddl_head_by_head.pdf')
+        plt.cla()
 
     # plot overhead vs. softmax resource
     cur_wh_ratio = float('inf')
@@ -547,31 +548,46 @@ def compare_mvm_ratio_with_latency_with_given_dsps(bert_hw_model: BertModel, dsp
             bert_hw_model.matmul_lat_qktrans_per_head(320, blk=(mvm_block_height, mvm_block_width))
     qk_trans_lat = qk_trans_addertree + qk_trans_adder + bert_hw_model.DIV_LAT
     softmax_lat = [np.mean([qk_trans_lat + bert_hw_model.baseline_softmax_lat(h, p) for h in real_exp_data]) for p in softmax_possible_p]
+    softmax_lat = np.array(softmax_lat)
+
+    sparse_softmax_possible_p = \
+        [p for p in softmax_p if bert_hw_model.softmax_resources(p, p, bert_hw_model.max_seq_len, 4)[0] < max_softmax_dsp]
+    sparse_softmax_lats = \
+        [np.mean([qk_trans_addertree + bert_hw_model.softmax_lat(h, p1=p, p2=p) for h in real_exp_data]) for p in sparse_softmax_possible_p]
+    sparse_softmax_lats = np.array(sparse_softmax_lats)
     # softmax_lat = [qk_trans_lat + bert_hw_model.baseline_softmax_lat(pa=p) for p in softmax_possible_p]
     softmax_ddl = qktrans_incycle + sum(bert_hw_model.matmul_lat_qkv_per_head(320, blk=(mvm_block_height, mvm_block_width)))
-    softmax_dsps = [bert_hw_model.baseline_softmax_resource(p, bert_hw_model.max_seq_len)[0] for p in softmax_possible_p]
+    softmax_dsps = np.array([bert_hw_model.baseline_softmax_resource(p, bert_hw_model.max_seq_len)[0] for p in softmax_possible_p])
+    sparse_softmax_dsps = np.array([bert_hw_model.softmax_resources(p, p, 320, 4)[0] for p in sparse_softmax_possible_p])
     softmax_overhead = [(softmax_ddl - lat) for lat in softmax_lat]
+    sparse_softmax_overhead = [(softmax_ddl - lat) for lat in sparse_softmax_lats]
 
-    fsize = 9
-    fig, ax = plt.subplots(1, 1, figsize=(6, 4))
-    matplotlib.rcParams.update({'xtick.labelsize': fsize})
-    matplotlib.rcParams.update({'ytick.labelsize': fsize})
-    matplotlib.rcParams['lines.markersize'] = 3
+    if plot_res:
+        fsize = 9
+        fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        matplotlib.rcParams.update({'xtick.labelsize': fsize})
+        matplotlib.rcParams.update({'ytick.labelsize': fsize})
+        matplotlib.rcParams['lines.markersize'] = 3
 
-    ax.plot(softmax_dsps, softmax_overhead, linestyle='-', color='C0', marker='s', linewidth=1, alpha=0.8)
-    # ax2 = ax.twinx()
-    # ax2.plot(res_wh[1:], res_relative_lat[1:], linestyle='-', color='C1', marker='s', linewidth=1, alpha=0.8)
+        ax.plot(softmax_dsps, softmax_overhead, linestyle='-', color='C0', marker='s', linewidth=1, alpha=0.8, label='baseline')
+        ax.plot(sparse_softmax_dsps, sparse_softmax_overhead, linestyle='-', color='C1', marker='s', linewidth=1, alpha=0.8, label='sparse softmax')
+        # ax2 = ax.twinx()
+        # ax2.plot(res_wh[1:], res_relative_lat[1:], linestyle='-', color='C1', marker='s', linewidth=1, alpha=0.8)
 
-    ax.set_xlabel(r'DSPs for softmax', fontsize=fsize)
-    ax.set_ylabel('deadline-softmax_lat', fontsize=fsize)
-    # ax2.set_ylabel(r'$\frac{deadline-softmax\_lat}{deadline}$')
-    ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
+        ax.set_xlabel(r'DSPs for softmax', fontsize=fsize)
+        ax.set_ylabel('deadline-softmax_lat', fontsize=fsize)
+        # ax2.set_ylabel(r'$\frac{deadline-softmax\_lat}{deadline}$')
+        ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
+        plt.legend(loc='lower right', fontsize=fsize)
+        fig.tight_layout()
+        fig.savefig('res_fig/softmax_ddl_head_by_head_pe.pdf')
+        plt.cla()
 
-    fig.tight_layout()
-    fig.savefig('res_fig/softmax_ddl_head_by_head_pe.pdf')
-    plt.cla()
+    res = {'ddl': softmax_ddl, 'baseline_lat': softmax_lat, 'baseline_dsps': softmax_dsps, \
+            'sparse_lat': sparse_softmax_lats, 'sparse_dsps': sparse_softmax_dsps}
+    return res
 
-def compare_mvm_ratio_delayed_v_with_latency_with_given_dsps(bert_hw_model:BertModel, dsps=6840.0, mvm_dsp_percentage=0.70):
+def compare_mvm_ratio_delayed_v_with_latency_with_given_dsps(bert_hw_model:BertModel, dsps=6840.0, mvm_dsp_percentage=0.70, plot_res=True):
     
     mvm_dsps = floor(dsps * mvm_dsp_percentage)
     mvm_block_height_list = range(2, floor(mvm_dsps/2.0), 20)
@@ -610,24 +626,25 @@ def compare_mvm_ratio_delayed_v_with_latency_with_given_dsps(bert_hw_model:BertM
         # else:
         #     pass
     
-    fsize = 9
-    fig, ax = plt.subplots(1, 1, figsize=(6, 4))
-    matplotlib.rcParams.update({'xtick.labelsize': fsize})
-    matplotlib.rcParams.update({'ytick.labelsize': fsize})
-    matplotlib.rcParams['lines.markersize'] = 3
+    if plot_res:
+        fsize = 9
+        fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        matplotlib.rcParams.update({'xtick.labelsize': fsize})
+        matplotlib.rcParams.update({'ytick.labelsize': fsize})
+        matplotlib.rcParams['lines.markersize'] = 3
 
-    ax.plot(res_wh[1:], res_lat_ddl[1:], linestyle='-', color='C0', marker='s', linewidth=1, alpha=0.8)
-    ax2 = ax.twinx()
-    ax2.plot(res_wh[1:], res_relative_lat[1:], linestyle='-', color='C1', marker='s', linewidth=1, alpha=0.8)
+        ax.plot(res_wh[1:], res_lat_ddl[1:], linestyle='-', color='C0', marker='s', linewidth=1, alpha=0.8)
+        ax2 = ax.twinx()
+        ax2.plot(res_wh[1:], res_relative_lat[1:], linestyle='-', color='C1', marker='s', linewidth=1, alpha=0.8)
 
-    ax.set_xlabel(r'$\frac{mvm\ block\ width}{mvm\ block\ height}$', fontsize=fsize)
-    ax.set_ylabel('deadline-softmax_lat', fontsize=fsize)
-    ax2.set_ylabel(r'$\frac{deadline-softmax\_lat}{deadline}$')
-    ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
+        ax.set_xlabel(r'$\frac{mvm\ block\ width}{mvm\ block\ height}$', fontsize=fsize)
+        ax.set_ylabel('deadline-softmax_lat', fontsize=fsize)
+        ax2.set_ylabel(r'$\frac{deadline-softmax\_lat}{deadline}$')
+        ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
 
-    fig.tight_layout()
-    fig.savefig('res_fig/softmax_ddl_delayed_v.pdf')
-    plt.cla()
+        fig.tight_layout()
+        fig.savefig('res_fig/softmax_ddl_delayed_v.pdf')
+        plt.cla()
 
     # plot overhead vs. softmax resource
     cur_wh_ratio = float('inf')
@@ -639,7 +656,9 @@ def compare_mvm_ratio_delayed_v_with_latency_with_given_dsps(bert_hw_model:BertM
 
     softmax_p = range(2, mvm_block_width)
     softmax_possible_p = [p for p in softmax_p if bert_hw_model.baseline_softmax_resource(p, bert_hw_model.max_seq_len)[0] < max_softmax_dsp]
+    sparse_softmax_possible_p = [p for p in softmax_p if bert_hw_model.softmax_resources(p, p, bert_hw_model.max_seq_len, 4)[0] < max_softmax_dsp]
     softmax_possible_p = np.array(softmax_possible_p)
+    sparse_softmax_possible_p = np.array(sparse_softmax_possible_p)
 
     qktrans_incycle, qk_trans_addertree, qk_trans_adder = \
             bert_hw_model.matmul_lat_qktrans_per_head(320, blk=(mvm_block_height, mvm_block_width))
@@ -648,13 +667,70 @@ def compare_mvm_ratio_delayed_v_with_latency_with_given_dsps(bert_hw_model:BertM
     
     softmax_stg1_incycle = np.array([h.shape[-1] * np.ceil(float(h.shape[-1]) / softmax_possible_p) for h in bert_hw_model.exps])
     softmax_stg1_incycle = np.mean(softmax_stg1_incycle, axis=0)
+    sparse_softmax_incycle = np.array([h.shape[-1] * np.ceil(float(h.shape[-1]) / sparse_softmax_possible_p) for h in bert_hw_model.exps])
+    sparse_softmax_incycle = np.mean(sparse_softmax_incycle, axis=0)
 
     # softmax_stg1_incycle = bert_hw_model.max_seq_len * np.ceil(float(bert_hw_model.max_seq_len) / softmax_possible_p)
     softmax_lat = softmax_stg1_incycle + qk_trans_adder + qk_trans_addertree
+    sparse_softmax_lat = sparse_softmax_incycle + qk_trans_adder + qk_trans_addertree
 
     softmax_ddl = qktrans_incycle + q_incycle + q_incycle + qk_trans_addertree + qk_trans_adder
-    softmax_dsps = [bert_hw_model.baseline_softmax_resource(p, bert_hw_model.max_seq_len)[0] for p in softmax_possible_p]
+    softmax_dsps = np.array([bert_hw_model.baseline_softmax_resource(p, bert_hw_model.max_seq_len)[0] for p in softmax_possible_p])
+    sparse_softmax_dsps = np.array([bert_hw_model.softmax_resources(p, p, bert_hw_model.max_seq_len, 4)[0] for p in sparse_softmax_possible_p])
     softmax_overhead = softmax_ddl - softmax_lat
+    sparse_softmax_overhead = softmax_ddl - sparse_softmax_lat
+
+    if plot_res:
+        fsize = 9
+        fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        matplotlib.rcParams.update({'xtick.labelsize': fsize})
+        matplotlib.rcParams.update({'ytick.labelsize': fsize})
+        matplotlib.rcParams['lines.markersize'] = 3
+
+        ax.plot(softmax_dsps, softmax_overhead, linestyle='-', color='C0', marker='s', linewidth=1, alpha=0.8, label='baseline')
+        ax.plot(sparse_softmax_dsps, sparse_softmax_overhead, linestyle = '-', color='C1', marker='s', linewidth=1, alpha=0.8, label='sparse softmax')
+
+        ax.set_xlabel(r'DSPs for softmax', fontsize=fsize)
+        ax.set_ylabel('deadline-softmax_lat', fontsize=fsize)
+        ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
+        plt.legend(loc='lower right', fontsize=fsize)
+        fig.tight_layout()
+        fig.savefig('res_fig/softmax_ddl_delayed_v_pe.pdf')
+        plt.cla()
+
+    res = {'ddl': softmax_ddl, 'baseline_lat': softmax_lat, 'baseline_dsps': softmax_dsps, \
+            'sparse_lat': sparse_softmax_lat, 'sparse_dsps': sparse_softmax_dsps}
+    return res
+
+def sweep_mvm_softmax_ratio(bert_hw_model: BertModel, effective_ovhead_threshold = 0.1, num_dsps = 6840.0, \
+                                schedule=compare_mvm_ratio_delayed_v_with_latency_with_given_dsps):
+    '''
+    sweeping across different mvm/softmax ratio
+    '''
+    mvm_dsp_percentage = np.arange(0.9, 0.99, 0.01)
+
+    def get_effective_overhead_idx(ddl, lat):
+        overhead = ddl-lat
+        effective_overhead = np.amax(overhead) * (1.0 - effective_ovhead_threshold)
+        effective_idx = np.argmax(overhead > effective_overhead)
+        return effective_idx
+
+    ddls = []
+    baseline_dsp_r, sparse_softmax_dsp_r = [], []
+    baseline_lat, sparse_softmax_lat = [], []
+    for mvm_dsp in mvm_dsp_percentage:
+        latency_res = schedule(bert_hw_model, dsps=num_dsps, mvm_dsp_percentage=mvm_dsp, plot_res=False)
+        ddls.append(latency_res['ddl'])
+
+        effective_idx = get_effective_overhead_idx(latency_res['ddl'], latency_res['baseline_lat'])
+        baseline_lat.append(latency_res['ddl']-latency_res['baseline_lat'][effective_idx])
+        baseline_dsp_r.append(mvm_dsp * num_dsps / latency_res['baseline_dsps'][effective_idx])
+        # baseline_dsp_r.append(latency_res['baseline_dsps'][effective_idx])
+
+        effective_idx = get_effective_overhead_idx(latency_res['ddl'], latency_res['sparse_lat'])
+        sparse_softmax_lat.append(latency_res['ddl']-latency_res['sparse_lat'][effective_idx])
+        sparse_softmax_dsp_r.append(mvm_dsp * num_dsps / latency_res['sparse_dsps'][effective_idx])
+        # sparse_softmax_dsp_r.append(latency_res['sparse_dsps'][effective_idx])
 
     fsize = 9
     fig, ax = plt.subplots(1, 1, figsize=(6, 4))
@@ -662,17 +738,17 @@ def compare_mvm_ratio_delayed_v_with_latency_with_given_dsps(bert_hw_model:BertM
     matplotlib.rcParams.update({'ytick.labelsize': fsize})
     matplotlib.rcParams['lines.markersize'] = 3
 
-    ax.plot(softmax_dsps, softmax_overhead, linestyle='-', color='C0', marker='s', linewidth=1, alpha=0.8)
-    # ax2 = ax.twinx()
-    # ax2.plot(res_wh[1:], res_relative_lat[1:], linestyle='-', color='C1', marker='s', linewidth=1, alpha=0.8)
+    ax.plot(baseline_dsp_r, baseline_lat, linestyle='-', color='C0', marker='s', linewidth=1, alpha=0.8, label='baseline')
+    ax.plot(sparse_softmax_dsp_r, sparse_softmax_lat, linestyle = '-', color='C1', marker='s', linewidth=1, alpha=0.8, label='sparse softmax')
 
-    ax.set_xlabel(r'DSPs for softmax', fontsize=fsize)
-    ax.set_ylabel('deadline-softmax_lat', fontsize=fsize)
-    # ax2.set_ylabel(r'$\frac{deadline-softmax\_lat}{deadline}$')
+    ax.set_xlabel(r'$\frac{mvm\ dsps}{softmax\ dsps}$', fontsize=fsize)
+    # ax.set_xlabel('softmax dsps', fontsize=fsize)
+    ax.set_ylabel('deadline-softmax latency', fontsize=fsize)
     ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
-
+    plt.legend(loc='lower right', fontsize=fsize)
     fig.tight_layout()
-    fig.savefig('res_fig/softmax_ddl_delayed_v_pe.pdf')
+    # fig.savefig('res_fig/softmax_ddl_softmax_dsp.pdf')
+    fig.savefig('res_fig/softmax_ddl_dsp_ratio.pdf')
     plt.cla()
 
 
@@ -689,5 +765,7 @@ if __name__ == '__main__':
     # v_compute_lat_teardown()
     # explore_p1_p2(bert_hw_model)
     # compare_softmax_with_model_len()
-    compare_mvm_ratio_with_latency_with_given_dsps(bert_hw_model, mvm_dsp_percentage=0.9)
-    compare_mvm_ratio_delayed_v_with_latency_with_given_dsps(bert_hw_model, mvm_dsp_percentage=0.9)
+    # compare_mvm_ratio_with_latency_with_given_dsps(bert_hw_model, mvm_dsp_percentage=0.9)
+    compare_mvm_ratio_delayed_v_with_latency_with_given_dsps(bert_hw_model, dsps=10890,  mvm_dsp_percentage=0.9)
+    sweep_mvm_softmax_ratio(bert_hw_model, effective_ovhead_threshold=0.1, \
+         schedule=compare_mvm_ratio_delayed_v_with_latency_with_given_dsps)
