@@ -1,4 +1,4 @@
-from math import ceil, floor, exp, log2
+from math import ceil, floor, exp, log2, sqrt
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
@@ -130,7 +130,29 @@ def explore_p1_p2(bert_model):
     res_lat_mat = np.array(res_lat_mat).reshape((len(p1_lst), len(p2_lst)))
 
     print(res_lat_mat)
-            
+
+
+def search_lowest_latency_in_bins(softmax_lat_lst: list, bin_width=100, resource_key='dsps'):
+    softmax_lat_lst.sort(key=lambda x: x[resource_key])
+    curr_bin, lst_idx = min([i[resource_key] for i in softmax_lat_lst]), 0
+    final_softmax_lat_lst = []
+    while curr_bin < max([i[resource_key] for i in softmax_lat_lst]):
+        temp_list = []
+        while curr_bin <= softmax_lat_lst[lst_idx][resource_key] < (curr_bin + bin_width) :
+            temp_list.append(softmax_lat_lst[lst_idx])
+            lst_idx += 1
+            if lst_idx >= len(softmax_lat_lst):
+                break
+
+        temp_list.sort(key=lambda x: x['latency'])
+        if len(temp_list) > 0:
+            if (len(final_softmax_lat_lst) < 1) or \
+                (len(final_softmax_lat_lst) > 0 and temp_list[0]['latency'] < final_softmax_lat_lst[-1]['latency']):
+                final_softmax_lat_lst.append(temp_list[0])
+        curr_bin += bin_width
+
+    return final_softmax_lat_lst
+
 
 def compare_lat_res_models(bert_hw_model: BertModel, resource_type = ['dsp', 'mem'], hw_modeling_type = ["softmax", "baseline softmax", "value mvm"], l_range = [200, 100, 50, 25]):
     '''
@@ -146,32 +168,13 @@ def compare_lat_res_models(bert_hw_model: BertModel, resource_type = ['dsp', 'me
     softmax_range = [2**i for i in range(8)]
     baseline_range = [(i+1) for i in range(16)]
     mvm_range = [2*(i) for i in np.arange(8, 33)]
-
-    def search_lowest_latency_in_bins(softmax_lat_lst: list, bin_width=100, resource_key='dsps'):
-        softmax_lat_lst.sort(key=lambda x: x[resource_key])
-        curr_bin, lst_idx = min([i[resource_key] for i in softmax_lat_lst]), 0
-        final_softmax_lat_lst = []
-        while curr_bin < max([i[resource_key] for i in softmax_lat_lst]):
-            temp_list = []
-            while curr_bin <= softmax_lat_lst[lst_idx][resource_key] < (curr_bin + bin_width) :
-                temp_list.append(softmax_lat_lst[lst_idx])
-                lst_idx += 1
-                if lst_idx >= len(softmax_lat_lst):
-                    break
-
-            temp_list.sort(key=lambda x: x['latency'])
-            if len(temp_list) > 0:
-                if (len(final_softmax_lat_lst) < 1) or \
-                    (len(final_softmax_lat_lst) > 0 and temp_list[0]['latency'] < final_softmax_lat_lst[-1]['latency']):
-                    final_softmax_lat_lst.append(temp_list[0])
-            curr_bin += bin_width
-
-        return final_softmax_lat_lst
-
     
     print("mvm range: ", mvm_range)
 
     value_res_lst = [bert_hw_model.matmul_res_qkv_per_head(blk=(w, w)) for w in mvm_range]
+
+    if len(bert_hw_model.exps) == 1:
+        print("selecting only one inst, seq len: ", bert_hw_model.exps[0].shape)
 
     softmax_lat_lst = []
     if "softmax" in hw_modeling_type:
@@ -230,45 +233,51 @@ def compare_lat_res_models(bert_hw_model: BertModel, resource_type = ['dsp', 'me
             v_compute_head_lat_lst.append(np.mean(temp_v_compute_head_lat))
             v_compute_head_lat_lst_ideal.append(np.mean(temp_v_compute_head_lat_ideal))
 
-    legend_lines = [mlines.Line2D([], [], color='C0', label='our softmax', marker='s', linestyle='-'),
-                    mlines.Line2D([], [], color='C1', label='baseline softmax', marker='s', linestyle='-'),
-                    mlines.Line2D([], [], color='C2', label='Value computation', marker='s', linestyle='-')
-                ]
+    qktrans_incycle = bert_hw_model.matmul_lat_qktrans_per_head_ideal(320, 143.0)
+    qkv_incycle = bert_hw_model.matmul_lat_qkv_per_head_ideal(320, 143.0)
+    ddl = qktrans_incycle + qkv_incycle * 3
+
+    blk_size = int(sqrt(3960*30))
+    qktrans_incycle_stratix, _, _ = bert_hw_model.matmul_lat_qktrans_per_head_stratix(320, blk=(blk_size, blk_size), ideal=True)
+    qkv_incycle_stratix, _, _ = bert_hw_model.matmul_lat_qkv_per_head_stratix(320, blk=(blk_size, blk_size), ideal=True)
+    stratix_ddl = qktrans_incycle_stratix + qkv_incycle_stratix * 3
 
     # plot lines
     if 'dsp' in resource_type:
         if len(softmax_lat_lst) > 0:
             ax.plot([i['dsps'] for i in final_softmax_lat_lst], [i['latency'] for i in final_softmax_lat_lst], 
-                        linestyle='-', color='C0', marker='s', linewidth=1, alpha=0.8)
+                        linestyle='-', color='C0', marker='s', linewidth=1, alpha=0.8, label="our softmax")
 
         if len(baseline_softmax_lat_lst) > 0:
             ax.plot([i['dsps'] for i in final_baseline_softmax_lat_lst], [i['latency'] for i in final_baseline_softmax_lat_lst], 
-                        linestyle='-', color='C1', marker='s', linewidth=1, alpha=0.8)
+                        linestyle='-', color='C1', marker='s', linewidth=1, alpha=0.8, label="baseline")
 
         if len(v_compute_head_lat_lst) > 0:
-            ax.plot([dsp[0] for dsp in value_res_lst], v_compute_head_lat_lst, linestyle='-', color='C2', marker='s', linewidth=1)
+            ax.plot([dsp[0] for dsp in value_res_lst], v_compute_head_lat_lst, linestyle='-', color='C2', marker='s', linewidth=1, label="v compute")
             ax.plot([dsp[0] for dsp in value_res_lst], v_compute_head_lat_lst_ideal, alpha=0.4, linestyle='-', color='C2', marker='s', linewidth=1)
 
-        ax.set_xlabel('DSP Usage', fontsize=fsize)
+        ax.axhline(ddl, linestyle='--', color='blue', label='softmax deadline (ideal)')
+        ax.axhline(stratix_ddl, linestyle='--', color='red', label='softmax deadline (ideal DPU)')
+
+        ax.set_xlabel('AI Tensor Usage', fontsize=fsize)
         ax.set_ylabel('latency', fontsize=fsize)
-        ax.set_xlim(xmin=0, xmax=10000)
-        ax.set_ylim(ymin=0)
+        ax.set_ylim(ymin=0, ymax=5500)
         ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
 
         fig.tight_layout()
-        plt.legend(handles=legend_lines, loc='upper right', fontsize=fsize)
-        fig.savefig('res_fig/softmax_lat_res_analyze_pe.pdf')
+        plt.legend(loc='upper right', fontsize=fsize)
+        fig.savefig('res_fig/softmax_lat_res_analyze_pe_fixed_len.pdf')
         plt.cla()
     
     if 'mem' in resource_type:
         if len(softmax_lat_lst) > 0:
             ax.plot([i['mem'] for i in final_softmax_mem_lst], [i['latency'] for i in final_softmax_mem_lst], 
-                        linestyle='-', color='C0', marker='s', linewidth=1, alpha=0.8)
+                        linestyle='-', color='C0', marker='s', linewidth=1, alpha=0.8, label="our softmax")
         if len(baseline_softmax_lat_lst) > 0:
             ax.plot([i['mem'] for i in final_baseline_softmax_mem_lst], [i['latency'] for i in final_baseline_softmax_mem_lst], 
-                        linestyle='-', color='C1', marker='s', linewidth=1, alpha=0.8)
+                        linestyle='-', color='C1', marker='s', linewidth=1, alpha=0.8, label="baseline")
         if len(v_compute_head_lat_lst) > 0:
-            ax.plot([mem[1] for mem in value_res_lst], v_compute_head_lat_lst, linestyle='-', color='C2', marker='s', linewidth=1)
+            ax.plot([mem[1] for mem in value_res_lst], v_compute_head_lat_lst, linestyle='-', color='C2', marker='s', linewidth=1, label="v compute")
 
 
         ax.set_xlabel('Mem Usage/KB', fontsize=fsize)
@@ -278,7 +287,7 @@ def compare_lat_res_models(bert_hw_model: BertModel, resource_type = ['dsp', 'me
         ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
 
         fig.tight_layout()
-        plt.legend(handles=legend_lines, loc='upper left', fontsize=fsize)
+        plt.legend(loc='upper left', fontsize=fsize)
         fig.savefig('res_fig/softmax_lat_res_analyze_mem.pdf')
         plt.cla()
 
@@ -755,10 +764,17 @@ def sweep_mvm_softmax_ratio(bert_hw_model: BertModel, effective_ovhead_threshold
 if __name__ == '__main__':
     # bert_hw_model = BertModel(read_exp_samples=False, num_layers=12, num_heads=12)
     bert_hw_model = BertModel(read_exp_samples=True)
+    filtered_insts = []
+    for inst in bert_hw_model.exps:
+        if inst.shape[-1] > 300:
+            filtered_insts.append(inst)
+
+    bert_hw_model.exps = filtered_insts
     # bert_hw_model.analyzer_void_columns()
     # compare_naive_softmax_heads(bert_hw_model)
     # compare_naive_softmax_parallel(bert_hw_model)
     # compare_lat_res_models(bert_hw_model, resource_type=['dsp'], l_range=np.arange(100, 2, -2), hw_modeling_type=["softmax", "baseline softmax", "value mvm"])
+    compare_lat_res_models(bert_hw_model, resource_type=['dsp'], l_range=np.arange(100, 2, -10), hw_modeling_type=["softmax", "baseline softmax"])
     # visualize_outer_product_intermediate_size(bert_hw_model)
     # visual_heatmap_exps(bert_hw_model)
     # mem_teardown(bert_hw_model)
@@ -766,6 +782,6 @@ if __name__ == '__main__':
     # explore_p1_p2(bert_hw_model)
     # compare_softmax_with_model_len()
     # compare_mvm_ratio_with_latency_with_given_dsps(bert_hw_model, mvm_dsp_percentage=0.9)
-    compare_mvm_ratio_delayed_v_with_latency_with_given_dsps(bert_hw_model, dsps=10890,  mvm_dsp_percentage=0.9)
-    sweep_mvm_softmax_ratio(bert_hw_model, effective_ovhead_threshold=0.1, \
-         schedule=compare_mvm_ratio_delayed_v_with_latency_with_given_dsps)
+    # compare_mvm_ratio_delayed_v_with_latency_with_given_dsps(bert_hw_model, dsps=10890,  mvm_dsp_percentage=0.9)
+    # sweep_mvm_softmax_ratio(bert_hw_model, effective_ovhead_threshold=0.1, \
+    #      schedule=compare_mvm_ratio_delayed_v_with_latency_with_given_dsps)
