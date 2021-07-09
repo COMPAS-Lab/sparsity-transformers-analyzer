@@ -112,7 +112,7 @@ class StratixDpuModel:
     MULT_LAT = 1.0
 
     ADDER_RES = 1
-    MULT_RES = 1/3
+    MULT_RES = 1.0/30.0
     DIV_RES = 0
     COMP_RES = 0
 
@@ -171,7 +171,7 @@ class StratixDpuModel:
         # print(f"dpu mults: {dpu_mults}, dpu adders: {dpu_adders}")
 
         mem_usage = self.b_w * self.b_h * self.WORD_SIZE / 1024.
-        return dpu_mults * self.MULT_RES + dpu_adders * self.ADDER_RES, mem_usage
+        return dpu_mults * self.MULT_RES, mem_usage
 
 class IdealMvmModel:
     tops = 0.0
@@ -218,13 +218,14 @@ class BertModel:
     embd_size = 0.0
     max_seq_len = 320.
 
-    COMP_LAT = 2.0
+    COMP_LAT = 3.0
     ADDER_LAT = 3.0
     MULT_LAT = 3.0
+    MAC_LAT = 4.0
     DIV_LAT = 15
 
     ADDER_RES = 1.0/3.0
-    MULT_RES = 2
+    MULT_RES = 1./30.
     DIV_RES = 0
     COMP_RES = 0
 
@@ -313,7 +314,7 @@ class BertModel:
             adder_tree_adders += float(2 ** int(log2Down(rest_elems)))
             rest_elems -= float(2 ** int(log2Down(rest_elems)))
 
-        adder_tree_adders *= ceil(self.ADDER_RES)
+        adder_tree_adders = ceil(self.ADDER_RES * (p1-1))
 
         accu_mem = l3 * 2
         # calculate exp out buffer
@@ -322,9 +323,9 @@ class BertModel:
 
         div_resources = p2 * self.DIV_RES
 
-        row_parallelism = np.ceil(self.max_seq_len / l3)
+        row_parallelism = self.max_seq_len / l3
         total_mem = row_parallelism * (exp_mem + accu_mem + exp_out_buffer) * self.WORD_SIZE / 1024
-        total_res = row_parallelism * (exp_resources + adder_tree_adders + 1 + div_resources)
+        total_res = ceil(row_parallelism * (exp_resources + adder_tree_adders + 1 + div_resources))
 
         return total_res, total_mem
 
@@ -353,7 +354,7 @@ class BertModel:
         argument:
         exp_dat - output of attention exponent func  
         '''
-        adder_tree_stages = log2(p1)
+        adder_tree_stages = p1-1
         row_itlve_len = exp_dat.shape[0]
 
         a_cols = np.count_nonzero(exp_dat, axis=-1)
@@ -394,7 +395,7 @@ class BertModel:
         return lat
 
     def baseline_softmax_resource(self, p, l):
-        exp_resource = max(self.MULT_RES, self.ADDER_RES)
+        exp_resource = self.MULT_RES
         log_resource = self.ADDER_RES
 
         tree_elems, rest_elems = 0.0, p
@@ -405,7 +406,7 @@ class BertModel:
         res_all = (tree_elems + 1) * self.COMP_RES
         res_all += ceil(self.ADDER_RES * p)
         res_all += exp_resource * p
-        res_all += (tree_elems + 1) * self.ADDER_RES
+        res_all += (p-1) * self.ADDER_RES
         res_all += ceil(self.ADDER_RES * 2 * p)
         res_all += exp_resource * p
         res_all += log_resource
@@ -414,7 +415,7 @@ class BertModel:
         res_all *= row_parallelism
 
         exp_lat = self.ADDER_LAT + self.MULT_LAT + 1 + 2
-        stg_2_lat = self.ADDER_LAT + exp_lat + log2Up(p) * self.ADDER_LAT + self.ADDER_LAT
+        stg_2_lat = self.ADDER_LAT + exp_lat + (p-1) * self.ADDER_LAT + self.ADDER_LAT
 
         exp_mem = 64
         log_mem = 64 + 32
@@ -448,7 +449,7 @@ class BertModel:
 
     def matmul_lat_qkv_per_head(self, seq_len, blk=(64.0, 64.0), ideal=False):
         if self.exps is not None:
-            print(__name__+": using acutal size of exp")
+            # print(__name__+": using acutal size of exp")
             actual_seq_len = [i.shape[-1] for i in self.exps]
         
             in_cycles, adder_trees, adders = [], [], []
@@ -471,7 +472,7 @@ class BertModel:
 
     def matmul_lat_qkv_per_head_ideal(self, seq_len, tops):
         if self.exps is not None:
-            print(__name__+": using acutal size of exp")
+            # print(__name__+": using acutal size of exp")
             actual_seq_len = [i.shape[-1] for i in self.exps]
         
             in_cycles = []
@@ -488,7 +489,7 @@ class BertModel:
     def matmul_lat_qkv_per_head_stratix(self, seq_len, blk, ideal=False):
 
         if self.exps is not None:
-            print(__name__+": using acutal size of exp")
+            # print(__name__+": using acutal size of exp")
             actual_seq_len = [i.shape[-1] for i in self.exps]
         
             in_cycles, adder_trees, adders = [], [], []
@@ -508,7 +509,7 @@ class BertModel:
     
     def matmul_lat_qktrans_per_head(self, seq_len, blk=(64.0, 64.0), ideal=False):
         if self.exps is not None:
-            print(__name__+": using acutal size of exp")
+            # print(__name__+": using acutal size of exp")
             actual_seq_len = [i.shape[-1] for i in self.exps]
             
             in_cycles, adder_trees, adders = [], [], []
@@ -526,6 +527,10 @@ class BertModel:
 
     def matmul_res_qktrans_per_head(self, blk, seq_len=320):
         dpu_model = DpuModel(seq_len, self.embd_size,  self.embd_size, seq_len, blk[0], blk[1])
+        return dpu_model.compute_resource()
+
+    def matmul_res_qktrans_per_head_stratix(self, blk, seq_len=320):
+        dpu_model = StratixDpuModel(seq_len, self.embd_size, self.embd_size, seq_len, blk[0], blk[1])
         return dpu_model.compute_resource()
 
     def matmul_lat_qktrans_per_head_ideal(self, seq_len, tops):
@@ -546,7 +551,7 @@ class BertModel:
 
     def matmul_lat_qktrans_per_head_stratix(self, seq_len, blk=(64.0, 64.0), ideal=False):
         if self.exps is not None:
-            print(__name__+": using acutal size of exp")
+            # print(__name__+": using acutal size of exp")
             actual_seq_len = [i.shape[-1] for i in self.exps]
             
             in_cycles, adder_trees, adders = [], [], []
