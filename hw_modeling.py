@@ -1,4 +1,4 @@
-from math import ceil, floor, exp, log2, gcd
+from math import ceil, floor, exp, log2, gcd, sqrt
 import numpy as np
 import matplotlib.pyplot as plt
 import random
@@ -107,11 +107,13 @@ class StratixDpuModel:
     b_w = 0
     b_h = 0
 
-    COMP_LAT = 1.0
-    ADDER_LAT = 1.0
-    MULT_LAT = 1.0
+    # FIXME: check the availability here
+    COMP_LAT = 3.0
+    ADDER_LAT = 3.0
+    MULT_LAT = 3.0
+    MAC_LAT = 4.0
 
-    ADDER_RES = 1
+    ADDER_RES = 1/3.0
     MULT_RES = 1.0/30.0
     DIV_RES = 0
     COMP_RES = 0
@@ -156,7 +158,8 @@ class StratixDpuModel:
     
     def compute_lat_teardown(self, ideal=False):
         input_cycles = self.num_grps_in_a(ideal=ideal) * self.num_wei_per_dpu(ideal=ideal) * self.a_h
-        adder_tree_cycles = self.elemul_addtree_lat()
+        # adder_tree_cycles = self.elemul_addtree_lat()
+        adder_tree_cycles = (self.input_len_per_cycle()-1)/30.0 * self.ADDER_LAT
         adder_lat = self.add_lat()
         return input_cycles, adder_tree_cycles, adder_lat
 
@@ -514,7 +517,7 @@ class BertModel:
             
             in_cycles, adder_trees, adders = [], [], []
             for l in actual_seq_len:
-                dpu_model = DpuModel(l, self.embd_size,  self.embd_size, seq_len, blk[0], blk[1])
+                dpu_model = DpuModel(l, self.embd_size,  self.embd_size, l, blk[0], blk[1])
                 in_cycle, adder_tree, adder = dpu_model.compute_lat_teardown(ideal=ideal)
                 in_cycles.append(in_cycle)
                 adder_trees.append(adder_tree)
@@ -556,7 +559,7 @@ class BertModel:
             
             in_cycles, adder_trees, adders = [], [], []
             for l in actual_seq_len:
-                dpu_model = StratixDpuModel(l, self.embd_size,  self.embd_size, seq_len, blk[0], blk[1])
+                dpu_model = StratixDpuModel(l, self.embd_size,  self.embd_size, l, blk[0], blk[1])
                 in_cycle, adder_tree, adder = dpu_model.compute_lat_teardown(ideal=ideal)
                 in_cycles.append(in_cycle)
                 adder_trees.append(adder_tree)
@@ -565,6 +568,43 @@ class BertModel:
             return np.mean(in_cycles), np.mean(adder_trees), np.mean(adders)
         else:
             dpu_model = StratixDpuModel(seq_len, self.embd_size,  self.embd_size, seq_len, blk[0], blk[1])
+            return dpu_model.compute_lat_teardown(ideal=ideal)
+
+
+    def matmul_lat_vatt_per_head_stratix(self, seq_len, blk=(64, 64), ideal=False):
+        if self.exps is not None:
+            # print(__name__+": using acutal size of exp")
+            actual_seq_len = [i.shape[-1] for i in self.exps]
+            
+            in_cycles, adder_trees, adders = [], [], []
+            for l in actual_seq_len:
+                dpu_model = StratixDpuModel(l, l, l, (self.embd_size / self.num_heads), blk[0], blk[1])
+                in_cycle, adder_tree, adder = dpu_model.compute_lat_teardown(ideal=ideal)
+                in_cycles.append(in_cycle)
+                adder_trees.append(adder_tree)
+                adders.append(adder)
+
+            return np.mean(in_cycles), np.mean(adder_trees), np.mean(adders)
+        else:
+            dpu_model = StratixDpuModel(seq_len, seq_len, seq_len, (self.embd_size / self.num_heads), blk[0], blk[1])
+            return dpu_model.compute_lat_teardown(ideal=ideal)
+
+    def matmul_lat_selfatt_out_stratix(self, seq_len, blk=(64, 64), ideal=False):
+        if self.exps is not None:
+            # print(__name__+": using acutal size of exp")
+            actual_seq_len = [i.shape[-1] for i in self.exps]
+            
+            in_cycles, adder_trees, adders = [], [], []
+            for l in actual_seq_len:
+                dpu_model = StratixDpuModel(l, self.embd_size, self.embd_size, self.embd_size, blk[0], blk[1])
+                in_cycle, adder_tree, adder = dpu_model.compute_lat_teardown(ideal=ideal)
+                in_cycles.append(in_cycle)
+                adder_trees.append(adder_tree)
+                adders.append(adder)
+
+            return np.mean(in_cycles), np.mean(adder_trees), np.mean(adders)
+        else:
+            dpu_model = StratixDpuModel(seq_len, self.embd_size, self.embd_size, self.embd_size, blk[0], blk[1])
             return dpu_model.compute_lat_teardown(ideal=ideal)
 
     def att_v_outer_product_intermediate_size(self):
@@ -580,6 +620,45 @@ class BertModel:
             return np.array(per_inst_intermediate_size)
         else:
             return None
+
+    def attention_lat_stratix(self, mvm_tcore: float, softmax_tcore: tuple):
+        equi_mvm_blk_size = int(sqrt(mvm_tcore*30))
+        mvm_in_cycles, mvm_accumu_lat, mvm_adder_lat = \
+            self.matmul_lat_qkv_per_head_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True)
+        
+        single_head_iter = mvm_in_cycles * 2
+        single_head_iter += mvm_accumu_lat + mvm_adder_lat
+
+        # first 11 heads to cover the softmax latency by mvm compute:
+        qktrans_in_cycles, qktrans_accumu_lat, qktrans_adder_lat = \
+            self.matmul_lat_qktrans_per_head_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True)
+        qkv_qktrans_compute_lat = qktrans_in_cycles + mvm_in_cycles * 3 + qktrans_accumu_lat + qktrans_adder_lat
+        r, p = softmax_tcore
+        softmax_stg1_incycle = np.mean([ceil(h.shape[-1]/r)* ceil(float(h.shape[-1])/p) \
+                                            for h in self.exps])
+        softmax_lat = softmax_stg1_incycle + qktrans_accumu_lat + qktrans_adder_lat
+
+        # select dominate intermediate latency: softmax in cycles or q k v compute
+        intermediate_lat = max(qkv_qktrans_compute_lat, softmax_stg1_incycle)
+        if qkv_qktrans_compute_lat > softmax_stg1_incycle:
+            print(f"{__name__}: softmax hidden successful")
+        else:
+            print(f"{__name__}: softmax hidden failed")
+
+        predessesor_heads_lat = mvm_in_cycles * 2 + intermediate_lat * (self.num_heads-1)
+
+        # accumulate VxAtt
+        vatt_mult_incycles, _, _ = \
+            self.matmul_lat_vatt_per_head_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True)
+        vatt_mult_incycles *= 12
+
+        # last step: FC layer for output
+        output_fc_incycles, output_fc_accu, output_fc_adder = \
+            self.matmul_lat_selfatt_out_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True)
+        output_fc_lat = output_fc_incycles + output_fc_accu + output_fc_adder
+
+        res = intermediate_lat + predessesor_heads_lat + vatt_mult_incycles + output_fc_lat
+        return res
     
 
 if __name__ == '__main__':
@@ -587,4 +666,6 @@ if __name__ == '__main__':
     # bert_hw_model.probe_exps()
 
     temp_lat = bert_hw_model.softmax_lat(bert_hw_model.exps[0][0, 0, :20, :20], p1=8, p2=16)
-    print(temp_lat)
+
+    res = bert_hw_model.attention_lat_stratix(3960.0, (16, 32))
+    print(res)
