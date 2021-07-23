@@ -1,4 +1,5 @@
 from math import ceil, floor, exp, log2, gcd, sqrt
+from re import template
 import numpy as np
 import matplotlib.pyplot as plt
 import random
@@ -621,7 +622,7 @@ class BertModel:
         else:
             return None
 
-    def attention_lat_stratix(self, mvm_tcore: float, softmax_tcore: tuple):
+    def attention_lat_stratix(self, mvm_tcore: float, softmax_tcore: tuple, softmax_type = "baseline"):
         equi_mvm_blk_size = int(sqrt(mvm_tcore*30))
         mvm_in_cycles, mvm_accumu_lat, mvm_adder_lat = \
             self.matmul_lat_qkv_per_head_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True)
@@ -634,18 +635,44 @@ class BertModel:
             self.matmul_lat_qktrans_per_head_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True)
         qkv_qktrans_compute_lat = qktrans_in_cycles + mvm_in_cycles * 3 + qktrans_accumu_lat + qktrans_adder_lat
         r, p = softmax_tcore
-        softmax_stg1_incycle = np.mean([ceil(h.shape[-1]/r)* ceil(float(h.shape[-1])/p) \
+        softmax_stg1_incycle = np.mean([ceil(h.shape[-1]/r) * ceil(float(h.shape[-1])/p) \
                                             for h in self.exps])
-        softmax_lat = softmax_stg1_incycle + qktrans_accumu_lat + qktrans_adder_lat
+
+        flatten_exps = []
+        for inst in self.exps:
+            num_layers, num_heads, num_rows, _ = inst.shape
+            real_exp = inst.reshape((num_layers * num_heads, num_rows, num_rows))
+            for h in real_exp: flatten_exps.append(h)
+
+        if softmax_type == "baseline":
+            temp_lats = []
+            for inst in flatten_exps:
+                effective_inst = inst[:ceil(inst.shape[-1]/r), :]
+                temp_lats.append(self.baseline_softmax_lat(effective_inst, p))
+
+            softmax_lat = softmax_stg1_incycle + np.mean(np.array(temp_lats))
+        else:
+            temp_lats = []
+            for inst in flatten_exps:
+                effective_inst = inst[:ceil(inst.shape[-1]/r), :]
+                temp_lats.append(self.softmax_lat(effective_inst, p, p))
+
+            softmax_lat = softmax_stg1_incycle + np.mean(np.array(temp_lats))
 
         # select dominate intermediate latency: softmax in cycles or q k v compute
         intermediate_lat = max(qkv_qktrans_compute_lat, softmax_stg1_incycle)
         if qkv_qktrans_compute_lat > softmax_stg1_incycle:
-            print(f"{__name__}: softmax hidden successful")
+            print(f"{__name__}: softmax hidden succeeded")
         else:
             print(f"{__name__}: softmax hidden failed")
 
         predessesor_heads_lat = mvm_in_cycles * 2 + intermediate_lat * (self.num_heads-1)
+        # softmax finish time (absolute time)
+        softmax_first_finish_time = mvm_in_cycles * 2 + qktrans_adder_lat + qktrans_accumu_lat + \
+                                        softmax_stg1_incycle + softmax_lat
+        softmax_first_ddl = predessesor_heads_lat + intermediate_lat
+        if softmax_first_ddl < softmax_first_finish_time:
+            print(softmax_first_finish_time, softmax_first_ddl)
 
         # accumulate VxAtt
         vatt_mult_incycles, _, _ = \
@@ -657,7 +684,19 @@ class BertModel:
             self.matmul_lat_selfatt_out_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True)
         output_fc_lat = output_fc_incycles + output_fc_accu + output_fc_adder
 
-        res = intermediate_lat + predessesor_heads_lat + vatt_mult_incycles + output_fc_lat
+        if softmax_first_ddl < softmax_first_finish_time:
+            # softmax latency cannot be covered by 12 heads
+            first_vatt_finish = softmax_lat + vatt_mult_incycles
+            second_vatt_start = intermediate_lat + softmax_lat
+            vatt_gap = second_vatt_start - first_vatt_finish
+            vatt_gap = 0 if vatt_gap < 0 else vatt_gap
+            res = mvm_in_cycles * 2 + qktrans_accumu_lat + qktrans_adder_lat
+            res += softmax_lat + (vatt_mult_incycles + vatt_gap) * self.num_heads
+            res += output_fc_lat
+        else: 
+            # softmax latency can be covered by 12 heads
+            res = intermediate_lat + predessesor_heads_lat + vatt_mult_incycles + output_fc_lat
+        
         return res
     
 
