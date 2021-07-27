@@ -23,3 +23,12 @@ dropped_attention_params
 
 #python
 __pycache__/
+
+#results
+cached_dev_optim-val-3bits_384
+cached_dev_roberta-base-squad-v1_320
+cached_dev_roberta-base-squad-v1_384
+cached_train_roberta-base-squad-v1_320
+cached_train_roberta-base-squad-v1_384
+runs/
+squad/
