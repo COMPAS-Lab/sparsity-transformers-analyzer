@@ -1,4 +1,4 @@
-from math import ceil, floor, exp, log2, gcd, sqrt
+from math import ceil, floor, exp, log2, gcd, sqrt, pow
 from re import template
 import numpy as np
 import matplotlib.pyplot as plt
@@ -222,6 +222,8 @@ class BertModel:
     embd_size = 0.0
     max_seq_len = 320.
 
+    freq = 500
+
     COMP_LAT = 3.0
     ADDER_LAT = 3.0
     MULT_LAT = 3.0
@@ -235,7 +237,7 @@ class BertModel:
 
     WORD_SIZE = 2
 
-    def __init__(self, embd_size=768.0, num_layers=0.0, num_heads=0.0, read_exp_samples=False, exp_sample_path='params/scrs_sampled.npy', att_sample_path='params/attentions_sampled.npy'):
+    def __init__(self, embd_size=768.0, num_layers=0.0, num_heads=0.0, read_exp_samples=False, max_seq_len=320., exp_sample_path='params/scrs_sampled.npy', att_sample_path='params/attentions_sampled.npy'):
         if read_exp_samples:
             self.load_exp_out(exp_sample_path, att_sample_path)
             self.num_layers = self.exps[0].shape[0]
@@ -245,6 +247,7 @@ class BertModel:
             self.num_heads = num_heads
             
         self.embd_size = embd_size
+        self.max_seq_len = max_seq_len
         
         if self.num_layers == 0 or self.num_heads == 0:
             raise Exception("BertModel init error: lack of critical parameters")
@@ -272,6 +275,29 @@ class BertModel:
             for i in range(atten_len): exps.append(np.load(exps_file))
 
         self.exps = exps
+
+    def qkv_size(self):
+        '''
+        return size in MB        
+        '''
+        qkv_size = 0.0
+        if self.exps is not None:
+            qkv_size = np.mean([inst.shape[-2] for inst in self.exps]) * self.embd_size / self.num_heads
+        else:
+            qkv_size = self.max_seq_len * self.embd_size / self.num_heads
+
+        qkv_size *= self.WORD_SIZE / pow(1024, 3)
+        return qkv_size
+
+    def att_size(self):
+        att_size = 0.0
+        if self.exps is not None:
+            att_size = np.mean([pow(inst.shape[-1], 2) for inst in self.exps])
+        else:
+            att_size = pow(self.max_seq_len, 2)
+
+        att_size *= self.WORD_SIZE / pow(1024, 3)
+        return att_size
 
     def probe_exps(self):
         fig, ax = plt.subplots(1, 1, figsize=(24, 4))
@@ -353,15 +379,21 @@ class BertModel:
         lut_lat = 2.0
         return self.COMP_LAT + lut_decoder_lat + lut_lat
 
-    def softmax_lat(self, exp_dat, p1=1., p2=1.):
+    def softmax_lat(self, exp_dat=None, p1=1., p2=1., exp_h=-1):
         '''
         argument:
         exp_dat - output of attention exponent func  
         '''
         adder_tree_stages = p1-1
-        row_itlve_len = exp_dat.shape[0]
+        if exp_dat is None:
+            row_itlve_len = exp_h
+            a_cols = self.max_seq_len * 0.8
+            grp_cols = ceil(exp_h / p1)
+        else:
+            row_itlve_len = exp_dat.shape[0]
+            a_cols = np.count_nonzero(exp_dat, axis=-1)
+            grp_cols = ceil(exp_dat.shape[-1] / p1)
 
-        a_cols = np.count_nonzero(exp_dat, axis=-1)
         # padding zeros for unaligned parallel sub-cols
         a_cols_1 = np.ceil(a_cols / p1)
         a_cols_2 = np.ceil(a_cols / p2)
@@ -370,7 +402,7 @@ class BertModel:
         
         #check parallelism eligibility
         p2_consuming = np.amax(a_cols_2) * row_itlve_len
-        p1_producing = np.ceil(exp_dat.shape[-1] / p1) * row_itlve_len
+        p1_producing = grp_cols * row_itlve_len
 
         if np.sum(a_cols) == 0:
             return 0.0
@@ -623,12 +655,125 @@ class BertModel:
             return None
 
     def attention_lat_stratix(self, mvm_tcore: float, softmax_tcore: tuple, softmax_type = "baseline"):
+        '''
+        softmax_tcore: r, p -> r: row parallelism, p -> column parallelism
+        '''
         equi_mvm_blk_size = int(sqrt(mvm_tcore*30))
         mvm_in_cycles, mvm_accumu_lat, mvm_adder_lat = \
             self.matmul_lat_qkv_per_head_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True)
         
         single_head_iter = mvm_in_cycles * 2
         single_head_iter += mvm_accumu_lat + mvm_adder_lat
+
+        # first 11 heads to cover the softmax latency by mvm compute:
+        qktrans_in_cycles, qktrans_accumu_lat, qktrans_adder_lat = \
+            self.matmul_lat_qktrans_per_head_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True)
+        qkv_qktrans_compute_lat = qktrans_in_cycles + mvm_in_cycles * 3 + qktrans_accumu_lat + qktrans_adder_lat
+        r, p = softmax_tcore
+        if self.exps is None:
+            softmax_stg1_incycle = ceil(self.max_seq_len/r) * ceil(self.max_seq_len/p)
+        else:
+            softmax_stg1_incycle = np.mean([ceil(h.shape[-1]/r) * ceil(float(h.shape[-1])/p) \
+                                            for h in self.exps])
+
+        flatten_exps = []
+        if self.exps is not None:
+            for inst in self.exps:
+                num_layers, num_heads, num_rows, _ = inst.shape
+                real_exp = inst.reshape((num_layers * num_heads, num_rows, num_rows))
+                for h in real_exp: flatten_exps.append(h)
+
+        if softmax_type == "baseline":
+            temp_lats = []
+            if len(flatten_exps) > 0:
+                for inst in flatten_exps:
+                    effective_inst = inst[:ceil(inst.shape[-1]/r), :]
+                    temp_lats.append(self.baseline_softmax_lat(effective_inst, p))
+            else:
+                temp_lats.append(self.baseline_softmax_lat(pa=p, exp_h=ceil(self.max_seq_len/r)))
+
+            softmax_lat = softmax_stg1_incycle + np.mean(np.array(temp_lats))
+        else:
+            temp_lats = []
+            if len(flatten_exps) > 0:
+                for inst in flatten_exps:
+                    effective_inst = inst[:ceil(inst.shape[-1]/r), :]
+                    temp_lats.append(self.softmax_lat(exp_dat=effective_inst, p1=p, p2=p))
+            else:
+                temp_lats.append(self.softmax_lat(p1=p, p2=p, exp_h=ceil(self.max_seq_len/r)))
+                
+            softmax_lat = softmax_stg1_incycle + np.mean(np.array(temp_lats))
+
+        # select dominate intermediate latency: softmax in cycles or q k v compute
+        intermediate_lat = max(qkv_qktrans_compute_lat, softmax_stg1_incycle)
+        if qkv_qktrans_compute_lat > softmax_stg1_incycle:
+            print(f"{__name__}: softmax hidden succeeded")
+        else:
+            print(f"{__name__}: softmax hidden failed")
+
+        predessesor_heads_lat = mvm_in_cycles * 2 + intermediate_lat * (self.num_heads-1)
+        # softmax finish time (absolute time)
+        softmax_first_finish_time = mvm_in_cycles * 2 + qktrans_adder_lat + qktrans_accumu_lat + \
+                                        softmax_stg1_incycle + softmax_lat
+        softmax_first_ddl = predessesor_heads_lat + intermediate_lat
+        if softmax_first_ddl < softmax_first_finish_time:
+            print(softmax_first_finish_time, softmax_first_ddl)
+
+        # accumulate VxAtt
+        vatt_mult_incycles, _, _ = \
+            self.matmul_lat_vatt_per_head_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True)
+        vatt_mult_incycles *= self.num_heads
+
+        # last step: FC layer for output
+        output_fc_incycles, output_fc_accu, output_fc_adder = \
+            self.matmul_lat_selfatt_out_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True)
+        output_fc_lat = output_fc_incycles + output_fc_accu + output_fc_adder
+
+        if softmax_first_ddl < softmax_first_finish_time:
+            # softmax latency cannot be covered by 12 heads
+            first_vatt_finish = softmax_lat + vatt_mult_incycles
+            second_vatt_start = intermediate_lat + softmax_lat
+            vatt_gap = second_vatt_start - first_vatt_finish
+            vatt_gap = 0 if vatt_gap < 0 else vatt_gap
+            res = mvm_in_cycles * 2 + qktrans_accumu_lat + qktrans_adder_lat
+            res += softmax_lat + (vatt_mult_incycles + vatt_gap) * self.num_heads
+            res += output_fc_lat
+        else: 
+            # softmax latency can be covered by 12 heads
+            res = intermediate_lat + predessesor_heads_lat + vatt_mult_incycles + output_fc_lat
+        
+        return res
+
+    def attention_mvm_only_lat_stratix(self, mvm_tcore: float):
+        '''
+        compute mvm only latency of the attention, used to estimate dynamic utilization of the mvm unit.
+        '''
+        equi_mvm_blk_size = int(sqrt(mvm_tcore*30))
+        mvm_in_cycles, mvm_accumu_lat, mvm_adder_lat = \
+            self.matmul_lat_qkv_per_head_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True)
+
+        # first 11 heads to cover the softmax latency by mvm compute:
+        qktrans_in_cycles, qktrans_accumu_lat, qktrans_adder_lat = \
+            self.matmul_lat_qktrans_per_head_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True)
+        qkv_qktrans_compute_lat = (mvm_in_cycles * 3 + qktrans_in_cycles) * self.num_heads
+        
+        vatt_mult_incycles, _, _ = \
+            self.matmul_lat_vatt_per_head_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True)
+        vatt_mult_incycles *= self.num_heads
+
+        # last step: FC layer for output
+        output_fc_incycles, output_fc_accu, output_fc_adder = \
+            self.matmul_lat_selfatt_out_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True)
+        output_fc_lat = output_fc_incycles + output_fc_accu + output_fc_adder
+
+        total_lat = qkv_qktrans_compute_lat + vatt_mult_incycles + output_fc_lat
+
+        return total_lat
+
+    def attention_bandwidth_stratix(self, mvm_tcore: float, softmax_tcore: tuple, softmax_type = "baseline"):
+        equi_mvm_blk_size = int(sqrt(mvm_tcore*30))
+        mvm_in_cycles, mvm_accumu_lat, mvm_adder_lat = \
+            self.matmul_lat_qkv_per_head_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True)
 
         # first 11 heads to cover the softmax latency by mvm compute:
         qktrans_in_cycles, qktrans_accumu_lat, qktrans_adder_lat = \
@@ -661,6 +806,7 @@ class BertModel:
 
         # select dominate intermediate latency: softmax in cycles or q k v compute
         intermediate_lat = max(qkv_qktrans_compute_lat, softmax_stg1_incycle)
+
         if qkv_qktrans_compute_lat > softmax_stg1_incycle:
             print(f"{__name__}: softmax hidden succeeded")
         else:
@@ -674,30 +820,13 @@ class BertModel:
         if softmax_first_ddl < softmax_first_finish_time:
             print(softmax_first_finish_time, softmax_first_ddl)
 
-        # accumulate VxAtt
-        vatt_mult_incycles, _, _ = \
-            self.matmul_lat_vatt_per_head_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True)
-        vatt_mult_incycles *= 12
-
-        # last step: FC layer for output
-        output_fc_incycles, output_fc_accu, output_fc_adder = \
-            self.matmul_lat_selfatt_out_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True)
-        output_fc_lat = output_fc_incycles + output_fc_accu + output_fc_adder
-
-        if softmax_first_ddl < softmax_first_finish_time:
-            # softmax latency cannot be covered by 12 heads
-            first_vatt_finish = softmax_lat + vatt_mult_incycles
-            second_vatt_start = intermediate_lat + softmax_lat
-            vatt_gap = second_vatt_start - first_vatt_finish
-            vatt_gap = 0 if vatt_gap < 0 else vatt_gap
-            res = mvm_in_cycles * 2 + qktrans_accumu_lat + qktrans_adder_lat
-            res += softmax_lat + (vatt_mult_incycles + vatt_gap) * self.num_heads
-            res += output_fc_lat
-        else: 
-            # softmax latency can be covered by 12 heads
-            res = intermediate_lat + predessesor_heads_lat + vatt_mult_incycles + output_fc_lat
+        dat_moving_time = max(softmax_lat, intermediate_lat * self.num_heads)
+        dat_moving_time *= 1./self.freq * 1e-6
+        v_size = self.qkv_size()
+        att_size = self.att_size()
+        dat_bw = (v_size + att_size) / dat_moving_time
         
-        return res
+        return dat_bw
     
 
 if __name__ == '__main__':

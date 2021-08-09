@@ -1,4 +1,5 @@
-from math import ceil, floor, exp, log2, sqrt
+import enum
+from math import ceil, floor, exp, log2, sqrt, isnan
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
@@ -631,17 +632,21 @@ def compare_mvm_ratio_delayed_v_with_latency_with_given_dsps(bert_hw_model:BertM
         for r, p in product(softmax_row_para, softmax_p):
             softmax_dsp = bert_hw_model.baseline_softmax_resource(p, ceil(bert_hw_model.max_seq_len / r))[0]
             if softmax_dsp < max_softmax_dsp:
-                softmax_stg1_incycle = np.mean([ceil(h.shape[-1]/r)* ceil(float(h.shape[-1])/p) \
+                if bert_hw_model.exps is None:
+                    softmax_stg1_incycle = ceil(bert_hw_model.max_seq_len/r) * ceil(bert_hw_model.max_seq_len/p)
+                else:
+                    softmax_stg1_incycle = np.mean([ceil(h.shape[-1]/r)* ceil(float(h.shape[-1])/p) \
                                             for h in bert_hw_model.exps])
                 softmax_lat = softmax_stg1_incycle + qk_trans_adder + qk_trans_addertree
                 softmax_lat_candidates.append({'dsps': softmax_dsp, 'latency': softmax_lat})
 
-        softmax_lat_candidates.sort(key=lambda x: x['latency'])
-        final_softmax_lat = softmax_lat_candidates[0]['latency']
-        res_wh.append(mvm_block_wh_ratio)
-        res_softmax_lat.append(final_softmax_lat)
-        res_lat_ddl.append(single_stage_softmax_deadline)
-        res_relative_lat.append((single_stage_softmax_deadline - final_softmax_lat) / single_stage_softmax_deadline)
+        if len(softmax_lat_candidates) > 0:
+            softmax_lat_candidates.sort(key=lambda x: x['latency'])
+            final_softmax_lat = softmax_lat_candidates[0]['latency']
+            res_wh.append(mvm_block_wh_ratio)
+            res_softmax_lat.append(final_softmax_lat)
+            res_lat_ddl.append(single_stage_softmax_deadline)
+            res_relative_lat.append((single_stage_softmax_deadline - final_softmax_lat) / single_stage_softmax_deadline)
     
         # if softmax_lat <= single_stage_softmax_deadline:
         #     res_lat_ddl.append(single_stage_softmax_deadline - softmax_lat)
@@ -649,7 +654,7 @@ def compare_mvm_ratio_delayed_v_with_latency_with_given_dsps(bert_hw_model:BertM
         # else:
         #     pass
     
-    if plot_res:
+    if plot_res and len(res_softmax_lat) > 1:
         fsize = 9
         fig, ax = plt.subplots(1, 1, figsize=(6, 4))
         matplotlib.rcParams.update({'xtick.labelsize': fsize})
@@ -690,25 +695,31 @@ def compare_mvm_ratio_delayed_v_with_latency_with_given_dsps(bert_hw_model:BertM
     for r, p in product(softmax_row_para, softmax_p):
         b_softmax_dsp = bert_hw_model.baseline_softmax_resource(p, ceil(bert_hw_model.max_seq_len / r))[0]
         s_softmax_dsp = bert_hw_model.softmax_resources(p, p, ceil(bert_hw_model.max_seq_len / r), 4)[0]
+        if bert_hw_model.exps is None:
+            softmax_stg1_incycle = ceil(bert_hw_model.max_seq_len/r) * ceil(bert_hw_model.max_seq_len/p)
+        else:
+            softmax_stg1_incycle = np.mean([ceil(h.shape[-1]/r) * ceil(float(h.shape[-1])/p) \
+                                        for h in bert_hw_model.exps])
+
         if b_softmax_dsp < max_softmax_dsp:
-            b_softmax_stg1_incycle = np.mean([ceil(h.shape[-1]/r)* ceil(float(h.shape[-1])/p) \
-                                            for h in bert_hw_model.exps]) 
-            b_softmax_lat = b_softmax_stg1_incycle + qk_trans_adder + qk_trans_addertree
+            b_softmax_lat = softmax_stg1_incycle + qk_trans_adder + qk_trans_addertree
             b_softmax_att_total_lat = bert_hw_model.attention_lat_stratix(float(mvm_dsp), (r, p), softmax_type="baseline")
-            b_softmax_lat_candidates.append({'dsp': b_softmax_dsp, 'softmax_lat': b_softmax_lat, 'att_lat': b_softmax_att_total_lat})
+            if not isnan(b_softmax_att_total_lat):
+                b_softmax_lat_candidates.append({'dsp': b_softmax_dsp, 'softmax_lat': b_softmax_lat, 'att_lat': b_softmax_att_total_lat})
 
 
         if s_softmax_dsp < max_softmax_dsp:
-            sparse_softmax_incycle = np.mean([ceil(h.shape[-1]/r)* ceil(float(h.shape[-1])/p) \
-                                            for h in bert_hw_model.exps]) 
-            sparse_softmax_lat = sparse_softmax_incycle + qk_trans_adder + qk_trans_addertree
+            sparse_softmax_lat = softmax_stg1_incycle + qk_trans_adder + qk_trans_addertree
             s_softmax_att_total_lat = bert_hw_model.attention_lat_stratix(float(mvm_dsp), (r, p), softmax_type="sparse")
-            s_softmax_lat_candidates.append({'dsp': s_softmax_dsp, 'softmax_lat': sparse_softmax_lat, 'att_lat': s_softmax_att_total_lat})
+            if not isnan(s_softmax_att_total_lat):
+                s_softmax_lat_candidates.append({'dsp': s_softmax_dsp, 'softmax_lat': sparse_softmax_lat, 'att_lat': s_softmax_att_total_lat})
 
     # softmax_stg1_incycle = bert_hw_model.max_seq_len * np.ceil(float(bert_hw_model.max_seq_len) / softmax_possible_p)
-    
-    final_b_softmax_lat = min(b_softmax_lat_candidates, key=lambda x: x['att_lat'])
-    final_s_softmax_lat = min(s_softmax_lat_candidates, key=lambda x: x['att_lat'])
+    if len(b_softmax_lat_candidates) < 1 or len(s_softmax_lat_candidates) < 1:
+        return None
+    else:
+        final_b_softmax_lat = min(b_softmax_lat_candidates, key=lambda x: x['att_lat'])
+        final_s_softmax_lat = min(s_softmax_lat_candidates, key=lambda x: x['att_lat'])
 
 
     softmax_ddl = qktrans_incycle + q_incycle * 3 + qk_trans_addertree + qk_trans_adder
@@ -722,57 +733,152 @@ def compare_mvm_ratio_delayed_v_with_latency_with_given_dsps(bert_hw_model:BertM
     return res
 
 def sweep_mvm_softmax_ratio(bert_hw_model: BertModel, num_dsps = 6840.0, \
-                                schedule=compare_mvm_ratio_delayed_v_with_latency_with_given_dsps, lat_type="softmax"):
+                                schedule=compare_mvm_ratio_delayed_v_with_latency_with_given_dsps, lat_type="softmax", plot_res=True):
     '''
     sweeping across different mvm/softmax ratio
     '''
-    num_mvm_dsps = np.arange(3500, num_dsps, 50)
+    num_mvm_dsps_candidates = np.arange(100, num_dsps, floor((num_dsps-100)/40))
 
-    ddls = []
+    ddls, num_mvm_dsps = [], []
     baseline_lat, sparse_softmax_lat = [], []
-    for mvm_dsp in tqdm(num_mvm_dsps):
+    mvm_dynautil_baseline, mvm_dynautil_sparse = [], []
+    for mvm_dsp in tqdm(num_mvm_dsps_candidates):
         latency_res = schedule(bert_hw_model, dsps=num_dsps, mvm_dsp=mvm_dsp, plot_res=False)
-        ddls.append(latency_res['ddl'])
+        if latency_res is not None:
+            ddls.append(latency_res['ddl'])
+            mvm_only_lat = bert_hw_model.attention_mvm_only_lat_stratix(float(mvm_dsp))
+            num_mvm_dsps.append(mvm_dsp)
+            if lat_type == "softmax":
+                baseline_lat.append(latency_res['baseline_lat'])
+                sparse_softmax_lat.append(latency_res['sparse_lat'])
+            elif lat_type == "self_attention":
+                mvm_dynautil_baseline.append(mvm_only_lat / latency_res['baseline_att_lat'])
+                mvm_dynautil_sparse.append(mvm_only_lat / latency_res['sparse_att_lat'])
+                baseline_lat.append(latency_res['baseline_att_lat'])
+                sparse_softmax_lat.append(latency_res['sparse_att_lat'])
+
+    if plot_res:
+        fsize = 9
+        fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        matplotlib.rcParams.update({'xtick.labelsize': fsize})
+        matplotlib.rcParams.update({'ytick.labelsize': fsize})
+        matplotlib.rcParams['lines.markersize'] = 3
+
+        ax.plot(num_mvm_dsps, baseline_lat, linestyle='-', color='C1', marker='s', linewidth=1, alpha=0.8, label='baseline softmax')
+        ax.plot(num_mvm_dsps, sparse_softmax_lat, linestyle = '-', color='C0', marker='s', linewidth=1, alpha=0.8, label='sparse softmax')
         if lat_type == "softmax":
-            baseline_lat.append(latency_res['baseline_lat'])
-            sparse_softmax_lat.append(latency_res['sparse_lat'])
-        elif lat_type == "self_attention":
-            baseline_lat.append(latency_res['baseline_att_lat'])
-            sparse_softmax_lat.append(latency_res['sparse_att_lat'])
+            ax.plot(num_mvm_dsps, ddls, linestyle='--', color='black', marker='s', linewidth=1, alpha=0.8, label='deadline')
 
+        ax.set_xlabel('mvm ai tensors', fontsize=fsize)
+        # ax.set_xlabel('softmax dsps', fontsize=fsize)
+        ax.set_ylabel('latency', fontsize=fsize)
+        ax.set_ylim(ymin=0)
+        ax.set_xlim(xmin=0)
+        ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
+        plt.legend(loc='upper left', fontsize=fsize)
+        fig.tight_layout()
+        file_name = lat_type + f"_latency_mvm_ai_tensor_tc{int(num_dsps)}_l{int(bert_hw_model.max_seq_len)}.pdf"
+        fig.savefig("res_fig/att_latency_analysis/" + file_name)
+        plt.cla()
 
-    fsize = 9
-    fig, ax = plt.subplots(1, 1, figsize=(6, 4))
-    matplotlib.rcParams.update({'xtick.labelsize': fsize})
-    matplotlib.rcParams.update({'ytick.labelsize': fsize})
-    matplotlib.rcParams['lines.markersize'] = 3
+    min_baseline_mvm_dynautil = 0
+    min_sparse_mvm_dynautil = 0
+    if lat_type == "self_attention":
+        min_baseline_mvm_dynautil = mvm_dynautil_baseline[baseline_lat.index(min(baseline_lat))]
+        min_sparse_mvm_dynautil = mvm_dynautil_sparse[sparse_softmax_lat.index(min(sparse_softmax_lat))]
 
-    ax.plot(num_mvm_dsps, baseline_lat, linestyle='-', color='C1', marker='s', linewidth=1, alpha=0.8, label='baseline softmax')
-    ax.plot(num_mvm_dsps, sparse_softmax_lat, linestyle = '-', color='C0', marker='s', linewidth=1, alpha=0.8, label='sparse softmax')
-    if lat_type == "softmax":
-        ax.plot(num_mvm_dsps, ddls, linestyle='--', color='black', marker='s', linewidth=1, alpha=0.8, label='deadline')
+    return {'lat': np.amin(baseline_lat), 'mvm_util': min_baseline_mvm_dynautil}, \
+            {'lat': np.amin(sparse_softmax_lat), 'mvm_util': min_sparse_mvm_dynautil}
 
-    ax.set_xlabel('mvm ai tensors', fontsize=fsize)
-    # ax.set_xlabel('softmax dsps', fontsize=fsize)
-    ax.set_ylabel('latency', fontsize=fsize)
-    ax.set_ylim(ymin=0, ymax=80000)
-    ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
-    plt.legend(loc='upper left', fontsize=fsize)
-    fig.tight_layout()
-    file_name = lat_type + "_latency_mvm_ai_tensor_zoomin.pdf"
-    fig.savefig("res_fig/" + file_name)
-    plt.cla()
+def sweep_dsp_budget_latency(bert_hw_model: BertModel, plot_res=False):
+    dsp_budget_list = np.arange(200, 4000, 200)
+    baseline_lat, sparse_lat = [], []
+    for dsp_budget in dsp_budget_list:
+        min_baseline_lat, min_sparse_lat = sweep_mvm_softmax_ratio(bert_hw_model, num_dsps=dsp_budget, \
+            schedule=compare_mvm_ratio_delayed_v_with_latency_with_given_dsps, lat_type="self_attention", plot_res=False)
+        baseline_lat.append(min_baseline_lat)
+        sparse_lat.append(min_sparse_lat)
 
+    if plot_res:
+        list_from_dicts = lambda x, k: [i[k] for i in x]
+
+        fsize = 9
+        fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        matplotlib.rcParams.update({'xtick.labelsize': fsize})
+        matplotlib.rcParams.update({'ytick.labelsize': fsize})
+        matplotlib.rcParams['lines.markersize'] = 3
+
+        ax2 = ax.twinx()
+        curs = []
+        baseline_lat_sec = np.array(list_from_dicts(baseline_lat, 'lat')) * (1 / bert_hw_model.freq) * 1e-6
+        curs += ax.plot(dsp_budget_list, baseline_lat_sec, linestyle='-', color='C1', marker='s', linewidth=1, alpha=0.8, label='baseline softmax')
+        curs += ax2.plot(dsp_budget_list, list_from_dicts(baseline_lat, 'mvm_util'), linestyle='--', color='C1', marker='s', linewidth=1, alpha=0.6, label='baseline mvm util')
+        sparse_lat_sec = np.array(list_from_dicts(sparse_lat, 'lat')) * (1 / bert_hw_model.freq) * 1e-6
+        curs += ax.plot(dsp_budget_list, sparse_lat_sec, linestyle='-', color='C0', marker='s', linewidth=1, alpha=0.8, label='sparse softmax')
+        curs += ax2.plot(dsp_budget_list, list_from_dicts(sparse_lat, 'mvm_util'), linestyle='--', color='C0', marker='s', linewidth=1, alpha=0.6, label='sparse mvm util')
+
+        labels = [l.get_label() for l in curs]
+        ax.legend(curs, labels, loc='upper right', bbox_to_anchor=(0.98, 0.85), fontsize=fsize)
+
+        ax.set_xlabel('ai tensors budget', fontsize=fsize)
+        ax.set_ylabel('latency/secs', fontsize=fsize)
+        ax.set_ylim(ymin=0)
+        ax.set_xlim(xmin=0)
+        ax2.set_ylim(ymin=0, ymax=1.0)
+        ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
+        fig.tight_layout()
+        file_name = f"att_latency_ai_tensor_budget_l{str(bert_hw_model.max_seq_len)}.pdf"
+        fig.savefig("res_fig/" + file_name)
+        plt.cla()
+        
+    return dsp_budget_list, baseline_lat, sparse_lat
+
+def sweep_seq_len_vs_budget(bert_models: list, plot_res = False):
+    if plot_res:
+        list_from_dicts = lambda x, k: [i[k] for i in x]
+
+        fsize = 9
+        fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        matplotlib.rcParams.update({'xtick.labelsize': fsize})
+        matplotlib.rcParams.update({'ytick.labelsize': fsize})
+        matplotlib.rcParams['lines.markersize'] = 3
+        ax2 = ax.twinx()
+
+        for idx, bert_model in enumerate(bert_models):
+            dsp_budget, baseline, sparse = sweep_dsp_budget_latency(bert_model, plot_res=False)
+            baseline_lat = np.array(list_from_dicts(baseline, 'lat')) * (1./bert_model.freq) * 1e-6
+            sparse_lat = np.array(list_from_dicts(sparse, 'lat')) * (1./bert_model.freq) * 1e-6
+            if idx == 0:
+                ax.plot(dsp_budget, baseline_lat, linestyle='-', color='C1', marker='s', linewidth=1, alpha=0.8, label='baseline softmax')
+                ax.plot(dsp_budget, sparse_lat, linestyle='-', color='C0', marker='s', linewidth=1, alpha=0.8, label='sparse softmax')
+            else:
+                ax.plot(dsp_budget, baseline_lat, linestyle='-', color='C1', marker='s', linewidth=1, alpha=0.8)
+                ax.plot(dsp_budget, sparse_lat, linestyle='-', color='C0', marker='s', linewidth=1, alpha=0.8)
+
+            ax2.plot(dsp_budget, list_from_dicts(baseline, 'mvm_util'), linestyle='--', color='C1', marker='s', linewidth=1, alpha=0.6)
+            ax2.plot(dsp_budget, list_from_dicts(sparse, 'mvm_util'), linestyle='--', color='C0', marker='s', linewidth=1, alpha=0.6)
+            ax.text(dsp_budget[0]+50, baseline_lat[0], f"len:{bert_model.max_seq_len}", alpha=0.8)
+
+        ax.set_xlabel('ai tensors budget', fontsize=fsize)
+        ax.set_ylabel('latency/sec', fontsize=fsize)
+        ax.set_ylim(ymin=0)
+        ax.set_xlim(xmin=0)
+        ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
+        plt.legend(loc='upper right', fontsize=fsize)
+        fig.tight_layout()
+        file_name = f"att_latency_ai_tensor_budget_diff_seqlen.pdf"
+        fig.savefig("res_fig/" + file_name)
+        plt.cla()
 
 if __name__ == '__main__':
-    # bert_hw_model = BertModel(read_exp_samples=False, num_layers=12, num_heads=12)
-    bert_hw_model = BertModel(read_exp_samples=True)
-    filtered_insts = []
-    for inst in bert_hw_model.exps:
-        if inst.shape[-1] > 300:
-            filtered_insts.append(inst)
+    bert_hw_model = BertModel(read_exp_samples=False, num_layers=12, num_heads=12, max_seq_len=512)
+    # bert_hw_model = BertModel(read_exp_samples=True)
+    # filtered_insts = []
+    # for inst in bert_hw_model.exps:
+    #     if inst.shape[-1] > 300:
+    #         filtered_insts.append(inst)
 
-    bert_hw_model.exps = filtered_insts
+    # bert_hw_model.exps = filtered_insts
     # bert_hw_model.analyzer_void_columns()
     # compare_naive_softmax_heads(bert_hw_model)
     # compare_naive_softmax_parallel(bert_hw_model)
@@ -786,5 +892,11 @@ if __name__ == '__main__':
     # compare_softmax_with_model_len()
     # compare_mvm_ratio_with_latency_with_given_dsps(bert_hw_model, mvm_dsp_percentage=0.9)
     # compare_mvm_ratio_delayed_v_with_latency_with_given_dsps(bert_hw_model, dsps=3960.0, mvm_dsp=3900, plot_res=True)
-    sweep_mvm_softmax_ratio(bert_hw_model, num_dsps=3960.0, \
-         schedule=compare_mvm_ratio_delayed_v_with_latency_with_given_dsps, lat_type="self_attention")
+    # bd_res = bert_hw_model.attention_bandwidth_stratix(3900.0, (8, 4), 'baseline')
+    # print("test bandwidth: ", bd_res)
+    # sweep_mvm_softmax_ratio(bert_hw_model, num_dsps=3960.0, \
+    #      schedule=compare_mvm_ratio_delayed_v_with_latency_with_given_dsps, lat_type="self_attention")
+    # sweep_dsp_budget_latency(bert_hw_model, plot_res=True)
+    bert_models = [BertModel(read_exp_samples=False, num_layers=12, num_heads=12, max_seq_len=i) for i in [512]]
+    sweep_dsp_budget_latency(bert_models[0], plot_res=True)
+    # sweep_seq_len_vs_budget(bert_models, plot_res=True)
