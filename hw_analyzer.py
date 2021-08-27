@@ -627,7 +627,9 @@ def compare_mvm_ratio_delayed_v_with_latency_with_given_dsps(bert_hw_model:BertM
         single_stage_softmax_deadline = qktrans_incycle + q_incycle * 3
 
         softmax_p = np.arange(2, mvm_block_width)
-        softmax_row_para = np.arange(1, 10)
+        # sweeping row parallel from 1 to 20 will not cause the failure of hiding the accumulator latency 
+        # inside the softmax, when adder latency is 3.
+        softmax_row_para = np.arange(1, 20, 2)
         softmax_lat_candidates = []
         for r, p in product(softmax_row_para, softmax_p):
             softmax_dsp = bert_hw_model.baseline_softmax_resource(p, ceil(bert_hw_model.max_seq_len / r))[0]
@@ -703,7 +705,8 @@ def compare_mvm_ratio_delayed_v_with_latency_with_given_dsps(bert_hw_model:BertM
 
         if b_softmax_dsp < max_softmax_dsp:
             b_softmax_lat = softmax_stg1_incycle + qk_trans_adder + qk_trans_addertree
-            b_softmax_att_total_lat = bert_hw_model.attention_lat_stratix(float(mvm_dsp), (r, p), softmax_type="baseline")
+            b_softmax_att_total_lat = bert_hw_model.attention_lat_stratix(float(mvm_dsp), (r, p), softmax_type="baseline", consider_mem_init=False)
+            mem_check_res = bert_hw_model.check_softmax_memory(float(mvm_dsp), (r, p))
             if not isnan(b_softmax_att_total_lat):
                 b_softmax_lat_candidates.append({'dsp': b_softmax_dsp, 'softmax_lat': b_softmax_lat, 'att_lat': b_softmax_att_total_lat})
 
@@ -821,10 +824,11 @@ def sweep_dsp_budget_latency(bert_hw_model: BertModel, plot_res=False):
         ax.legend(curs, labels, loc='upper right', bbox_to_anchor=(0.98, 0.85), fontsize=fsize)
 
         ax.set_xlabel('ai tensors budget', fontsize=fsize)
-        ax.set_ylabel('latency/secs', fontsize=fsize)
-        ax.set_ylim(ymin=0)
+        ax.set_ylabel('latency (secs)', fontsize=fsize)
+        ax.set_ylim(ymin=0, ymax=0.0016)
         ax.set_xlim(xmin=0)
         ax2.set_ylim(ymin=0, ymax=1.0)
+        ax2.set_ylabel('Dynamic Utilization')
         ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
         fig.tight_layout()
         file_name = f"att_latency_ai_tensor_budget_l{str(bert_hw_model.max_seq_len)}.pdf"
@@ -842,7 +846,7 @@ def sweep_seq_len_vs_budget(bert_models: list, plot_res = False):
         matplotlib.rcParams.update({'xtick.labelsize': fsize})
         matplotlib.rcParams.update({'ytick.labelsize': fsize})
         matplotlib.rcParams['lines.markersize'] = 3
-        ax2 = ax.twinx()
+        # ax2 = ax.twinx()
 
         for idx, bert_model in enumerate(bert_models):
             dsp_budget, baseline, sparse = sweep_dsp_budget_latency(bert_model, plot_res=False)
@@ -855,8 +859,8 @@ def sweep_seq_len_vs_budget(bert_models: list, plot_res = False):
                 ax.plot(dsp_budget, baseline_lat, linestyle='-', color='C1', marker='s', linewidth=1, alpha=0.8)
                 ax.plot(dsp_budget, sparse_lat, linestyle='-', color='C0', marker='s', linewidth=1, alpha=0.8)
 
-            ax2.plot(dsp_budget, list_from_dicts(baseline, 'mvm_util'), linestyle='--', color='C1', marker='s', linewidth=1, alpha=0.6)
-            ax2.plot(dsp_budget, list_from_dicts(sparse, 'mvm_util'), linestyle='--', color='C0', marker='s', linewidth=1, alpha=0.6)
+            # ax2.plot(dsp_budget, list_from_dicts(baseline, 'mvm_util'), linestyle='--', color='C1', marker='s', linewidth=1, alpha=0.6)
+            # ax2.plot(dsp_budget, list_from_dicts(sparse, 'mvm_util'), linestyle='--', color='C0', marker='s', linewidth=1, alpha=0.6)
             ax.text(dsp_budget[0]+50, baseline_lat[0], f"len:{bert_model.max_seq_len}", alpha=0.8)
 
         ax.set_xlabel('ai tensors budget', fontsize=fsize)
@@ -897,6 +901,6 @@ if __name__ == '__main__':
     # sweep_mvm_softmax_ratio(bert_hw_model, num_dsps=3960.0, \
     #      schedule=compare_mvm_ratio_delayed_v_with_latency_with_given_dsps, lat_type="self_attention")
     # sweep_dsp_budget_latency(bert_hw_model, plot_res=True)
-    bert_models = [BertModel(read_exp_samples=False, num_layers=12, num_heads=12, max_seq_len=i) for i in [512]]
-    sweep_dsp_budget_latency(bert_models[0], plot_res=True)
-    # sweep_seq_len_vs_budget(bert_models, plot_res=True)
+    bert_models = [BertModel(read_exp_samples=False, num_layers=12, num_heads=12, max_seq_len=i) for i in [128, 512, 4096]]
+    # sweep_dsp_budget_latency(bert_models[0], plot_res=True)
+    sweep_seq_len_vs_budget(bert_models, plot_res=True)
