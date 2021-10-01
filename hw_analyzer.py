@@ -12,7 +12,7 @@ from itertools import product
 from tqdm import tqdm
 
 
-from hw_modeling import BertModel, DpuModel
+from hw_modeling import BertModel, DpuModel, StratixDpuModel
 
 def compare_naive_softmax_heads(bert_model):
     fsize = 20
@@ -874,6 +874,90 @@ def sweep_seq_len_vs_budget(bert_models: list, plot_res = False):
         fig.savefig("res_fig/" + file_name)
         plt.cla()
 
+def fpt2020_sweeping_explore():
+    mvm_model = StratixDpuModel(1024, 1024, 1024, 1024, 16, 16, freq=300, num_tcs=3960)
+    fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+    fsize = 9
+    matplotlib.rcParams.update({'xtick.labelsize': fsize})
+    matplotlib.rcParams.update({'ytick.labelsize': fsize})
+    matplotlib.rcParams['lines.markersize'] = 3
+
+    # sweep across init cas len
+    total_cores_in_chain = 160
+    flops = [mvm_model.tensor_fpt20_mat_flops(i, 7, total_cores_in_chain/i) 
+                for i in np.arange(2, 16, 2)]
+    ax.plot(list(np.arange(2, 16, 2)), flops, linestyle='-', marker='s', linewidth=1, alpha=0.8)
+    ax.set_xlabel('init cascade chain')
+    ax.set_ylabel('TOPs')
+    ax.set_ylim(ymin=0)
+    ax.set_xlim(xmin=0)
+    ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
+    fig.tight_layout()
+    fig.savefig("res_fig/mvm_tc_explore/fpt2020_sweep_initcaslen.pdf")
+    plt.cla()
+
+    #sweep across acc len
+    flops = [mvm_model.tensor_fpt20_mat_flops(4, i, 40) 
+                for i in np.arange(2, 10, 1)]
+    ax.plot(list(np.arange(2, 10, 1)), flops, linestyle='-', marker='s', linewidth=1, alpha=0.8)
+    ax.set_xlabel('acc cascade chain')
+    ax.set_ylabel('TOPs')
+    ax.set_xlim(xmin=0)
+    ax.set_ylim(ymin=0)
+    ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
+    fig.tight_layout()
+    fig.savefig("res_fig/mvm_tc_explore/fpt2020_sweep_acccaslen.pdf")
+    plt.cla()
+
+    #sweep across mat size
+    diff_size_model = [StratixDpuModel(float(i), float(i), float(i), float(i), 16, 16, freq=300, num_tcs=3960) 
+                            for i in [2**j for j in np.arange(4, 13, 1)]]
+    flops = [model.tensor_fpt20_mat_flops(10, 7, 16) for model in diff_size_model]
+    ax.plot([2**i for i in np.arange(4, 13, 1)], flops, linestyle='-', marker='s', linewidth=1, alpha=0.8)
+    ax.set_xlabel('matrix size')
+    ax.set_ylabel('TOPs')
+    ax.set_xlim(xmin=0)
+    ax.set_ylim(ymin=0)
+    ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
+    fig.tight_layout()
+    fig.savefig("res_fig/mvm_tc_explore/fpt2020_sweep_matsize.pdf")
+    plt.cla()
+
+def fpga2021_sweeping_explore():
+    mvm_model = StratixDpuModel(1024, 1024, 1024, 1024, 16, 16, freq=300, num_tcs=3960)
+    fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+    fsize = 9
+    matplotlib.rcParams.update({'xtick.labelsize': fsize})
+    matplotlib.rcParams.update({'ytick.labelsize': fsize})
+    matplotlib.rcParams['lines.markersize'] = 3
+
+    #sweep across cascade len
+    flops = [mvm_model.tensor_fpga21_mat_flops(i)for i in np.arange(2, 40, 2)]
+    ax.plot(list(np.arange(2, 40, 2)), flops, linestyle='-', marker='s', linewidth=1, alpha=0.8)
+    ax.set_xlabel('cascade chain')
+    ax.set_ylabel('TOPs')
+    ax.set_xlim(xmin=0)
+    ax.set_ylim(ymin=0)
+    ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
+    fig.tight_layout()
+    fig.savefig("res_fig/mvm_tc_explore/fpga2021_sweep_caslen.pdf")
+    plt.cla()
+
+    #sweep across mat size
+    diff_size_model = [StratixDpuModel(float(i), float(i), float(i), float(i), 16, 16, freq=300, num_tcs=3960) 
+                            for i in [2**j for j in np.arange(4, 14, 1)]]
+    flops = [model.tensor_fpga21_mat_flops(32) for model in diff_size_model]
+    ax.plot([2**i for i in np.arange(4, 14, 1)], flops, linestyle='-', marker='s', linewidth=1, alpha=0.8)
+    ax.set_xlabel('matrix size')
+    ax.set_ylabel('TOPs')
+    ax.set_xlim(xmin=0)
+    ax.set_ylim(ymin=0)
+    ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
+    fig.tight_layout()
+    fig.savefig("res_fig/mvm_tc_explore/fpga2021_sweep_matsize.pdf")
+    plt.cla()
+
+
 if __name__ == '__main__':
     bert_hw_model = BertModel(read_exp_samples=False, num_layers=12, num_heads=12, max_seq_len=512)
     # bert_hw_model = BertModel(read_exp_samples=True)
@@ -901,6 +985,21 @@ if __name__ == '__main__':
     # sweep_mvm_softmax_ratio(bert_hw_model, num_dsps=3960.0, \
     #      schedule=compare_mvm_ratio_delayed_v_with_latency_with_given_dsps, lat_type="self_attention")
     # sweep_dsp_budget_latency(bert_hw_model, plot_res=True)
-    bert_models = [BertModel(read_exp_samples=False, num_layers=12, num_heads=12, max_seq_len=i) for i in [128, 512, 4096]]
+    # bert_models = [BertModel(read_exp_samples=False, num_layers=12, num_heads=12, max_seq_len=i) for i in [128, 512, 4096]]
     # sweep_dsp_budget_latency(bert_models[0], plot_res=True)
-    sweep_seq_len_vs_budget(bert_models, plot_res=True)
+    # sweep_seq_len_vs_budget(bert_models, plot_res=True)
+
+    fpt20_model = StratixDpuModel(128, 1792+128, 1792+128, 1792, 16, 16, freq=300, num_tcs=3600)
+    fpt20_tops = fpt20_model.tensor_fpt20_mat_flops(10, 7, 16, sym=True)
+    fpga21_model = StratixDpuModel(5000, 5000, 5000, 5000, 16, 16, freq=440, num_tcs=3600)
+    fpga21_tops = fpga21_model.tensor_fpga21_mat_flops(32, sym=True)
+
+    fpt2020_sweeping_explore()
+    fpga2021_sweeping_explore()
+    
+    print(fpt20_tops)
+    print(fpga21_tops)
+
+    print("="*10)
+    nx10_model = StratixDpuModel(1000, 1000, 1000, 1000, 16, 16, freq=600, num_tcs=3960)
+    print(nx10_model.ideal_tops())

@@ -5,6 +5,11 @@ import matplotlib.pyplot as plt
 import random
 import logging
 
+import sympy as sp
+
+class OutOfResourceError(Exception):
+    pass
+
 # Helper functions:
 def log2Up(x):
     return float(ceil(log2(x)))
@@ -16,6 +21,8 @@ def lcm(a: float, b: float):
 
 def dspToAlu(dsp, dtype: str):
     return dsp / 2.0 if dtype == 'float32' else dsp
+
+
 
 class MatMulDimErr(Exception):
     pass
@@ -124,6 +131,16 @@ class StratixDpuModel(DpuModel):
     DDR_RD_LAT = 150.
 
     WORD_SIZE = 1
+
+    FREQ = 500.0
+    NUM_TCs = 3960.0
+
+    def __init__(self, a_h, a_w, b_h, b_w, blk_h, blk_w, freq=0.0, num_tcs=0.0):
+        super().__init__(a_h, a_w, b_h, b_w, blk_h, blk_w)
+        if freq > 0:
+            self.FREQ = freq
+        if num_tcs > 0:
+            self.NUM_TCs = num_tcs
         
     # derived parameters
     def compute_lat(self, ideal=False, mem_init=False):
@@ -171,6 +188,139 @@ class StratixDpuModel(DpuModel):
 
         mem_usage = self.b_w * self.b_h * self.WORD_SIZE / 1024.
         return dpu_mults * self.MULT_RES, mem_usage
+
+    def tensor_mat_flops(self, in_cascade_len, acc_cascade_len, num_cols_grp_loading_chain=2):
+        '''
+        compute single block matrix size, and the flops of it on stratix nx chain.
+
+        mat a: each block in the init chain has 3 rows from A, and n_cols * 10 elems for cols from A
+        then we have acc_cascade_len of such cols from A
+        mat b: infer rows from B by cols from A, and each 3 cols. If increasing the tile parallelism, 
+        the cols will be 3 * num_tiles
+        '''
+        matA_size = (in_cascade_len * 3, 10 * acc_cascade_len * num_cols_grp_loading_chain)
+        matB_size = (10 * acc_cascade_len * num_cols_grp_loading_chain, 3)
+        input_ops = in_cascade_len * 3 * (10 * acc_cascade_len * num_cols_grp_loading_chain) * 2 * 3
+
+        total_latency = 6 * (in_cascade_len - 1) + num_cols_grp_loading_chain * 3 + 4 + 3
+
+        total_latency =  total_latency * 1./self.FREQ * 1e-6
+        flops = input_ops / total_latency / 1e12
+        print("mat size: ", matA_size, matB_size)
+        print(total_latency)
+
+        return flops
+
+    def tensor_fpt20_mat_flops(self, initcas_len, acccas_len, num_initcas_lane, sym=False):
+        '''
+        compute flops for fpt20 paper, with aggregated initialization.
+        '''
+        if not sym:
+            matA_size = (self.a_h, self.a_w)
+            matB_size = (self.b_h, self.b_w)
+
+            flops = matA_size[0] * matA_size[1] * 2 * matB_size[1]
+            compute_block_flops = initcas_len * (3 * initcas_len) * matA_size[1] * 2 * (3 * num_initcas_lane)
+            a_cols_grps = ceil(matA_size[1] / (10 * acccas_len))
+            total_latency = 3 * initcas_len + (3*initcas_len) * a_cols_grps + 4 + acccas_len * 2
+
+            num_cores = floor(self.NUM_TCs / ((initcas_len + 1) * (acccas_len + 1) * num_initcas_lane))
+            if num_cores < 1:
+                raise OutOfResourceError("Error: not enough resources on the chip")
+            num_blocks = ceil(flops / compute_block_flops)
+            pipeline_iters = ceil(num_blocks / num_cores)
+            total_latency *= pipeline_iters * 1./self.FREQ * 1e-6
+
+            # print("npu cores: ", num_cores, "npu core iterations: ", pipeline_iters)
+
+            flops = flops / total_latency / 1e12
+        else:
+            # simplify the equation and export latex code
+            mA_row, mA_col, mB_col = sp.symbols('arow acol bcol')
+            mB_row = mA_col
+            init_len, acc_len, init_grp = sp.symbols('init\_len acc\_len init\_grp')
+
+            flops = mA_row * mA_col * 2 * mB_col
+            compute_block_flops = init_len * (3 * init_len) * mA_col * 2 * (3 * init_grp)
+            a_cols_grps = (mA_col / (10 * acc_len))
+            total_latency = 3 * init_len + (3*init_len) * a_cols_grps + 4 + acc_len * 2
+
+            num_cores = (self.NUM_TCs / ((init_len + 1) * (acc_len + 1) * init_grp))
+            num_blocks = (flops / compute_block_flops)
+            pipeline_iters = (num_blocks / num_cores)
+            total_latency *= pipeline_iters * 1./self.FREQ * 1e-6
+            flops = flops / total_latency / 1e12
+            flops = flops.subs({init_len: initcas_len, acc_len: acccas_len, init_grp: num_initcas_lane})
+            print("lim: ", sp.latex(sp.simplify(sp.limit(flops, mA_col, sp.oo))))
+            flops = sp.latex(flops)
+            
+        return flops
+
+    def tensor_fpga21_mat_flops(self, cascade_len, sym=False):
+        ''' 
+        compute flops with a given number of cascaded chain and b cols
+        a loading grps: the number of groups that a chain is responsible for along the a rows.
+        assuming a chain must finish 3 entire A rows at least.
+        '''
+
+        if not sym:
+            matA_size = (self.a_h, self.a_w)
+            matB_size = (self.b_h, self.b_w)
+
+            total_ops =  matA_size[0] * matA_size[1] * 2 * matB_size[1]
+            chain_loading_lat = 3 * (cascade_len + 1)
+            block_matA_size = (3, matA_size[1])
+            block_matB_size = (matA_size[1], chain_loading_lat)
+            a_loading_grps = ceil(matA_size[1] / (cascade_len * 10))
+
+            compute_block_ops = block_matA_size[0] * block_matA_size[1] * 2 * block_matB_size[1]
+            
+            total_latency = chain_loading_lat + chain_loading_lat * a_loading_grps + \
+                                4 + cascade_len * 2
+
+            num_cores = ceil(self.NUM_TCs / (cascade_len + 2))
+            num_blocks = ceil(total_ops / compute_block_ops)
+            pipeline_iters = ceil(num_blocks / num_cores)
+            total_latency *= pipeline_iters * 1./self.FREQ * 1e-6
+
+            # print("num_cores for fpga 21: ", num_cores)
+
+            flops = total_ops / total_latency / 1e12
+        else:
+            # simplify the equation and export latex code
+            mA_row, mA_col, mB_col = sp.symbols('arow acol bcol')
+            mB_row = mA_col
+            cas_len = sp.symbols('len')
+
+            total_ops =  mA_row * mA_col * 2 * mB_col
+            chain_loading_lat = 3 * (cas_len + 1)
+            block_matA_size = (3, mA_col)
+            block_matB_size = (mA_col, chain_loading_lat)
+            a_loading_grps = (mA_col / (cas_len * 10))
+
+            compute_block_ops = block_matA_size[0] * block_matA_size[1] * 2 * block_matB_size[1]
+            
+            total_latency = chain_loading_lat + chain_loading_lat * a_loading_grps + \
+                                4 + cas_len * 2
+
+            num_cores = (self.NUM_TCs / (cas_len + 2))
+            num_blocks = (total_ops / compute_block_ops)
+            pipeline_iters = (num_blocks / num_cores)
+            total_latency *= pipeline_iters * 1./self.FREQ * 1e-6
+
+            flops = total_ops / total_latency / 1e12
+            flops = flops.subs({cas_len: cascade_len})
+            print("lim: ", sp.latex(sp.simplify(sp.limit(flops, mA_col, sp.oo))))
+
+            flops = sp.latex(flops)
+
+        return flops
+
+    def ideal_tops(self):
+        ops = (10*2*3+3) * self.NUM_TCs
+        latency = 1/self.FREQ * 1e-6
+        tops = ops / latency / 1e12
+        return tops
 
 class NpuDpuModel(DpuModel):
     '''
@@ -913,9 +1063,6 @@ class BertModel:
     
 
 if __name__ == '__main__':
-    # bert_hw_model = BertModel(read_exp_samples=False)
-    # bert_hw_model.probe_exps()
-    static_bert_models = BertModel(read_exp_samples=False, num_layers=12, num_heads=12, max_seq_len=512)
-    stratix_head_lat = static_bert_models.matmul_lat_qkv_per_head_stratix(512, blk=(128, 128), ideal=True)
-    npu_head_lat = static_bert_models.matmul_lat_qkv_per_head_npu(512, blk=(128, 128), ideal=True)
-    print(stratix_head_lat, npu_head_lat)
+    bert_hw_model = BertModel(read_exp_samples=False)
+    bert_hw_model.probe_exps()
+    # print("Tflops: ", 2 * tensor_mat_flops(20, 7, 2))
