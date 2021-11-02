@@ -102,7 +102,8 @@ def run_qa_pipeline(model_name: str, filter_inputs=True, single_input=True, samp
         "question-answering",
         model=model_name,
         tokenizer=model_name,
-        device=0
+        device=0,
+        config=AutoConfig(hidden_size=512, hidden_act="relu")
     )
 
     print("Running pipeline...")
@@ -134,7 +135,7 @@ def run_qa_pipeline(model_name: str, filter_inputs=True, single_input=True, samp
         filtered_associated_data = list(compress(associated_data, len_filter))
         fed_data = filtered_associated_data
     if single_input:
-        single_associated_data = [random.choice(associated_data)]
+        single_associated_data = [random.choice(associated_data)] 
         fed_data = single_associated_data
     
     # MARK: define head mask here

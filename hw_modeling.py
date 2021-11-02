@@ -3,9 +3,10 @@ from re import template
 import numpy as np
 import matplotlib.pyplot as plt
 import random
-import logging
-
+import sys, logging
 import sympy as sp
+
+log = logging.getLogger(__name__)
 
 class OutOfResourceError(Exception):
     pass
@@ -105,6 +106,9 @@ class DpuModel:
         mem_usage = self.b_w * self.b_h * self.WORD_SIZE / 1024.
         return dpu_mults * self.MULT_RES + dpu_adders * self.ADDER_RES, mem_usage
 
+    def total_ops(self):
+        return  self.a_h * self.a_w * 2 * self.b_w
+
 class StratixDpuModel(DpuModel):
     '''
     This class is used to construct Intel Stratix DPU hardware model which does AxB
@@ -135,59 +139,76 @@ class StratixDpuModel(DpuModel):
     FREQ = 500.0
     NUM_TCs = 3960.0
 
-    def __init__(self, a_h, a_w, b_h, b_w, blk_h, blk_w, freq=0.0, num_tcs=0.0):
-        super().__init__(a_h, a_w, b_h, b_w, blk_h, blk_w)
+    def __init__(self, a_h, a_w, b_h, b_w, freq=0.0, num_tcs=0.0):
+        super().__init__(a_h, a_w, b_h, b_w, 16, 16)
         if freq > 0:
             self.FREQ = freq
         if num_tcs > 0:
             self.NUM_TCs = num_tcs
         
     # derived parameters
-    def compute_lat(self, ideal=False, mem_init=False):
-        # matrix b init time
-        b_size = self.b_w * self.b_h
-        if ideal == False:
-            mat_b_init_lat = b_size / self.input_len_per_cycle()
-        else:
-            mat_b_init_lat = float(ceil(b_size/self.input_len_per_cycle()))
-        mat_b_init_lat += self.URAM_WR_LAT + self.DDR_RD_LAT
-        # actual computation time
-        input_cycles = self.num_grps_in_a(ideal=ideal) * self.num_wei_per_dpu(ideal=ideal) * self.a_h
-        if mem_init:
-            return input_cycles + self.dpu_lat() + mat_b_init_lat
-        else:
-            return input_cycles + self.dpu_lat()
+    def compute_lat(self, cascade_len: int, ideal=False):
+        '''
+        compute latency based on fpga 21 paper
+        '''
+        round = lambda x: x if ideal else ceil(x)
 
-    def compute_lat_teardown(self, ideal=False, mem_init=False):
-        # matrix b init time
-        b_size = self.b_w * self.b_h
-        if ideal == False:
-            mat_b_init_lat = b_size / self.input_len_per_cycle()
-        else:
-            mat_b_init_lat = float(ceil(b_size/self.input_len_per_cycle()))
-        mat_b_init_lat += self.URAM_WR_LAT + self.DDR_RD_LAT
-        # actual computation time
-        input_cycles = self.num_grps_in_a(ideal=ideal) * self.num_wei_per_dpu(ideal=ideal) * self.a_h
-        adder_tree_cycles = (self.input_len_per_cycle()-1)/30.0 * self.ADDER_LAT
-        adder_lat = self.add_lat()
+        matA_size = (self.a_h, self.a_w)
+        matB_size = (self.b_h, self.b_w)
 
-        if mem_init:
-            return mat_b_init_lat + input_cycles, adder_tree_cycles, adder_lat
-        else:
-            return input_cycles, adder_tree_cycles, adder_lat
+        total_ops =  self.total_ops()
+        chain_loading_lat = 3 * (cascade_len + 1)
+        block_matA_size = (3, matA_size[1])
+        block_matB_size = (matA_size[1], chain_loading_lat)
+        a_loading_grps = round(matA_size[1] / (cascade_len * 10))
 
-    def compute_resource(self):
-        dpu_mults = self.num_mults_per_dpu * self.num_dpus
-        dpu_adders, rest_elems = 0.0, self.num_mults_per_dpu
-        while rest_elems > 0.0:
-            dpu_adders += float(2 ** int(log2Down(rest_elems)))
-            rest_elems -= float(2 ** int(log2Down(rest_elems)))
+        compute_block_ops = block_matA_size[0] * block_matA_size[1] * 2 * block_matB_size[1]
+        
+        total_latency = chain_loading_lat + chain_loading_lat * a_loading_grps + \
+                            4 + cascade_len * 2
 
-        dpu_adders = (dpu_adders-1.0) * self.num_dpus
-        # print(f"dpu mults: {dpu_mults}, dpu adders: {dpu_adders}")
+        num_cores = round(self.NUM_TCs / (cascade_len + 2))
+        num_blocks = round(total_ops / compute_block_ops)
+        pipeline_iters = round(num_blocks / num_cores)
+        total_latency *= pipeline_iters
 
-        mem_usage = self.b_w * self.b_h * self.WORD_SIZE / 1024.
-        return dpu_mults * self.MULT_RES, mem_usage
+        return total_latency
+
+
+    def compute_lat_teardown(self, cascade_len: int, ideal=False):
+        '''
+        compute latency based on fpga 21 paper
+        '''
+        round = lambda x, f: x if ideal else f(x)
+
+        matA_size = (self.a_h, self.a_w)
+        matB_size = (self.b_h, self.b_w)
+
+        total_ops =  self.total_ops()
+        chain_loading_lat = 3 * (cascade_len + 1)
+        block_matA_size = (3, matA_size[1])
+        block_matB_size = (matA_size[1], chain_loading_lat)
+        a_loading_grps = round(matA_size[1] / (cascade_len * 10), ceil)
+
+        compute_block_ops = block_matA_size[0] * block_matA_size[1] * 2 * block_matB_size[1]
+        
+        in_cycles = chain_loading_lat + chain_loading_lat * a_loading_grps
+        lat = 4 + cascade_len * 2
+
+        num_cores = round(self.NUM_TCs / (cascade_len + 2), floor)
+        num_blocks = round(total_ops / compute_block_ops, ceil)
+        pipeline_iters = round(num_blocks / num_cores, ceil)
+
+        return in_cycles * pipeline_iters, lat * pipeline_iters
+
+
+    def compute_resource(self, tcs_cascade_len: int, num_cores: int):
+        '''
+        compute resources by assuming the tcs cascade length does not include head/tail tcs.
+        '''
+        tcs = (tcs_cascade_len+2) * num_cores
+        mem_usage = self.fpga21_output_ram_size(tcs_cascade_len)
+        return tcs, mem_usage
 
     def tensor_mat_flops(self, in_cascade_len, acc_cascade_len, num_cols_grp_loading_chain=2):
         '''
@@ -256,31 +277,81 @@ class StratixDpuModel(DpuModel):
             
         return flops
 
-    def tensor_fpga21_mat_flops(self, cascade_len, sym=False):
+    def tensor_fpt20fixed_mat_flops(self, lanes, cores, tiles, dpes, sym=False):
+        '''
+        compute flops for fpt20 paper, with aggregated initialization.
+        '''
+        if not sym:
+            matA_size = (self.a_h, self.a_w)
+            matB_size = (self.b_h, self.b_w)
+
+            ops = self.total_ops()
+            init_latency = lanes / 10 * 3
+            total_lat = init_latency + max(matA_size[0] / cores, init_latency) * \
+                            ceil(matB_size[0] / (tiles * lanes / 10)) * ceil(matB_size[1] / (3*dpes)) + \
+                            3 + tiles * lanes / 10
+            # total_lat = init_latency + max(matB_size[1] / cores, init_latency) * \
+            #                 (matA_size[1] / (tiles * lanes / 10)) * (matA_size[0] / (3*dpes)) + \
+            #                   3 + tiles * lanes / 10 
+            total_lat *= 1./self.FREQ * 1e-6
+
+            required_res = cores * tiles * dpes * lanes / 10
+            if required_res > self.NUM_TCs:
+                raise OutOfResourceError("Error: not enough resources on the chip")
+
+            print(f"init lat: {init_latency}, input cycles: {matA_size[0] / cores}")
+            # print("npu cores: ", num_cores, "npu core iterations: ", pipeline_iters)
+            flops = ops / total_lat / 1e12
+        else:
+            flops = 'a+b'
+            # # simplify the equation and export latex code
+            # mA_row, mA_col, mB_col = sp.symbols('arow acol bcol')
+            # mB_row = mA_col
+            # init_len, acc_len, init_grp = sp.symbols('init\_len acc\_len init\_grp')
+
+            # flops = mA_row * mA_col * 2 * mB_col
+            # compute_block_flops = init_len * (3 * init_len) * mA_col * 2 * (3 * init_grp)
+            # a_cols_grps = (mA_col / (10 * acc_len))
+            # total_latency = 3 * init_len + (3*init_len) * a_cols_grps + 4 + acc_len * 2
+
+            # num_cores = (self.NUM_TCs / ((init_len + 1) * (acc_len + 1) * init_grp))
+            # num_blocks = (flops / compute_block_flops)
+            # pipeline_iters = (num_blocks / num_cores)
+            # total_latency *= pipeline_iters * 1./self.FREQ * 1e-6
+            # flops = flops / total_latency / 1e12
+            # flops = flops.subs({init_len: initcas_len, acc_len: acccas_len, init_grp: num_initcas_lane})
+            # print("lim: ", sp.latex(sp.simplify(sp.limit(flops, mA_col, sp.oo))))
+            # flops = sp.latex(flops)
+            
+        return flops
+
+    def tensor_fpga21_mat_flops(self, cascade_len, sym=False, ideal: bool=False):
         ''' 
         compute flops with a given number of cascaded chain and b cols
         a loading grps: the number of groups that a chain is responsible for along the a rows.
         assuming a chain must finish 3 entire A rows at least.
         '''
 
+        round = lambda x: x if ideal else ceil(x)
+
         if not sym:
             matA_size = (self.a_h, self.a_w)
             matB_size = (self.b_h, self.b_w)
 
-            total_ops =  matA_size[0] * matA_size[1] * 2 * matB_size[1]
+            total_ops =  self.total_ops()
             chain_loading_lat = 3 * (cascade_len + 1)
             block_matA_size = (3, matA_size[1])
             block_matB_size = (matA_size[1], chain_loading_lat)
-            a_loading_grps = ceil(matA_size[1] / (cascade_len * 10))
+            a_loading_grps = round(matA_size[1] / (cascade_len * 10))
 
             compute_block_ops = block_matA_size[0] * block_matA_size[1] * 2 * block_matB_size[1]
             
             total_latency = chain_loading_lat + chain_loading_lat * a_loading_grps + \
                                 4 + cascade_len * 2
 
-            num_cores = ceil(self.NUM_TCs / (cascade_len + 2))
-            num_blocks = ceil(total_ops / compute_block_ops)
-            pipeline_iters = ceil(num_blocks / num_cores)
+            num_cores = round(self.NUM_TCs / (cascade_len + 2))
+            num_blocks = round(total_ops / compute_block_ops)
+            pipeline_iters = round(num_blocks / num_cores)
             total_latency *= pipeline_iters * 1./self.FREQ * 1e-6
 
             # print("num_cores for fpga 21: ", num_cores)
@@ -309,6 +380,7 @@ class StratixDpuModel(DpuModel):
             total_latency *= pipeline_iters * 1./self.FREQ * 1e-6
 
             flops = total_ops / total_latency / 1e12
+            print("total_lat: ", sp.latex(sp.simplify(total_latency)))
             flops = flops.subs({cas_len: cascade_len})
             print("lim: ", sp.latex(sp.simplify(sp.limit(flops, mA_col, sp.oo))))
 
@@ -317,10 +389,73 @@ class StratixDpuModel(DpuModel):
         return flops
 
     def ideal_tops(self):
-        ops = (10*2*3+3) * self.NUM_TCs
+        ops = (10*2*3) * self.NUM_TCs
         latency = 1/self.FREQ * 1e-6
         tops = ops / latency / 1e12
         return tops
+
+    def fpga21_output_ram_size(self, cascade_len):
+        '''
+        compute ram requirments for the fifo after each chain
+        '''
+        num_elements = 3 * cascade_len * 3
+        num_cores = ceil(self.NUM_TCs / (cascade_len + 2))
+        ram_size = num_cores * num_elements * 24 / 8 / 1024
+        return ram_size
+
+    def fpga21_num_ports(self, cascade_len):
+        '''
+        compute ports and fanin/fanout of the fpga21 core
+        '''
+        num_cores = ceil(self.NUM_TCs / (cascade_len + 2))
+        num_inports_per_core = cascade_len + 1
+        num_outports_per_core = 3
+        in_ports = num_cores * num_inports_per_core
+        outports = num_outports_per_core * num_cores
+        return in_ports, outports
+
+    def fpga21_bandwidth(self, cascade_len, peak=False):
+        '''
+        compute input and output bandwidth of the fpga21 core
+        '''
+
+        def datawidth_to_bandwidth(dwidth, latency = 1):
+            dwidth /= (8 * (2**30))
+            bandwidth = dwidth / (latency * 1./self.FREQ * 1e-6)
+            return bandwidth
+
+        if peak:        
+            datawidth = 8 * 10
+            inports, outports = self.fpga21_num_ports(cascade_len)
+            peak_input_bandwidth = inports * datawidth
+            peak_out_bandwidth = outports * 24
+            
+            return datawidth_to_bandwidth(peak_input_bandwidth), \
+                    datawidth_to_bandwidth(peak_out_bandwidth)
+        else:
+            total_inputs = self.a_h * self.a_w + self.b_w * self.b_h
+            total_inputs *= 8
+            total_outputs = self.a_h * self.b_w * 24
+            matA_size = (self.a_h, self.a_w)
+            matB_size = (self.b_h, self.b_w)
+
+            total_ops =  self.total_ops()
+            chain_loading_lat = 3 * (cascade_len + 1)
+            block_matA_size = (3, matA_size[1])
+            block_matB_size = (matA_size[1], chain_loading_lat)
+            a_loading_grps = ceil(matA_size[1] / (cascade_len * 10))
+
+            compute_block_ops = block_matA_size[0] * block_matA_size[1] * 2 * block_matB_size[1]
+            
+            total_lat = chain_loading_lat + chain_loading_lat * a_loading_grps + \
+                                4 + cascade_len * 2
+
+            num_cores = ceil(self.NUM_TCs / (cascade_len + 2))
+            num_blocks = ceil(total_ops / compute_block_ops)
+            pipeline_iters = ceil(num_blocks / num_cores)
+            total_lat *= pipeline_iters
+            return datawidth_to_bandwidth(total_inputs, total_lat), \
+                    datawidth_to_bandwidth(total_outputs, total_lat)
 
 class NpuDpuModel(DpuModel):
     '''
@@ -439,16 +574,22 @@ class BertModel:
     ADDER_LAT = 3.0
     MULT_LAT = 3.0
     MAC_LAT = 4.0
-    DIV_LAT = 15
+    DIV_LAT = 3
 
     ADDER_RES = 1.0/3.0
     MULT_RES = 1./30.
     DIV_RES = 0
     COMP_RES = 0
 
+    SFTMAX_ADDER_RES = 1
+    SFTMAX_MULT_RES = 1
+    SFTMAX_COMP_RES = 1
+    SFTMAX_DIV_RES = 1
+
     WORD_SIZE = 2
 
-    def __init__(self, embd_size=768.0, num_layers=0.0, num_heads=0.0, read_exp_samples=False, max_seq_len=320., exp_sample_path='params/scrs_sampled.npy', att_sample_path='params/attentions_sampled.npy'):
+    def __init__(self, embd_size=768.0, num_layers=0.0, num_heads=0.0, read_exp_samples=False, max_seq_len=320., \
+                    exp_sample_path='params/scrs_sampled.npy', att_sample_path='params/attentions_sampled.npy'):
         if read_exp_samples:
             self.load_exp_out(exp_sample_path, att_sample_path)
             self.num_layers = self.exps[0].shape[0]
@@ -546,26 +687,36 @@ class BertModel:
         fig.savefig('res_fig/exps_count_zeros.png')
         plt.clf()
 
-    def softmax_resources(self, p1, p2, l3, quant_bits):
-        exp_resources = p1 * (2 ** quant_bits - 1) * self.COMP_RES
+    def softmax_resources(self, p1, p2, l3, quant_bits, mvm_tcore):
+        exp_resources = p1 * (2 ** quant_bits - 1) * self.SFTMAX_COMP_RES
         exp_mem = p1 * (2 ** quant_bits * self.num_heads) / 2.0
+        row_parallelism = self.max_seq_len / l3
 
         adder_tree_adders, rest_elems = 0.0, p1
         while rest_elems > 1.0:
             adder_tree_adders += float(2 ** int(log2Down(rest_elems)))
             rest_elems -= float(2 ** int(log2Down(rest_elems)))
 
-        adder_tree_adders = ceil(self.ADDER_RES * (p1-1))
+        adder_tree_adders = ceil(self.SFTMAX_ADDER_RES * (p1-1))
 
         accu_mem = l3 * 2
+        # counting the needed exp out buffer by p1 p2 and exp latency
+        # and also the buffer needed to store the inputs
         # calculate exp out buffer
-        density = 0.3
-        exp_out_buffer = (np.ceil(self.max_seq_len / p1) - 1) * l3 * p1 * density
-
-        div_resources = p2 * self.DIV_RES
-
-        row_parallelism = self.max_seq_len / l3
-        total_mem = row_parallelism * (exp_mem + accu_mem + exp_out_buffer) * self.WORD_SIZE / 1024
+        theortical_max_elements = self.max_seq_len * l3
+        # FIXME: lacking of the exp out buffer for the adder tree delay
+        exp_out_buffer = (ceil(theortical_max_elements / p1) - ceil(theortical_max_elements / p2)) * p1
+        div_resources = p2 * self.SFTMAX_DIV_RES
+        # FIXME: fixed mvm core size
+        _, _, softmax_incycle_delayed, softmax_inputs_hiding = \
+            self.softmax_incycles_lat_stratix((10, floor(mvm_tcore / (10+2))), (row_parallelism, p1))
+        softmax_input_buffer = 0
+        if not softmax_inputs_hiding:
+            # we need the buffer holding all the attention scores waiting for the softmax input
+            last_head_softmax_incycles_lat = softmax_incycle_delayed * (self.num_heads - 1)
+            softmax_input_buffer = last_head_softmax_incycles_lat * p1 * row_parallelism
+        
+        total_mem = row_parallelism * (exp_mem + accu_mem + max(exp_out_buffer, 0.0) + softmax_input_buffer) * self.WORD_SIZE / 1024
         total_res = ceil(row_parallelism * (exp_resources + adder_tree_adders + 1 + div_resources))
 
         return total_res, total_mem
@@ -592,17 +743,19 @@ class BertModel:
 
     def softmax_lat(self, exp_dat=None, p1=1., p2=1., exp_h=-1):
         '''
-        argument:
+        computing the sparse softmax latency
         exp_dat - output of attention exponent func  
         '''
         adder_tree_stages = p1-1
         if exp_dat is None:
             row_itlve_len = exp_h
-            a_cols = 320 * 0.2
+            a_cols = self.max_seq_len * 0.2
+            total_elems = a_cols * exp_h
             grp_cols = ceil(exp_h / p1)
         else:
             row_itlve_len = exp_dat.shape[0]
             a_cols = np.count_nonzero(exp_dat, axis=-1)
+            total_elems = np.count_nonzero(exp_dat)
             grp_cols = ceil(exp_dat.shape[-1] / p1)
 
         # padding zeros for unaligned parallel sub-cols
@@ -610,6 +763,12 @@ class BertModel:
         a_cols_2 = np.ceil(a_cols / p2)
         lat = self.qp_exp_lat()
         lat += ((adder_tree_stages+1) * self.ADDER_LAT)
+
+        # check if extra exp out latency exists
+        if p1 > p2:
+            lat += ceil(total_elems / p2) - ceil(total_elems / p1) + 2
+
+        return lat
         
         #check parallelism eligibility
         p2_consuming = np.amax(a_cols_2) * row_itlve_len
@@ -641,20 +800,23 @@ class BertModel:
 
         return lat
 
-    def baseline_softmax_resource(self, p, l):
-        exp_resource = self.MULT_RES
-        log_resource = self.ADDER_RES
+    def baseline_softmax_resource(self, p, l, mvm_tcore):
+        '''
+        computing the baseline softmax dsps and memories
+        '''
+        exp_resource = self.SFTMAX_MULT_RES + self.SFTMAX_ADDER_RES
+        log_resource = self.SFTMAX_ADDER_RES
 
         tree_elems, rest_elems = 0.0, p
         while rest_elems > 1.0:
             tree_elems += float(2 ** int(log2Down(rest_elems)))
             rest_elems -= float(2 ** int(log2Down(rest_elems)))
         
-        res_all = (tree_elems + 1) * self.COMP_RES
-        res_all += ceil(self.ADDER_RES * p)
+        res_all = (tree_elems + 1) * self.SFTMAX_COMP_RES
+        res_all += ceil(self.SFTMAX_ADDER_RES * p)
         res_all += exp_resource * p
-        res_all += (p-1) * self.ADDER_RES
-        res_all += ceil(self.ADDER_RES * 2 * p)
+        res_all += (tree_elems + 1) * self.SFTMAX_ADDER_RES
+        res_all += ceil(self.SFTMAX_ADDER_RES * 2 * p)
         res_all += exp_resource * p
         res_all += log_resource
 
@@ -664,11 +826,21 @@ class BertModel:
         exp_lat = self.ADDER_LAT + self.MULT_LAT + 1 + 2
         stg_2_lat = self.ADDER_LAT + exp_lat + (p-1) * self.ADDER_LAT + self.ADDER_LAT
 
+        # FIXME: fixed mvm core shape
+        _, _, softmax_incycle_delayed, softmax_inputs_hiding = \
+            self.softmax_incycles_lat_stratix((10, floor(mvm_tcore / (10+2))), (row_parallelism, p))
+        softmax_input_buffer = 0
+        if softmax_inputs_hiding:
+            # we need the buffer holding all the attention scores waiting for the softmax input
+            last_head_softmax_incycles_lat = softmax_incycle_delayed * (self.num_heads - 1)
+            softmax_input_buffer = last_head_softmax_incycles_lat * p * row_parallelism
+
         exp_mem = 64
         log_mem = 64 + 32
         buffer_mem = p * stg_2_lat
 
-        mem_all = row_parallelism * (exp_mem * p * 2 + log_mem + buffer_mem) * self.WORD_SIZE / 1024
+        mem_all = row_parallelism * (exp_mem * p * 2 + log_mem + buffer_mem + softmax_input_buffer) \
+                    * self.WORD_SIZE / 1024
 
         return res_all, mem_all
 
@@ -736,23 +908,22 @@ class BertModel:
             dpu_model = IdealMvmModel(seq_len, self.embd_size, self.embd_size, self.embd_size/self.num_heads, "tops", tops)
             return dpu_model.compute_lat()    
 
-    def matmul_lat_qkv_per_head_stratix(self, seq_len, blk, ideal=False, mem_init=False):
+    def matmul_lat_qkv_per_head_stratix(self, seq_len, cascade_len, num_tcs, ideal=False):
         if self.exps is not None:
             # print(__name__+": using acutal size of exp")
             actual_seq_len = [i.shape[-1] for i in self.exps]
         
-            in_cycles, adder_trees, adders = [], [], []
+            in_cycles, compute_lats = [], []
             for l in actual_seq_len:
-                dpu_model = StratixDpuModel(l, self.embd_size,  self.embd_size, self.embd_size/self.num_heads, blk[0], blk[1])
-                in_cycle, adder_tree, adder = dpu_model.compute_lat_teardown(ideal=ideal, mem_init=mem_init)
+                dpu_model = StratixDpuModel(l, self.embd_size,  self.embd_size, self.embd_size/self.num_heads, num_tcs=num_tcs)
+                in_cycle, compute_lat = dpu_model.compute_lat_teardown(cascade_len, ideal=ideal)
                 in_cycles.append(in_cycle)
-                adder_trees.append(adder_tree)
-                adders.append(adder)
+                compute_lats.append(compute_lat)
 
-            return np.mean(in_cycles), np.mean(adder_trees), np.mean(adders)
+            return np.mean(in_cycles), np.mean(compute_lats)
         else:
-            dpu_model = StratixDpuModel(seq_len, self.embd_size,  self.embd_size, self.embd_size/self.num_heads, blk[0], blk[1])
-            return dpu_model.compute_lat_teardown(ideal=ideal, mem_init=mem_init)   
+            dpu_model = StratixDpuModel(seq_len, self.embd_size,  self.embd_size, self.embd_size/self.num_heads, num_tcs=num_tcs)
+            return dpu_model.compute_lat_teardown(cascade_len, ideal=ideal)
     
     def matmul_lat_qktrans_per_head(self, seq_len, blk=(64.0, 64.0), ideal=False):
         if self.exps is not None:
@@ -776,9 +947,9 @@ class BertModel:
         dpu_model = DpuModel(seq_len, self.embd_size,  self.embd_size, seq_len, blk[0], blk[1])
         return dpu_model.compute_resource()
 
-    def matmul_res_qktrans_per_head_stratix(self, blk, seq_len=320):
-        dpu_model = StratixDpuModel(seq_len, self.embd_size, self.embd_size, seq_len, blk[0], blk[1])
-        return dpu_model.compute_resource()
+    def matmul_res_qktrans_per_head_stratix(self, tc_cascade_len, num_cores, seq_len=320):
+        dpu_model = StratixDpuModel(seq_len, self.embd_size, self.embd_size, seq_len)
+        return dpu_model.compute_resource(tc_cascade_len, num_cores)
 
     def matmul_lat_qktrans_per_head_ideal(self, seq_len, tops):
         if self.exps is not None:
@@ -796,59 +967,56 @@ class BertModel:
             dpu_model = IdealMvmModel(seq_len, self.embd_size, self.embd_size, seq_len, "tops", tops)
             return dpu_model.compute_lat()
 
-    def matmul_lat_qktrans_per_head_stratix(self, seq_len, blk=(64.0, 64.0), ideal=False, mem_init=False):
+    def matmul_lat_qktrans_per_head_stratix(self, seq_len, cascade_len, num_tcs, ideal=False):
         if self.exps is not None:
             # print(__name__+": using acutal size of exp")
             actual_seq_len = [i.shape[-1] for i in self.exps]
             
-            in_cycles, adder_trees, adders = [], [], []
+            in_cycles, out_lats = [], []
             for l in actual_seq_len:
-                dpu_model = StratixDpuModel(l, self.embd_size,  self.embd_size, l, blk[0], blk[1])
-                in_cycle, adder_tree, adder = dpu_model.compute_lat_teardown(ideal=ideal, mem_init=mem_init)
+                dpu_model = StratixDpuModel(l, self.embd_size,  self.embd_size, l, num_tcs=num_tcs)
+                in_cycle, out_lat = dpu_model.compute_lat_teardown(cascade_len, ideal=ideal)
                 in_cycles.append(in_cycle)
-                adder_trees.append(adder_tree)
-                adders.append(adder)
+                out_lats.append(out_lat)
 
-            return np.mean(in_cycles), np.mean(adder_trees), np.mean(adders)
+            return np.mean(in_cycles), np.mean(out_lats)
         else:
-            dpu_model = StratixDpuModel(seq_len, self.embd_size,  self.embd_size, seq_len, blk[0], blk[1])
-            return dpu_model.compute_lat_teardown(ideal=ideal, mem_init=mem_init)
+            dpu_model = StratixDpuModel(seq_len, self.embd_size,  self.embd_size, seq_len, num_tcs=num_tcs)
+            return dpu_model.compute_lat_teardown(cascade_len, ideal=ideal)
 
-    def matmul_lat_vatt_per_head_stratix(self, seq_len, blk=(64, 64), ideal=False, mem_init=False):
+    def matmul_lat_vatt_per_head_stratix(self, seq_len, cascade_len, num_tcs, ideal=False):
         if self.exps is not None:
             # print(__name__+": using acutal size of exp")
             actual_seq_len = [i.shape[-1] for i in self.exps]
             
-            in_cycles, adder_trees, adders = [], [], []
+            in_cycles, out_lats = [], []
             for l in actual_seq_len:
-                dpu_model = StratixDpuModel(l, l, l, (self.embd_size / self.num_heads), blk[0], blk[1])
-                in_cycle, adder_tree, adder = dpu_model.compute_lat_teardown(ideal=ideal, mem_init=mem_init)
+                dpu_model = StratixDpuModel(l, l, l, (self.embd_size / self.num_heads), num_tcs=num_tcs)
+                in_cycle, out_lat = dpu_model.compute_lat_teardown(cascade_len, ideal=ideal)
                 in_cycles.append(in_cycle)
-                adder_trees.append(adder_tree)
-                adders.append(adder)
+                out_lats.append(out_lat)
 
-            return np.mean(in_cycles), np.mean(adder_trees), np.mean(adders)
+            return np.mean(in_cycles), np.mean(out_lats)
         else:
-            dpu_model = StratixDpuModel(seq_len, seq_len, seq_len, (self.embd_size / self.num_heads), blk[0], blk[1])
-            return dpu_model.compute_lat_teardown(ideal=ideal, mem_init=mem_init)
+            dpu_model = StratixDpuModel(seq_len, seq_len, seq_len, (self.embd_size / self.num_heads), num_tcs=num_tcs)
+            return dpu_model.compute_lat_teardown(cascade_len, ideal=ideal)
 
-    def matmul_lat_selfatt_out_stratix(self, seq_len, blk=(64, 64), ideal=False, mem_init=False):
+    def matmul_lat_selfatt_out_stratix(self, seq_len, cascade_len, num_tcs, ideal=False):
         if self.exps is not None:
             # print(__name__+": using acutal size of exp")
             actual_seq_len = [i.shape[-1] for i in self.exps]
             
-            in_cycles, adder_trees, adders = [], [], []
+            in_cycles, out_lats = [], []
             for l in actual_seq_len:
-                dpu_model = StratixDpuModel(l, self.embd_size, self.embd_size, self.embd_size, blk[0], blk[1])
-                in_cycle, adder_tree, adder = dpu_model.compute_lat_teardown(ideal=ideal, mem_init=mem_init)
+                dpu_model = StratixDpuModel(l, self.embd_size, self.embd_size, self.embd_size, num_tcs=num_tcs)
+                in_cycle, out_lat = dpu_model.compute_lat_teardown(cascade_len, ideal=ideal)
                 in_cycles.append(in_cycle)
-                adder_trees.append(adder_tree)
-                adders.append(adder)
+                out_lats.append(out_lat)
 
-            return np.mean(in_cycles), np.mean(adder_trees), np.mean(adders)
+            return np.mean(in_cycles), np.mean(out_lats)
         else:
-            dpu_model = StratixDpuModel(seq_len, self.embd_size, self.embd_size, self.embd_size, blk[0], blk[1])
-            return dpu_model.compute_lat_teardown(ideal=ideal, mem_init=mem_init)
+            dpu_model = StratixDpuModel(seq_len, self.embd_size, self.embd_size, self.embd_size, num_tcs=num_tcs)
+            return dpu_model.compute_lat_teardown(cascade_len, ideal=ideal)
 
     def att_v_outer_product_intermediate_size(self):
         if self.exps is not None:
@@ -867,18 +1035,19 @@ class BertModel:
     def check_softmax_memory(self, mvm_tcore: float, softmax_tcore: tuple, softmax_type = "baseline"):
         # starting to compare the latency of softmax and q,k,v,qxkT 
         # by the time the first attention score is generated.
-        equi_mvm_blk_size = int(sqrt(mvm_tcore*30))
-        mvm_in_cycles, mvm_accumu_lat, mvm_adder_lat = \
-            self.matmul_lat_qkv_per_head_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True, mem_init=False)
+        
+        equi_mvm_blk_size = (10, floor(mvm_tcore/12))
+        mvm_in_cycles, _ = \
+            self.matmul_lat_qkv_per_head_stratix(self.max_seq_len, equi_mvm_blk_size[0], equi_mvm_blk_size[1], ideal=True)
 
-        qktrans_in_cycles, qktrans_accumu_lat, qktrans_adder_lat = \
-            self.matmul_lat_qktrans_per_head_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True, mem_init=False)
+        qktrans_in_cycles, qktrans_compute_lat = \
+            self.matmul_lat_qktrans_per_head_stratix(self.max_seq_len, equi_mvm_blk_size[0], equi_mvm_blk_size[1], ideal=True)
 
         # start of new score outputs:
-        new_score_output_lat = mvm_in_cycles*4 + qktrans_accumu_lat + qktrans_adder_lat
+        new_score_output_lat = mvm_in_cycles*4 + qktrans_compute_lat
         # start of softmax stg3:
         r, p = softmax_tcore
-        start_of_softmax_stg3_lat = qktrans_accumu_lat + qktrans_adder_lat + \
+        start_of_softmax_stg3_lat = qktrans_compute_lat + \
                                         self.baseline_softmax_lat(pa=p, exp_h=ceil(self.max_seq_len/r), return_2ndstg_lat=True)
         if new_score_output_lat < start_of_softmax_stg3_lat:
             logging.warning("softmax mem in danger of overflow!")
@@ -886,22 +1055,13 @@ class BertModel:
 
         return True
         
-
-    def attention_lat_stratix(self, mvm_tcore: float, softmax_tcore: tuple, softmax_type = "baseline", consider_mem_init=False):
-        '''
-        softmax_tcore: r, p -> r: row parallelism, p -> column parallelism
-        '''
-        equi_mvm_blk_size = int(sqrt(mvm_tcore*30))
-        mvm_in_cycles, mvm_accumu_lat, mvm_adder_lat = \
-            self.matmul_lat_qkv_per_head_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True, mem_init=consider_mem_init)
+    def softmax_incycles_lat_stratix(self, equi_mvm_blk_size, softmax_tcore):
+        mvm_in_cycles, mvm_compute_delay = \
+            self.matmul_lat_qkv_per_head_stratix(self.max_seq_len, equi_mvm_blk_size[0], equi_mvm_blk_size[1], ideal=True)
         
-        single_head_iter = mvm_in_cycles * 2
-        single_head_iter += mvm_accumu_lat + mvm_adder_lat
-
-        # first 11 heads to cover the softmax latency by mvm compute:
-        qktrans_in_cycles, qktrans_accumu_lat, qktrans_adder_lat = \
-            self.matmul_lat_qktrans_per_head_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True, mem_init=consider_mem_init)
-        qkv_qktrans_compute_lat = qktrans_in_cycles + mvm_in_cycles * 3 + qktrans_accumu_lat + qktrans_adder_lat
+        qktrans_in_cycles, qktrans_compute_delay = \
+            self.matmul_lat_qktrans_per_head_stratix(self.max_seq_len, equi_mvm_blk_size[0], equi_mvm_blk_size[1], ideal=True)
+        qkv_qktrans_compute_lat = qktrans_in_cycles + mvm_in_cycles * 3 + qktrans_compute_delay
         r, p = softmax_tcore
         if self.exps is None:
             softmax_stg1_incycle = ceil(self.max_seq_len/r) * ceil(self.max_seq_len/p)
@@ -909,6 +1069,36 @@ class BertModel:
             softmax_stg1_incycle = np.mean([ceil(h.shape[-1]/r) * ceil(float(h.shape[-1])/p) \
                                             for h in self.exps])
 
+        intermediate_lat = max(qkv_qktrans_compute_lat, softmax_stg1_incycle)
+        softmax_stg1_incycle_delayed = 0
+        softmax_inputs_hiding = True
+        if qkv_qktrans_compute_lat < softmax_stg1_incycle:
+            softmax_stg1_incycle_delayed = softmax_stg1_incycle - qkv_qktrans_compute_lat
+            softmax_inputs_hiding = False
+            logging.warn(f"{__name__}: softmax input cycles hidden failed")
+
+        return intermediate_lat, softmax_stg1_incycle, softmax_stg1_incycle_delayed, softmax_inputs_hiding
+
+
+    def attention_lat_stratix(self, mvm_tcore: float, softmax_tcore: tuple, softmax_type = "baseline"):
+        '''
+        softmax_tcore: r, p -> r: row parallelism, p -> column parallelism
+        '''
+        equi_mvm_blk_size = (10, floor(mvm_tcore / (10+2)))
+        mvm_in_cycles, mvm_compute_delay = \
+            self.matmul_lat_qkv_per_head_stratix(self.max_seq_len, equi_mvm_blk_size[0], equi_mvm_blk_size[1], ideal=True)
+        qktrans_in_cycles, qktrans_compute_delay = \
+            self.matmul_lat_qktrans_per_head_stratix(self.max_seq_len, equi_mvm_blk_size[0], equi_mvm_blk_size[1], ideal=True)
+
+        # first 11 heads to cover the softmax latency by mvm compute:
+        # compute latency of one head, the softmax incycles and if there's delay
+        # intermediate latency: num of cycles to finish one head of q, k, v and qktrans computation, or
+        # the number of softmax input cycles, depending on which one is larger.
+        # it's the num of cycles to feed in one entire head into the self attention computation essentially.
+        intermediate_lat, softmax_stg1_incycle, softmax_stg1_incycle_delayed, softmax_inputs_hiding = \
+            self.softmax_incycles_lat_stratix(equi_mvm_blk_size, softmax_tcore)
+
+        r, p = softmax_tcore
         flatten_exps = []
         if self.exps is not None:
             for inst in self.exps:
@@ -925,7 +1115,7 @@ class BertModel:
             else:
                 temp_lats.append(self.baseline_softmax_lat(pa=p, exp_h=ceil(self.max_seq_len/r)))
 
-            softmax_lat = softmax_stg1_incycle + np.mean(np.array(temp_lats))
+            softmax_lat = np.mean(np.array(temp_lats))
         else:
             temp_lats = []
             if len(flatten_exps) > 0:
@@ -935,83 +1125,77 @@ class BertModel:
             else:
                 temp_lats.append(self.softmax_lat(p1=p, p2=p, exp_h=ceil(self.max_seq_len/r)))
                 
-            softmax_lat = softmax_stg1_incycle + np.mean(np.array(temp_lats))
+            softmax_lat = np.mean(np.array(temp_lats))
 
-        # select dominate intermediate latency: softmax in cycles or q k v compute
-        intermediate_lat = max(qkv_qktrans_compute_lat, softmax_stg1_incycle)
-        if qkv_qktrans_compute_lat > softmax_stg1_incycle:
-            logging.info(f"{__name__}: softmax hidden succeeded")
-        else:
-            logging.info(f"{__name__}: softmax hidden failed")
-
-        predessesor_heads_lat = mvm_in_cycles * 2 + intermediate_lat * (self.num_heads-1)
+        # predessesor heads: latency from the self attention starts to the last head softmax start
+        predessesor_heads_lat = mvm_in_cycles * 2 + (intermediate_lat + softmax_stg1_incycle_delayed) * (self.num_heads-1)
         # softmax finish time (absolute time)
-        softmax_first_finish_time = mvm_in_cycles * 2 + qktrans_adder_lat + qktrans_accumu_lat + \
-                                        softmax_stg1_incycle + softmax_lat
-        softmax_first_ddl = predessesor_heads_lat + intermediate_lat
-        if softmax_first_ddl < softmax_first_finish_time:
-            logging.info(softmax_first_finish_time, softmax_first_ddl)
+        # checking the first softmax finish latency
+        # softmax_first_finish_time = mvm_in_cycles * 2 + qktrans_compute_delay + \
+        #                                 softmax_stg1_incycle + softmax_lat
+        # softmax_first_ddl = predessesor_heads_lat + intermediate_lat
+        # softmax_compute_hiding = True
+        # if softmax_first_ddl < softmax_first_finish_time:
+        #     softmax_compute_hiding = False
+        #     logging.warn("softmax compute hidden failed", softmax_first_finish_time, softmax_first_ddl)
 
         # accumulate VxAtt
-        vatt_mult_incycles, _, _ = \
-            self.matmul_lat_vatt_per_head_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True, mem_init=consider_mem_init)
+        vatt_mult_incycles, _ = \
+            self.matmul_lat_vatt_per_head_stratix(self.max_seq_len, equi_mvm_blk_size[0], equi_mvm_blk_size[1], ideal=True)
         vatt_mult_incycles *= self.num_heads
 
         # last step: FC layer for output
-        output_fc_incycles, output_fc_accu, output_fc_adder = \
-            self.matmul_lat_selfatt_out_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True, mem_init=consider_mem_init)
-        output_fc_lat = output_fc_incycles + output_fc_accu + output_fc_adder
+        output_fc_incycles, output_fc_compute_delay = \
+            self.matmul_lat_selfatt_out_stratix(self.max_seq_len, equi_mvm_blk_size[0], equi_mvm_blk_size[1], ideal=True)
+        output_fc_lat = output_fc_incycles + output_fc_compute_delay
 
-        if softmax_first_ddl < softmax_first_finish_time:
-            # softmax latency cannot be covered by 12 heads
-            first_vatt_finish = softmax_lat + vatt_mult_incycles
-            second_vatt_start = intermediate_lat + softmax_lat
-            vatt_gap = second_vatt_start - first_vatt_finish
-            vatt_gap = 0 if vatt_gap < 0 else vatt_gap
-            res = mvm_in_cycles * 2 + qktrans_accumu_lat + qktrans_adder_lat
-            res += softmax_lat + (vatt_mult_incycles + vatt_gap) * self.num_heads
-            res += output_fc_lat
-        else: 
-            # softmax latency can be covered by 12 heads
-            res = intermediate_lat + predessesor_heads_lat + vatt_mult_incycles + output_fc_lat
+        # check if the softmax latency is longer than the v att mult deadline
+        res = predessesor_heads_lat + intermediate_lat + softmax_stg1_incycle_delayed
+        res += max(vatt_mult_incycles, softmax_lat)
+        softmax_compute_hiding = True
+        if vatt_mult_incycles < softmax_lat:
+            softmax_compute_hiding = False
+            logging.warn("softmax compute hidden failed: {}, {}".format(vatt_mult_incycles, softmax_lat))
+
+        res += output_fc_lat
         
-        return res
+        return res, softmax_compute_hiding
 
     def attention_mvm_only_lat_stratix(self, mvm_tcore: float):
         '''
         compute mvm only latency of the attention, used to estimate dynamic utilization of the mvm unit.
         '''
-        equi_mvm_blk_size = int(sqrt(mvm_tcore*30))
-        mvm_in_cycles, mvm_accumu_lat, mvm_adder_lat = \
-            self.matmul_lat_qkv_per_head_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True)
+        equi_mvm_blk_size = (10, floor(mvm_tcore / 10))
+        mvm_in_cycles, _ = \
+            self.matmul_lat_qkv_per_head_stratix(self.max_seq_len, equi_mvm_blk_size[0], equi_mvm_blk_size[1], ideal=True)
 
         # first 11 heads to cover the softmax latency by mvm compute:
-        qktrans_in_cycles, qktrans_accumu_lat, qktrans_adder_lat = \
-            self.matmul_lat_qktrans_per_head_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True)
+        qktrans_in_cycles, _ = \
+            self.matmul_lat_qktrans_per_head_stratix(self.max_seq_len, equi_mvm_blk_size[0], equi_mvm_blk_size[1], ideal=True)
         qkv_qktrans_compute_lat = (mvm_in_cycles * 3 + qktrans_in_cycles) * self.num_heads
         
-        vatt_mult_incycles, _, _ = \
-            self.matmul_lat_vatt_per_head_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True)
+        vatt_mult_incycles, _ = \
+            self.matmul_lat_vatt_per_head_stratix(self.max_seq_len, equi_mvm_blk_size[0], equi_mvm_blk_size[1], ideal=True)
         vatt_mult_incycles *= self.num_heads
 
         # last step: FC layer for output
-        output_fc_incycles, output_fc_accu, output_fc_adder = \
-            self.matmul_lat_selfatt_out_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True)
-        output_fc_lat = output_fc_incycles + output_fc_accu + output_fc_adder
+        output_fc_incycles, output_fc_compute_lat = \
+            self.matmul_lat_selfatt_out_stratix(self.max_seq_len, equi_mvm_blk_size[0], equi_mvm_blk_size[1], ideal=True)
+        output_fc_lat = output_fc_incycles + output_fc_compute_lat
 
         total_lat = qkv_qktrans_compute_lat + vatt_mult_incycles + output_fc_lat
 
         return total_lat
 
     def attention_bandwidth_stratix(self, mvm_tcore: float, softmax_tcore: tuple, softmax_type = "baseline"):
-        equi_mvm_blk_size = int(sqrt(mvm_tcore*30))
-        mvm_in_cycles, mvm_accumu_lat, mvm_adder_lat = \
-            self.matmul_lat_qkv_per_head_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True)
+        equi_mvm_blk_size = (10, floor(mvm_tcore / 12))
+        mvm_in_cycles, _ = \
+            self.matmul_lat_qkv_per_head_stratix(self.max_seq_len, equi_mvm_blk_size[0], equi_mvm_blk_size[1], ideal=True)
 
         # first 11 heads to cover the softmax latency by mvm compute:
-        qktrans_in_cycles, qktrans_accumu_lat, qktrans_adder_lat = \
-            self.matmul_lat_qktrans_per_head_stratix(self.max_seq_len, (equi_mvm_blk_size, equi_mvm_blk_size), ideal=True)
-        qkv_qktrans_compute_lat = qktrans_in_cycles + mvm_in_cycles * 3 + qktrans_accumu_lat + qktrans_adder_lat
+        qktrans_in_cycles, qktrans_compute_lat = \
+            self.matmul_lat_qktrans_per_head_stratix(self.max_seq_len, equi_mvm_blk_size[0], equi_mvm_blk_size[1], ideal=True)
+        qkv_qktrans_compute_lat = qktrans_in_cycles + mvm_in_cycles * 3 + qktrans_compute_lat
         r, p = softmax_tcore
         softmax_stg1_incycle = np.mean([ceil(h.shape[-1]/r) * ceil(float(h.shape[-1])/p) \
                                             for h in self.exps])
@@ -1047,7 +1231,7 @@ class BertModel:
 
         predessesor_heads_lat = mvm_in_cycles * 2 + intermediate_lat * (self.num_heads-1)
         # softmax finish time (absolute time)
-        softmax_first_finish_time = mvm_in_cycles * 2 + qktrans_adder_lat + qktrans_accumu_lat + \
+        softmax_first_finish_time = mvm_in_cycles * 2 + qktrans_compute_lat + \
                                         softmax_stg1_incycle + softmax_lat
         softmax_first_ddl = predessesor_heads_lat + intermediate_lat
         if softmax_first_ddl < softmax_first_finish_time:
