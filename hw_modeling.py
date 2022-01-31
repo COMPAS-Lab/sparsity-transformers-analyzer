@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import random
 import sys, logging
+from numpy.core.fromnumeric import nonzero, size
 import sympy as sp
 
 log = logging.getLogger(__name__)
@@ -106,8 +107,20 @@ class DpuModel:
         mem_usage = self.b_w * self.b_h * self.WORD_SIZE / 1024.
         return dpu_mults * self.MULT_RES + dpu_adders * self.ADDER_RES, mem_usage
 
-    def total_ops(self):
-        return  self.a_h * self.a_w * 2 * self.b_w
+    def total_ops(self, exp_dat=None):
+        if exp_dat is None:
+            return  self.a_h * self.a_w * 2 * self.b_w
+        else:
+            # count none zeros per row
+            none_zeros = np.count_nonzero(exp_dat, axis=-1)
+            # mimicing the padding zeros to every 3 rows
+            zeros_padded = none_zeros.size % 3
+            none_zeros = np.pad(none_zeros, (0, 3 - zeros_padded), "constant", constant_values=0)
+            none_zeros = np.split(none_zeros, np.arange(3, none_zeros.size, 3))
+            max_none_zeros_per_grp = np.array([np.amax(i) for i in none_zeros])
+            print("max none zeros per 3 rows: ", max_none_zeros_per_grp)
+            total_ops = sum([dense_vals * 2 * self.b_w * 3 for dense_vals in max_none_zeros_per_grp])
+            return total_ops
 
 class StratixDpuModel(DpuModel):
     '''
@@ -124,7 +137,6 @@ class StratixDpuModel(DpuModel):
     COMP_LAT = 3.0
     ADDER_LAT = 3.0
     MULT_LAT = 3.0
-    MAC_LAT = 4.0
 
     ADDER_RES = 1/3.0
     MULT_RES = 1.0/30.0
@@ -138,9 +150,12 @@ class StratixDpuModel(DpuModel):
 
     FREQ = 500.0
     NUM_TCs = 3960.0
+    __exp_dat = None
 
-    def __init__(self, a_h, a_w, b_h, b_w, freq=0.0, num_tcs=0.0):
+    def __init__(self, a_h, a_w, b_h, b_w, exp_dat=None, freq=0.0, num_tcs=0.0):
         super().__init__(a_h, a_w, b_h, b_w, 16, 16)
+        if exp_dat is not None:
+            self.__exp_dat = exp_dat
         if freq > 0:
             self.FREQ = freq
         if num_tcs > 0:
@@ -151,28 +166,54 @@ class StratixDpuModel(DpuModel):
         '''
         compute latency based on fpga 21 paper
         '''
-        round = lambda x: x if ideal else ceil(x)
-
-        matA_size = (self.a_h, self.a_w)
-        matB_size = (self.b_h, self.b_w)
-
-        total_ops =  self.total_ops()
         chain_loading_lat = 3 * (cascade_len + 1)
-        block_matA_size = (3, matA_size[1])
-        block_matB_size = (matA_size[1], chain_loading_lat)
-        a_loading_grps = round(matA_size[1] / (cascade_len * 10))
 
-        compute_block_ops = block_matA_size[0] * block_matA_size[1] * 2 * block_matB_size[1]
-        
-        total_latency = chain_loading_lat + chain_loading_lat * a_loading_grps + \
-                            4 + cascade_len * 2
+        if self.__exp_dat is None:
+            round = lambda x: x if ideal else ceil(x)
+            matA_size = (self.a_h, self.a_w)
+            matB_size = (self.b_h, self.b_w)
 
-        num_cores = round(self.NUM_TCs / (cascade_len + 2))
-        num_blocks = round(total_ops / compute_block_ops)
-        pipeline_iters = round(num_blocks / num_cores)
-        total_latency *= pipeline_iters
+            total_ops =  self.total_ops()
+            block_matA_size = (3, matA_size[1])
+            block_matB_size = (matA_size[1], chain_loading_lat)
+            a_loading_grps = round(matA_size[1] / (cascade_len * 10))
 
-        return total_latency
+            compute_block_ops = block_matA_size[0] * block_matA_size[1] * 2 * block_matB_size[1]
+            
+            total_latency = chain_loading_lat + chain_loading_lat * a_loading_grps + \
+                                4 + cascade_len * 2
+
+            num_cores = round(self.NUM_TCs / (cascade_len + 2))
+            num_blocks = round(total_ops / compute_block_ops)
+            pipeline_iters = round(num_blocks / num_cores)
+            total_latency *= pipeline_iters
+
+            return total_latency
+        else:
+            round = lambda x: x if ideal else np.ceil(x)
+
+            if len(self.__exp_dat.shape) != 2:
+                raise Exception("Wrong exp shape in compute latency!")
+            else:
+                total_ops = self.total_ops(self.__exp_dat)
+
+                # count none zeros per row
+                none_zeros = np.count_nonzero(self.__exp_dat, axis=-1)
+                # mimicing the padding zeros to every 3 rows
+                zeros_padded = none_zeros.size % 3
+                none_zeros = np.pad(none_zeros, (0, 3 - zeros_padded), "constant", constant_values=0)
+                none_zeros = np.split(none_zeros, np.arange(3, none_zeros.size, 3))
+                max_none_zeros_per_grp = np.array([np.amax(i) for i in none_zeros])
+
+                a_loading_grps = round(max_none_zeros_per_grp / (cascade_len * 10))
+                grp_loading_lats = chain_loading_lat + chain_loading_lat * a_loading_grps + \
+                                4 + cascade_len * 2
+                grp_loading_lats *= round(self.b_w / chain_loading_lat)
+                num_cores = round(self.NUM_TCs / (cascade_len + 2))
+
+                ideal_lat = round(np.sum(grp_loading_lats) / num_cores)
+                greedy_lat = ideal_lat * ((4*num_cores-1)/(3*num_cores))
+                return greedy_lat
 
 
     def compute_lat_teardown(self, cascade_len: int, ideal=False):
@@ -280,6 +321,8 @@ class StratixDpuModel(DpuModel):
     def tensor_fpt20fixed_mat_flops(self, lanes, cores, tiles, dpes, sym=False):
         '''
         compute flops for fpt20 paper, with aggregated initialization.
+        FIXME: this function returns significant different result compared to the 
+        original paper.
         '''
         if not sym:
             matA_size = (self.a_h, self.a_w)
@@ -472,7 +515,6 @@ class NpuDpuModel(DpuModel):
     COMP_LAT = 3.0
     ADDER_LAT = 3.0
     MULT_LAT = 3.0
-    MAC_LAT = 4.0
 
     ADDER_RES = 1/3.0
     MULT_RES = 1.0/30.0
@@ -569,22 +611,23 @@ class BertModel:
     max_seq_len = 320.
 
     freq = 500
+    
+    BFP16_ADDER_LAT = 3.0
+    BFP16_MULT_LAT = 3.0
+    
+    FP16_DIV_LAT = 8.0
+    FP16_COMP_LAT = 2.0
+    FP16_ADDER_LAT = 16.0
+    FP16_MULT_LAT = 8.0
+    FP16_SQRT_LAT = 8.0
 
-    COMP_LAT = 3.0
-    ADDER_LAT = 3.0
-    MULT_LAT = 3.0
-    MAC_LAT = 4.0
-    DIV_LAT = 3
-
-    ADDER_RES = 1.0/3.0
-    MULT_RES = 1./30.
-    DIV_RES = 0
-    COMP_RES = 0
-
-    SFTMAX_ADDER_RES = 1
-    SFTMAX_MULT_RES = 1
-    SFTMAX_COMP_RES = 1
-    SFTMAX_DIV_RES = 1
+    BFP16_ADDER_RES = 1.0/3.0
+    BFP16_MULT_RES = 1./30.
+    
+    FP16_ADDER_RES = 200
+    FP16_MULT_RES = 100
+    FP16_COMP_RES = 10
+    FP16_DIV_RES = 100
 
     WORD_SIZE = 2
 
@@ -621,12 +664,13 @@ class BertModel:
         exps = []
 
         with open(atten_path, "rb") as attention_file:
-            atten_len, _ = (np.load(attention_file))[0], []
-        
-        with open(exp_path, 'rb') as exps_file: 
-            for i in range(atten_len): exps.append(np.load(exps_file))
+            atten_len, all_attens = (np.load(attention_file))[0], []
+            for i in range(atten_len): all_attens.append(np.load(attention_file))
 
-        self.exps = exps
+        # with open(exp_path, 'rb') as exps_file: 
+        #     for i in range(atten_len): exps.append(np.load(exps_file))
+
+        self.exps = all_attens
 
     def qkv_size(self):
         '''
@@ -651,13 +695,21 @@ class BertModel:
         att_size *= self.WORD_SIZE / pow(1024, 3)
         return att_size
 
-    def probe_exps(self):
+    def probe_exps(self, num_samples = -1):
+        '''
+        extracting features of the exponential function outputs inside the softmax
+        '''
+        if num_samples == -1:
+            num_samples = len(self.exps)
+
+        dat_sampled = random.sample(self.exps, num_samples)
+        
+        # num zeros in each head
         fig, ax = plt.subplots(1, 1, figsize=(24, 4))
         indices = ["{}".format(i+1) for i in range(144)]
         for i in range(144):
             if i%12 == 6: indices[i] = "layer {}".format(int(i/12) + 1)
 
-        dat_sampled = random.sample(self.exps, 10)
         for dat in dat_sampled:
             print(dat.shape)
             num_zeros = np.count_nonzero((dat == 0.), axis=-1) / dat.shape[-1]
@@ -687,8 +739,36 @@ class BertModel:
         fig.savefig('res_fig/exps_count_zeros.png')
         plt.clf()
 
+        #distribution of the nonzero numbers inside the exp dat
+        fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+        nonzero_per_row = []
+        for dat in dat_sampled:
+            new_nonzero_per_row = np.count_nonzero(dat, axis=-1).flatten()
+            nonzero_per_row.append(new_nonzero_per_row)
+
+        nonzero_per_row = np.concatenate(nonzero_per_row)
+        # calculate ratio of none zeros
+        ratio_nzeros = (nonzero_per_row > 30).sum() / nonzero_per_row.size
+        print("ratio of #none-zeros larger than 30: ", ratio_nzeros)
+        # calculate lengths of nonzeros larger than 30
+        nonzero_large = nonzero_per_row[nonzero_per_row > 30]
+        print("average/std len of nonzeros larger than 30: ", np.mean(nonzero_large), np.std(nonzero_large))
+        # calculate zeros
+        ratio_zeros = (nonzero_per_row == 0).sum() / nonzero_per_row.size
+        print("proportion of zeros: ", ratio_zeros)
+        hists, bins, _ = ax.hist(nonzero_per_row, bins=40, range=(0, self.max_seq_len), weights=[1./nonzero_per_row.size]*nonzero_per_row.size)
+        print("summation of the hists: ", sum(hists))
+        ax.grid(linestyle='--', color='grey', alpha=0.4)
+        ax.set_xlabel("#nonzero values")
+        ax.set_ylabel("#rows")
+        ax.set_xlim(xmin=0, xmax=self.max_seq_len)
+        ax.set_ylim(ymin=0)
+        fig.tight_layout()
+        fig.savefig("res_fig/exps_nonzero_dist.pdf")
+        plt.clf()
+
     def softmax_resources(self, p1, p2, l3, quant_bits, mvm_tcore):
-        exp_resources = p1 * (2 ** quant_bits - 1) * self.SFTMAX_COMP_RES
+        exp_resources = p1 * (2 ** quant_bits - 1) * self.FP16_COMP_RES
         exp_mem = p1 * (2 ** quant_bits * self.num_heads) / 2.0
         row_parallelism = self.max_seq_len / l3
 
@@ -697,7 +777,7 @@ class BertModel:
             adder_tree_adders += float(2 ** int(log2Down(rest_elems)))
             rest_elems -= float(2 ** int(log2Down(rest_elems)))
 
-        adder_tree_adders = ceil(self.SFTMAX_ADDER_RES * (p1-1))
+        adder_tree_adders = ceil(self.FP16_ADDER_RES * (p1-1))
 
         accu_mem = l3 * 2
         # counting the needed exp out buffer by p1 p2 and exp latency
@@ -706,7 +786,7 @@ class BertModel:
         theortical_max_elements = self.max_seq_len * l3
         # FIXME: lacking of the exp out buffer for the adder tree delay
         exp_out_buffer = (ceil(theortical_max_elements / p1) - ceil(theortical_max_elements / p2)) * p1
-        div_resources = p2 * self.SFTMAX_DIV_RES
+        div_resources = p2 * self.FP16_DIV_RES
         # FIXME: fixed mvm core size
         _, _, softmax_incycle_delayed, softmax_inputs_hiding = \
             self.softmax_incycles_lat_stratix((10, floor(mvm_tcore / (10+2))), (row_parallelism, p1))
@@ -739,7 +819,7 @@ class BertModel:
     def qp_exp_lat(self):
         lut_decoder_lat = 0.0
         lut_lat = 2.0
-        return self.COMP_LAT + lut_decoder_lat + lut_lat
+        return self.FP16_COMP_LAT + lut_decoder_lat + lut_lat
 
     def softmax_lat(self, exp_dat=None, p1=1., p2=1., exp_h=-1):
         '''
@@ -762,7 +842,7 @@ class BertModel:
         a_cols_1 = np.ceil(a_cols / p1)
         a_cols_2 = np.ceil(a_cols / p2)
         lat = self.qp_exp_lat()
-        lat += ((adder_tree_stages+1) * self.ADDER_LAT)
+        lat += ((adder_tree_stages+1) * self.FP16_ADDER_LAT)
 
         # check if extra exp out latency exists
         if p1 > p2:
@@ -804,27 +884,27 @@ class BertModel:
         '''
         computing the baseline softmax dsps and memories
         '''
-        exp_resource = self.SFTMAX_MULT_RES + self.SFTMAX_ADDER_RES
-        log_resource = self.SFTMAX_ADDER_RES
+        exp_resource = self.FP16_MULT_RES + self.FP16_ADDER_RES
+        log_resource = self.FP16_ADDER_RES
 
         tree_elems, rest_elems = 0.0, p
         while rest_elems > 1.0:
             tree_elems += float(2 ** int(log2Down(rest_elems)))
             rest_elems -= float(2 ** int(log2Down(rest_elems)))
         
-        res_all = (tree_elems + 1) * self.SFTMAX_COMP_RES
-        res_all += ceil(self.SFTMAX_ADDER_RES * p)
+        res_all = (tree_elems + 1) * self.FP16_COMP_RES
+        res_all += ceil(self.FP16_ADDER_RES * p)
         res_all += exp_resource * p
-        res_all += (tree_elems + 1) * self.SFTMAX_ADDER_RES
-        res_all += ceil(self.SFTMAX_ADDER_RES * 2 * p)
+        res_all += (tree_elems + 1) * self.FP16_ADDER_RES
+        res_all += ceil(self.FP16_ADDER_RES * 2 * p)
         res_all += exp_resource * p
         res_all += log_resource
 
         row_parallelism = np.ceil(self.max_seq_len/l)
         res_all *= row_parallelism
 
-        exp_lat = self.ADDER_LAT + self.MULT_LAT + 1 + 2
-        stg_2_lat = self.ADDER_LAT + exp_lat + (p-1) * self.ADDER_LAT + self.ADDER_LAT
+        exp_lat = self.FP16_ADDER_LAT + self.FP16_MULT_LAT + 1 + 2
+        stg_2_lat = self.FP16_ADDER_LAT + exp_lat + (p-1) * self.FP16_ADDER_LAT + self.FP16_ADDER_LAT
 
         # FIXME: fixed mvm core shape
         _, _, softmax_incycle_delayed, softmax_inputs_hiding = \
@@ -846,20 +926,20 @@ class BertModel:
 
 
     def baseline_softmax_lat(self, exp_dat=None, pa=4., exp_h=-1, return_2ndstg_lat = False):
-        exp_lat = self.ADDER_LAT + self.MULT_LAT + 1 + 2
-        ln_lat = 2 + self.ADDER_LAT
+        exp_lat = self.FP16_ADDER_LAT + self.FP16_MULT_LAT + 1 + 2
+        ln_lat = 2 + self.FP16_ADDER_LAT
 
         dat_h = exp_h if exp_dat is None else exp_dat.shape[0]
         dat_h = self.max_seq_len if dat_h < 0 else dat_h
         dat_w = self.max_seq_len if exp_dat is None else exp_dat.shape[1]
         
-        stg_1_lat = log2Up(pa) * self.COMP_LAT
+        stg_1_lat = log2Up(pa) * self.FP16_COMP_LAT
         # stg_1_lat += max(self.COMP_LAT, dat_h-1) * (ceil(dat_w / pa) - 1)
 
-        stg_2_lat = self.ADDER_LAT + exp_lat + log2Up(pa) * self.ADDER_LAT + self.ADDER_LAT
+        stg_2_lat = self.FP16_ADDER_LAT + exp_lat + log2Up(pa) * self.FP16_ADDER_LAT + self.FP16_ADDER_LAT
         # stg_2_lat += max(self.ADDER_LAT, dat_h-1) * (ceil(dat_w / pa) - 1)
 
-        stg_3_lat = ln_lat + self.ADDER_LAT + exp_lat
+        stg_3_lat = ln_lat + self.FP16_ADDER_LAT + exp_lat
         stg_3_lat += dat_h * dat_w / pa
 
         pipeline_lat = stg_1_lat + stg_2_lat + stg_3_lat
@@ -868,6 +948,52 @@ class BertModel:
             return stg_2_lat
         else:
             return pipeline_lat
+
+    def layernorm_res(self, row_parallel, p):
+        '''
+        compute layer norm resources
+        '''
+        # adder tree cost
+        adder_tree_adders, rest_elems = 0.0, p
+        while rest_elems > 1.0:
+            adder_tree_adders += float(2 ** int(log2Down(rest_elems)))
+            rest_elems -= float(2 ** int(log2Down(rest_elems)))
+
+        adder_tree_adders = ceil(self.FP16_ADDER_RES * (p-1))
+
+        dsps = adder_tree_adders + self.FP16_ADDER_RES + self.FP16_MULT_RES
+        dsps += (self.FP16_ADDER_RES + self.FP16_MULT_RES) * p + adder_tree_adders + self.FP16_ADDER_RES + self.FP16_MULT_RES
+        dsps += (self.FP16_MULT_RES *3 + self.FP16_ADDER_RES) * p
+
+        return dsps
+
+
+    def layernorm_latency(self, row_parallel, p, mat_blk=(64.0, 64.0)):
+        '''
+        compute layer norm latency
+        '''
+        r = ceil(mat_blk[0] / row_parallel)
+        tree_elems, rest_elems = 0.0, p
+        while rest_elems > 1.0:
+            tree_elems += float(2 ** int(log2Down(rest_elems)))
+            rest_elems -= float(2 ** int(log2Down(rest_elems)))
+        
+        adder_tree_lat = (tree_elems + 1) * self.FP16_ADDER_LAT
+
+        # FIXME: maybe need to change the mult here to a shifter
+        stg1_lat = adder_tree_lat + self.FP16_ADDER_LAT + self.FP16_MULT_LAT
+        # input row lat
+        stg1_hidden_lat = max(self.FP16_ADDER_LAT, r)
+        stg1_input_cycle = stg1_hidden_lat * ceil(mat_blk[1]/p)
+        # FIXME: consider to change the 2nd multipler to a special square unit
+        stg2_lat = self.FP16_ADDER_LAT + self.FP16_MULT_LAT + adder_tree_lat + \
+                    self.FP16_ADDER_LAT + self.FP16_MULT_LAT + 2
+        stg2_hidden_lat = max(self.FP16_ADDER_LAT, r)
+        stg2_input_cycle = stg2_hidden_lat * ceil(mat_blk[1]/p)
+        stg3_lat = self.FP16_SQRT_LAT + self.FP16_MULT_LAT * 2 + self.FP16_ADDER_LAT
+
+        res = stg1_lat + stg1_input_cycle + stg2_lat + stg2_input_cycle + stg3_lat
+        return res
 
     def matmul_lat_qkv_per_head(self, seq_len, blk=(64.0, 64.0), ideal=False):
         if self.exps is not None:
@@ -1001,6 +1127,23 @@ class BertModel:
             dpu_model = StratixDpuModel(seq_len, seq_len, seq_len, (self.embd_size / self.num_heads), num_tcs=num_tcs)
             return dpu_model.compute_lat_teardown(cascade_len, ideal=ideal)
 
+    def matmul_lat_sparse_vatt_per_head_stratix(self, seq_len, cascade_len, num_tcs, ideal=False):
+        if self.exps is not None:
+            # print(__name__+": using acutal size of exp")
+            actual_seq_len = [i.shape[-1] for i in self.exps]
+            
+            in_cycles, out_lats = [], []
+            for l in actual_seq_len:
+                dpu_model = StratixDpuModel(l, l*0.2, l*0.2, (self.embd_size / self.num_heads), num_tcs=num_tcs)
+                in_cycle, out_lat = dpu_model.compute_lat_teardown(cascade_len, ideal=ideal)
+                in_cycles.append(in_cycle)
+                out_lats.append(out_lat)
+
+            return np.mean(in_cycles), np.mean(out_lats)
+        else:
+            dpu_model = StratixDpuModel(seq_len, seq_len*0.2, seq_len*0.2, (self.embd_size / self.num_heads), num_tcs=num_tcs)
+            return dpu_model.compute_lat_teardown(cascade_len, ideal=ideal)
+
     def matmul_lat_selfatt_out_stratix(self, seq_len, cascade_len, num_tcs, ideal=False):
         if self.exps is not None:
             # print(__name__+": using acutal size of exp")
@@ -1017,6 +1160,41 @@ class BertModel:
         else:
             dpu_model = StratixDpuModel(seq_len, self.embd_size, self.embd_size, self.embd_size, num_tcs=num_tcs)
             return dpu_model.compute_lat_teardown(cascade_len, ideal=ideal)
+
+    def matmul_lat_post_att_fcs0_stratix(self, seq_len, cascade_len, num_tcs, ideal=False):
+        if self.exps is not None:
+            # print(__name__+": using acutal size of exp")
+            actual_seq_len = [i.shape[-1] for i in self.exps]
+            
+            in_cycles, out_lats = [], []
+            for l in actual_seq_len:
+                dpu_model = StratixDpuModel(l, 768, 768, 3072, num_tcs=num_tcs)
+                in_cycle, out_lat = dpu_model.compute_lat_teardown(cascade_len, ideal=ideal)
+                in_cycles.append(in_cycle)
+                out_lats.append(out_lat)
+
+            return np.mean(in_cycles), np.mean(out_lats)
+        else:
+            dpu_model = StratixDpuModel(seq_len, 768, 768, 3072, num_tcs=num_tcs)
+            return dpu_model.compute_lat_teardown(cascade_len, ideal=ideal)
+
+    def matmul_lat_post_att_fcs1_stratix(self, seq_len, cascade_len, num_tcs, ideal=False):
+        if self.exps is not None:
+            # print(__name__+": using acutal size of exp")
+            actual_seq_len = [i.shape[-1] for i in self.exps]
+            
+            in_cycles, out_lats = [], []
+            for l in actual_seq_len:
+                dpu_model = StratixDpuModel(l, 3072, 3072, 768, num_tcs=num_tcs)
+                in_cycle, out_lat = dpu_model.compute_lat_teardown(cascade_len, ideal=ideal)
+                in_cycles.append(in_cycle)
+                out_lats.append(out_lat)
+
+            return np.mean(in_cycles), np.mean(out_lats)
+        else:
+            dpu_model = StratixDpuModel(seq_len, 3072, 3072, 768, num_tcs=num_tcs)
+            return dpu_model.compute_lat_teardown(cascade_len, ideal=ideal)
+    
 
     def att_v_outer_product_intermediate_size(self):
         if self.exps is not None:
@@ -1161,6 +1339,21 @@ class BertModel:
         
         return res, softmax_compute_hiding
 
+    def attention_linearfunc_lat_stratix(self, mvm_tcore: float):
+        equi_mvm_blk_size = (10, floor(mvm_tcore / (10+2)))
+        # last step: FC layer for output
+        postatt_fc0_incycles, postatt_fc0_compute_delay = \
+            self.matmul_lat_post_att_fcs0_stratix(self.max_seq_len, equi_mvm_blk_size[0], equi_mvm_blk_size[1], ideal=True)
+        postatt_fc1_incycles, postatt_fc1_compute_delay = \
+            self.matmul_lat_post_att_fcs1_stratix(self.max_seq_len, equi_mvm_blk_size[0], equi_mvm_blk_size[1], ideal=True)
+
+        post_att_fc_lat = postatt_fc0_compute_delay + postatt_fc1_compute_delay + postatt_fc0_incycles
+        ln_layer = self.layernorm_latency(2, 6, mat_blk=(self.max_seq_len, 768))
+
+        print("ln layers {}, post att fc latency {}".format(ln_layer, post_att_fc_lat))
+        print("ratio: {}".format(ln_layer / (ln_layer + post_att_fc_lat)))
+        return 
+
     def attention_mvm_only_lat_stratix(self, mvm_tcore: float):
         '''
         compute mvm only latency of the attention, used to estimate dynamic utilization of the mvm unit.
@@ -1247,6 +1440,23 @@ class BertModel:
     
 
 if __name__ == '__main__':
-    bert_hw_model = BertModel(read_exp_samples=False)
-    bert_hw_model.probe_exps()
+    bert_hw_model_d = BertModel(read_exp_samples=False, num_layers=12, num_heads=12, max_seq_len=320)
+    bert_hw_model_s = BertModel(read_exp_samples=True)
+    bert_hw_model_s.probe_exps()
+    exit()
+
+    stratix_dpu_d = StratixDpuModel(bert_hw_model_d.max_seq_len, bert_hw_model_d.max_seq_len, bert_hw_model_d.max_seq_len, bert_hw_model_d.embd_size / bert_hw_model_d.num_heads, freq=500, num_tcs=3960)
+
+    all_mvm_lat_s = []
+    for exps in bert_hw_model_s.exps:
+        for l in exps:
+            for h in l:
+                stratix_dpu_s = StratixDpuModel(bert_hw_model_d.max_seq_len, bert_hw_model_d.max_seq_len, bert_hw_model_d.max_seq_len, bert_hw_model_d.embd_size / bert_hw_model_d.num_heads, exp_dat=h, freq=500, num_tcs=3960)
+                all_mvm_lat_s.append(stratix_dpu_s.compute_lat(10, ideal=False))
+
+    mvm_lat_d = stratix_dpu_d.compute_lat(10, ideal=False)
+    mvm_lat_s = np.average(all_mvm_lat_s)
+
+    print(mvm_lat_d, mvm_lat_s)
+
     # print("Tflops: ", 2 * tensor_mat_flops(20, 7, 2))

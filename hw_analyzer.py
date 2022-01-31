@@ -10,6 +10,7 @@ from textwrap import wrap
 
 from itertools import product
 from numpy.core.fromnumeric import sort
+from torch.nn.modules.normalization import LayerNorm
 from tqdm import tqdm
 import logging
 
@@ -517,7 +518,7 @@ def compare_mvm_ratio_with_latency_with_given_dsps(bert_hw_model: BertModel, dsp
         softmax_p = softmax_possible_p[-1]
         qktrans_incycle, qk_trans_addertree, qk_trans_adder = \
             bert_hw_model.matmul_lat_qktrans_per_head_stratix(320, blk=(mvm_block_height, mvm_block_width))
-        qk_trans_lat = qk_trans_addertree + qk_trans_adder + bert_hw_model.DIV_LAT
+        qk_trans_lat = qk_trans_addertree + qk_trans_adder + bert_hw_model.FP16_DIV_LAT
 
         softmax_lat = np.mean([qk_trans_lat + bert_hw_model.baseline_softmax_lat(h, softmax_p) for h in real_exp_data])
         # softmax_lat = qk_trans_lat + bert_hw_model.baseline_softmax_lat(pa=softmax_p)
@@ -562,7 +563,7 @@ def compare_mvm_ratio_with_latency_with_given_dsps(bert_hw_model: BertModel, dsp
     softmax_possible_p = [p for p in softmax_p if bert_hw_model.baseline_softmax_resource(p, bert_hw_model.max_seq_len)[0] < max_softmax_dsp]
     qktrans_incycle, qk_trans_addertree, qk_trans_adder = \
             bert_hw_model.matmul_lat_qktrans_per_head(320, blk=(mvm_block_height, mvm_block_width))
-    qk_trans_lat = qk_trans_addertree + qk_trans_adder + bert_hw_model.DIV_LAT
+    qk_trans_lat = qk_trans_addertree + qk_trans_adder + bert_hw_model.FP16_DIV_LAT
     softmax_lat = [np.mean([qk_trans_lat + bert_hw_model.baseline_softmax_lat(h, p) for h in real_exp_data]) for p in softmax_possible_p]
     softmax_lat = np.array(softmax_lat)
 
@@ -836,17 +837,20 @@ def sweep_mvm_softmax_ratio(bert_hw_model: BertModel, num_dsps = 6840.0, \
     return {'lat': np.amin(baseline_dat), 'mvm_util': min_baseline_mvm_dynautil}, \
             {'lat': np.amin(sparse_softmax_dat), 'mvm_util': min_sparse_mvm_dynautil}
 
-def explore_softmax_hiding_during_selfatt(bert_hw_model: BertModel, num_dsps, plot_res=True):
+def explore_softmax_hiding_during_selfatt(bert_hw_model: BertModel, num_dsps, max_softmax_dsps, plot_res=True):
     '''
     sweeping across different mvm/softmax ratio
     '''
-    num_mvm_dsps_candidates = np.arange(100, num_dsps, floor((num_dsps-100)/6))
+    num_mvm_dsps_candidates = np.arange(100, num_dsps, floor((num_dsps-100)/80))
 
     baseline_dat, sparse_softmax_dat = [], []
     actual_s_mvm_dsps, actual_b_mvm_dsps = [], []
     for mvm_dsp in tqdm(num_mvm_dsps_candidates):
-        softmax_dsps = 400
-        softmax_dsp_step = 10
+        if mvm_dsp > 6000:
+            logging.info("mvm size lager than 6k")
+
+        softmax_dsps = max_softmax_dsps
+        softmax_dsp_step = 500
         last_possible_s_softmax_dsps, last_possible_b_softmax_dsps = 0, 0
         b_recorded, s_recorded = False, False
         while not (b_recorded and s_recorded) and softmax_dsps > 0:
@@ -892,6 +896,9 @@ def explore_softmax_hiding_during_selfatt(bert_hw_model: BertModel, num_dsps, pl
         matplotlib.rcParams.update({'xtick.labelsize': fsize})
         matplotlib.rcParams.update({'ytick.labelsize': fsize})
         matplotlib.rcParams['lines.markersize'] = 3
+
+        # baseline_dat = np.array(baseline_dat) / max_softmax_dsps
+        # sparse_softmax_dat = np.array(sparse_softmax_dat) / max_softmax_dsps
 
         ax.plot(actual_b_mvm_dsps, baseline_dat, linestyle='-', color='C1', marker='s', linewidth=1, alpha=0.8, label='baseline softmax')
         ax.plot(actual_s_mvm_dsps, sparse_softmax_dat, linestyle = '-', color='C0', marker='s', linewidth=1, alpha=0.5, label='sparse softmax')
@@ -1074,6 +1081,40 @@ def fpga2021_sweeping_explore():
     plt.cla()
 
 
+def check_stratix_layernorm_throughput_req(bert_hw_model: BertModel, mvm_tcore: float):
+    '''
+    assuming a single mvm engine on the chip, check if the layer norm 
+    can finish before the mvm engine requires the next group of inputs
+    '''
+    equi_mvm_blk_size = (10, floor(mvm_tcore / (10+2)))
+    # compute v x att lat
+    vatt_incycles, vatt_latency = bert_hw_model.matmul_lat_selfatt_out_stratix(bert_hw_model.max_seq_len, equi_mvm_blk_size[0], equi_mvm_blk_size[1], ideal=False)
+
+    layernorm_latency = bert_hw_model.layernorm_latency(4, 2, (bert_hw_model.max_seq_len, 768))
+
+    # check first ln throughput
+    att_fcout_to_next_lat = vatt_latency + bert_hw_model.BFP16_ADDER_LAT + layernorm_latency
+    if vatt_incycles < att_fcout_to_next_lat:
+        print("1st layer norm under utilization")
+
+    # compute 2nd fc layer lat
+    second_fc_incycles, second_fc_lat = bert_hw_model.matmul_lat_post_att_fcs1_stratix(bert_hw_model.max_seq_len, equi_mvm_blk_size[0], equi_mvm_blk_size[1])
+
+    second_fc_to_next_lat = second_fc_lat + bert_hw_model.BFP16_ADDER_LAT + layernorm_latency
+    if second_fc_incycles < second_fc_to_next_lat:
+        print("2nd layer norm under utilization")
+
+
+def compare_dense_sparse_v_att(bert_hw_model: BertModel, mvm_tcore: float):
+    equi_mvm_blk_size = (10, floor(mvm_tcore / (10+2)))
+    vatt_incycles, vatt_lat = bert_hw_model.matmul_lat_vatt_per_head_stratix(bert_hw_model.max_seq_len, equi_mvm_blk_size[0], equi_mvm_blk_size[1], ideal=True)
+
+    s_vatt_incycles, s_vatt_lat = bert_hw_model.matmul_lat_sparse_vatt_per_head_stratix(bert_hw_model.max_seq_len, equi_mvm_blk_size[0], equi_mvm_blk_size[1], ideal=True)
+
+    ratio = abs(s_vatt_incycles + s_vatt_lat - vatt_incycles - vatt_lat) / (vatt_incycles + vatt_lat)
+    print("sparse/dense vatt ratio: ", ratio)
+    pass
+
 if __name__ == '__main__':
     logging.basicConfig(level=logging.ERROR)
 
@@ -1108,7 +1149,9 @@ if __name__ == '__main__':
 
     # sweep_mvm_softmax_ratio(bert_hw_model, num_dsps=3960.0, \
     #      schedule=mvm_delayed_v_with_latency_with_given_dsps, lat_type="softmax")
-    explore_softmax_hiding_during_selfatt(bert_hw_model, num_dsps=20000, plot_res=True)
+    check_stratix_layernorm_throughput_req(bert_hw_model, 3960.0)
+    compare_dense_sparse_v_att(bert_hw_model, 3960)
+    explore_softmax_hiding_during_selfatt(bert_hw_model, num_dsps=10000, max_softmax_dsps=702720, plot_res=True)
 
     fpt20_model = StratixDpuModel(128, 1792+128, 1792+128, 1792, freq=300, num_tcs=3600)
     fpt20_tops = fpt20_model.tensor_fpt20_mat_flops(10, 7, 16, sym=True)
