@@ -102,8 +102,7 @@ def run_qa_pipeline(model_name: str, filter_inputs=True, single_input=True, samp
         "question-answering",
         model=model_name,
         tokenizer=model_name,
-        device=0,
-        config=AutoConfig(hidden_size=512, hidden_act="relu")
+        device=0
     )
 
     print("Running pipeline...")

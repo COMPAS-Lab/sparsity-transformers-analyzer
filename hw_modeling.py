@@ -1,3 +1,4 @@
+from itertools import chain, compress
 from math import ceil, floor, exp, log2, gcd, sqrt, pow
 from re import template
 import numpy as np
@@ -6,6 +7,7 @@ import random
 import sys, logging
 from numpy.core.fromnumeric import nonzero, size
 import sympy as sp
+import skimage.measure
 
 log = logging.getLogger(__name__)
 
@@ -107,10 +109,29 @@ class DpuModel:
         mem_usage = self.b_w * self.b_h * self.WORD_SIZE / 1024.
         return dpu_mults * self.MULT_RES + dpu_adders * self.ADDER_RES, mem_usage
 
-    def total_ops(self, exp_dat=None):
+    def total_ops(self, exp_dat=None, chain_len=-1, compress_row=False, ideal=False):
         if exp_dat is None:
             return  self.a_h * self.a_w * 2 * self.b_w
-        else:
+        
+        if chain_len > 0 and not compress_row:
+            b_size = chain_len * 10
+            dense_feature_map = skimage.measure.block_reduce(exp_dat, (3, b_size), np.sum)
+            single_block_ops = b_size * 2 * self.b_w * 3
+            num_dense_grps = np.count_nonzero(dense_feature_map, axis=-1)
+            total_ops = num_dense_grps.shape[0] * np.amax(num_dense_grps) * single_block_ops
+            return total_ops
+
+        if chain_len > 0 and compress_row:
+            b_size = 10
+            single_block_ops = b_size * 2 * self.b_w * 3
+            dense_feature_map = skimage.measure.block_reduce(exp_dat, (3, b_size), np.sum)
+            num_dense_grps = np.count_nonzero(dense_feature_map, axis=-1)
+            compressed_dense_feature_map = num_dense_grps % chain_len
+            total_ops = compressed_dense_feature_map.shape[0] * \
+                            np.amax(compressed_dense_feature_map) * single_block_ops
+            return total_ops
+        
+        if ideal:
             # count none zeros per row
             none_zeros = np.count_nonzero(exp_dat, axis=-1)
             # mimicing the padding zeros to every 3 rows
@@ -368,7 +389,7 @@ class StratixDpuModel(DpuModel):
             
         return flops
 
-    def tensor_fpga21_mat_flops(self, cascade_len, sym=False, ideal: bool=False):
+    def tensor_fpga21_mat_flops(self, cascade_len, sym=False, ideal=False):
         ''' 
         compute flops with a given number of cascaded chain and b cols
         a loading grps: the number of groups that a chain is responsible for along the a rows.
@@ -382,6 +403,7 @@ class StratixDpuModel(DpuModel):
             matB_size = (self.b_h, self.b_w)
 
             total_ops =  self.total_ops()
+            
             chain_loading_lat = 3 * (cascade_len + 1)
             block_matA_size = (3, matA_size[1])
             block_matB_size = (matA_size[1], chain_loading_lat)
@@ -389,8 +411,11 @@ class StratixDpuModel(DpuModel):
 
             compute_block_ops = block_matA_size[0] * block_matA_size[1] * 2 * block_matB_size[1]
             
-            total_latency = chain_loading_lat + chain_loading_lat * a_loading_grps + \
-                                4 + cascade_len * 2
+            # compute the latency of a block: 
+            # init load + computation that can be hidden by B loading + TC core latency 
+            #   + sum chain latency + accumulation latency from cascade input to output
+            total_latency = chain_loading_lat + (chain_loading_lat-3) * a_loading_grps + \
+                                4 + cascade_len * 2 + 2
 
             num_cores = round(self.NUM_TCs / (cascade_len + 2))
             num_blocks = round(total_ops / compute_block_ops)
@@ -431,6 +456,43 @@ class StratixDpuModel(DpuModel):
 
         return flops
 
+    def tensor_fpga21_mat_sparse_flops(self, sampled_exp, cascade_len, ideal=False):
+        ''' 
+        compute flops with a given number of cascaded chain and b cols
+        a loading grps: the number of groups that a chain is responsible for along the a rows.
+        assuming a chain must finish 3 entire A rows at least.
+        '''
+
+        round = lambda x: x if ideal else ceil(x)
+
+        matA_size = (self.a_h, self.a_w)
+        matB_size = (self.b_h, self.b_w)
+
+        total_ops =  self.total_ops(sampled_exp, chain_len=cascade_len)
+        
+        chain_loading_lat = 3 * (cascade_len + 1)
+        block_matA_size = (3, matA_size[1])
+        block_matB_size = (matA_size[1], chain_loading_lat)
+        a_loading_grps = round(matA_size[1] / (cascade_len * 10))
+
+        compute_block_ops = block_matA_size[0] * block_matA_size[1] * 2 * block_matB_size[1]
+        
+        # compute the latency of a block: 
+        # init load + computation that can be hidden by B loading + TC core latency 
+        #   + sum chain latency + accumulation latency from cascade input to output
+        total_latency = chain_loading_lat + (chain_loading_lat-3) * a_loading_grps + \
+                            4 + cascade_len * 2 + 2
+
+        num_cores = round(self.NUM_TCs / (cascade_len + 2))
+        num_blocks = round(total_ops / compute_block_ops)
+        pipeline_iters = round(num_blocks / num_cores)
+        total_latency *= pipeline_iters * 1./self.FREQ * 1e-6
+
+        # print("num_cores for fpga 21: ", num_cores)
+
+        flops = total_ops / total_latency / 1e12
+        return flops
+    
     def ideal_tops(self):
         ops = (10*2*3) * self.NUM_TCs
         latency = 1/self.FREQ * 1e-6
@@ -1440,9 +1502,12 @@ class BertModel:
     
 
 if __name__ == '__main__':
-    bert_hw_model_d = BertModel(read_exp_samples=False, num_layers=12, num_heads=12, max_seq_len=320)
-    bert_hw_model_s = BertModel(read_exp_samples=True)
-    bert_hw_model_s.probe_exps()
+    # bert_hw_model_d = BertModel(read_exp_samples=False, num_layers=12, num_heads=12, max_seq_len=320)
+    # bert_hw_model_s = BertModel(read_exp_samples=True)
+    # bert_hw_model_s.probe_exps()
+
+    chain_test_model = StratixDpuModel(3*3960/5, 90, 90, 9)
+    print("chain_flops: ", chain_test_model.tensor_fpga21_mat_flops(3))
     exit()
 
     stratix_dpu_d = StratixDpuModel(bert_hw_model_d.max_seq_len, bert_hw_model_d.max_seq_len, bert_hw_model_d.max_seq_len, bert_hw_model_d.embd_size / bert_hw_model_d.num_heads, freq=500, num_tcs=3960)
