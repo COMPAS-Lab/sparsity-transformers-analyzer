@@ -6,7 +6,6 @@ import matplotlib.pyplot as plt
 import random
 import sys, logging
 from numpy.core.fromnumeric import nonzero, size
-import sympy as sp
 import skimage.measure
 
 log = logging.getLogger(__name__)
@@ -123,10 +122,10 @@ class DpuModel:
 
         if chain_len > 0 and compress_row:
             b_size = 10
-            single_block_ops = b_size * 2 * self.b_w * 3
+            single_block_ops = b_size * chain_len * 2 * self.b_w * 3
             dense_feature_map = skimage.measure.block_reduce(exp_dat, (3, b_size), np.sum)
             num_dense_grps = np.count_nonzero(dense_feature_map, axis=-1)
-            compressed_dense_feature_map = num_dense_grps % chain_len
+            compressed_dense_feature_map = np.ceil(num_dense_grps / chain_len)
             total_ops = compressed_dense_feature_map.shape[0] * \
                             np.amax(compressed_dense_feature_map) * single_block_ops
             return total_ops
@@ -456,7 +455,7 @@ class StratixDpuModel(DpuModel):
 
         return flops
 
-    def tensor_fpga21_mat_sparse_flops(self, sampled_exp, cascade_len, ideal=False):
+    def tensor_fpga21_mat_sparse_flops(self, cascade_len, compress_row=False, ideal=False):
         ''' 
         compute flops with a given number of cascaded chain and b cols
         a loading grps: the number of groups that a chain is responsible for along the a rows.
@@ -468,7 +467,7 @@ class StratixDpuModel(DpuModel):
         matA_size = (self.a_h, self.a_w)
         matB_size = (self.b_h, self.b_w)
 
-        total_ops =  self.total_ops(sampled_exp, chain_len=cascade_len)
+        total_ops =  self.total_ops(exp_dat=self.__exp_dat, compress_row=compress_row, chain_len=cascade_len)
         
         chain_loading_lat = 3 * (cascade_len + 1)
         block_matA_size = (3, matA_size[1])
@@ -490,6 +489,8 @@ class StratixDpuModel(DpuModel):
 
         # print("num_cores for fpga 21: ", num_cores)
 
+        #FIXME: may need to change total_ops to the total ops of the 
+        # mat mul
         flops = total_ops / total_latency / 1e12
         return flops
     
@@ -1503,11 +1504,23 @@ class BertModel:
 
 if __name__ == '__main__':
     # bert_hw_model_d = BertModel(read_exp_samples=False, num_layers=12, num_heads=12, max_seq_len=320)
-    # bert_hw_model_s = BertModel(read_exp_samples=True)
+    bert_hw_model_s = BertModel(read_exp_samples=True)
     # bert_hw_model_s.probe_exps()
 
-    chain_test_model = StratixDpuModel(3*3960/5, 90, 90, 9)
-    print("chain_flops: ", chain_test_model.tensor_fpga21_mat_flops(3))
+    for exps in bert_hw_model_s.exps:
+        for l_idx, l in enumerate(exps):
+            for h_idx, h in enumerate(l):
+                base_model = StratixDpuModel(h.shape[0], h.shape[1], h.shape[1], h.shape[0], \
+                                                exp_dat=h, freq=440, num_tcs=3960)
+                sparse_model = StratixDpuModel(h.shape[0], h.shape[1], h.shape[1], h.shape[0], \
+                                                exp_dat=h, freq=440, num_tcs=3960)
+                base_flops = base_model.tensor_fpga21_mat_sparse_flops(5, False, True)
+                sparse_flops = sparse_model.tensor_fpga21_mat_sparse_flops(5, True, True)
+                print("h{0}l{1}:".format(h_idx, l_idx), base_flops, "/", sparse_flops)
+                if sparse_flops < base_flops:
+                    print(h_idx, l_idx)
+                
+
     exit()
 
     stratix_dpu_d = StratixDpuModel(bert_hw_model_d.max_seq_len, bert_hw_model_d.max_seq_len, bert_hw_model_d.max_seq_len, bert_hw_model_d.embd_size / bert_hw_model_d.num_heads, freq=500, num_tcs=3960)
