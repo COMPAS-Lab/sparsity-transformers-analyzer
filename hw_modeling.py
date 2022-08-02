@@ -5,10 +5,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 import random
 import sys, logging
-from numpy.core.fromnumeric import nonzero, size
 import skimage.measure
+import logging
 
-log = logging.getLogger(__name__)
+logging.basicConfig(filename='hw_modeling.log', filemode='w', format='%(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 class OutOfResourceError(Exception):
     pass
@@ -108,6 +108,11 @@ class DpuModel:
         mem_usage = self.b_w * self.b_h * self.WORD_SIZE / 1024.
         return dpu_mults * self.MULT_RES + dpu_adders * self.ADDER_RES, mem_usage
 
+    # help functions for sparsity
+    def get_density_per_row(self, dat):
+        row_density = np.sum(dat > 0.0, axis=-1)
+        return row_density
+
     def total_ops(self, exp_dat=None, chain_len=-1, compress_row=False, ideal=False):
         if exp_dat is None:
             return  self.a_h * self.a_w * 2 * self.b_w
@@ -169,10 +174,14 @@ class StratixDpuModel(DpuModel):
     WORD_SIZE = 1
 
     FREQ = 500.0
+    NUM_TCC_ROWS = 0.0
+    NUM_TCC_COLS = 0.0
+    CHAIN_LEN = 0.0
     NUM_TCs = 3960.0
+    TCCORE_SIZE = 10
     __exp_dat = None
 
-    def __init__(self, a_h, a_w, b_h, b_w, exp_dat=None, freq=0.0, num_tcs=0.0):
+    def __init__(self, a_h, a_w, b_h, b_w, exp_dat=None, freq=0.0, num_tcs=0.0, tcc_array_shape=None, tcc_chainlen = 0.0):
         super().__init__(a_h, a_w, b_h, b_w, 16, 16)
         if exp_dat is not None:
             self.__exp_dat = exp_dat
@@ -180,6 +189,13 @@ class StratixDpuModel(DpuModel):
             self.FREQ = freq
         if num_tcs > 0:
             self.NUM_TCs = num_tcs
+        if tcc_array_shape is not None:
+            self.NUM_TCC_ROWS, self.NUM_TCC_COLS = tcc_array_shape
+        if tcc_chainlen > 0:
+            self.CHAIN_LEN = tcc_chainlen
+
+    def set_tccore_size(self, size): 
+        self.TCCORE_SIZE = size
         
     # derived parameters
     def compute_lat(self, cascade_len: int, ideal=False):
@@ -406,7 +422,7 @@ class StratixDpuModel(DpuModel):
             chain_loading_lat = 3 * (cascade_len + 1)
             block_matA_size = (3, matA_size[1])
             block_matB_size = (matA_size[1], chain_loading_lat)
-            a_loading_grps = round(matA_size[1] / (cascade_len * 10))
+            a_loading_grps = round(matA_size[1] / (cascade_len * self.TCCORE_SIZE))
 
             compute_block_ops = block_matA_size[0] * block_matA_size[1] * 2 * block_matB_size[1]
             
@@ -419,11 +435,12 @@ class StratixDpuModel(DpuModel):
             num_cores = round(self.NUM_TCs / (cascade_len + 2))
             num_blocks = round(total_ops / compute_block_ops)
             pipeline_iters = round(num_blocks / num_cores)
-            total_latency *= pipeline_iters * 1./self.FREQ * 1e-6
+            total_latency *= pipeline_iters
+            time_latency = total_latency * 1./self.FREQ * 1e-6
 
             # print("num_cores for fpga 21: ", num_cores)
 
-            flops = total_ops / total_latency / 1e12
+            flops = total_ops / time_latency / 1e12
         else:
             # simplify the equation and export latex code
             mA_row, mA_col, mB_col = sp.symbols('arow acol bcol')
@@ -434,7 +451,7 @@ class StratixDpuModel(DpuModel):
             chain_loading_lat = 3 * (cas_len + 1)
             block_matA_size = (3, mA_col)
             block_matB_size = (mA_col, chain_loading_lat)
-            a_loading_grps = (mA_col / (cas_len * 10))
+            a_loading_grps = (mA_col / (cas_len * self.TCCORE_SIZE))
 
             compute_block_ops = block_matA_size[0] * block_matA_size[1] * 2 * block_matB_size[1]
             
@@ -453,46 +470,99 @@ class StratixDpuModel(DpuModel):
 
             flops = sp.latex(flops)
 
-        return flops
+        return flops, total_latency
 
-    def tensor_fpga21_mat_sparse_flops(self, cascade_len, compress_row=False, ideal=False):
+    def tensor_fpga21_mat_sparse_flops(self, sparse_mat, sort_rows_by_sparsity=False, ideal=False, using_single_column=False, sparse_block_size = 10.0):
         ''' 
-        compute flops with a given number of cascaded chain and b cols
-        a loading grps: the number of groups that a chain is responsible for along the a rows.
-        assuming a chain must finish 3 entire A rows at least.
+        compute flops and latency with a given number of cascaded chain and b cols
+        considering skipping the zeros in the mat A
+        sort_rows_by_sparsity: if sorting the rows to increase loading regularity
+        using_single_column: if using only 1/3 of the columns in the tc
+        sparse_block_size: size of the sparse block size to reduce the loading irregularity
         '''
-
         round = lambda x: x if ideal else ceil(x)
 
-        matA_size = (self.a_h, self.a_w)
-        matB_size = (self.b_h, self.b_w)
+        def check_a_loading_iterations(mat):
+            split_nonezeros = np.split(mat, np.arange(3, mat.size, 3))
+            max_none_zeros_per_grp = np.array([np.amax(i) for i in split_nonezeros])
+            # calculate number of iterations to load each 3-row groups
+            mat_a_loading_iterations = max_none_zeros_per_grp / (self.CHAIN_LEN * self.TCCORE_SIZE)
+            # check if we can finish all groups within 1 bigger iteration
+            tcc_loading_iters = np.split(mat_a_loading_iterations, \
+                                    np.arange(self.NUM_TCC_COLS, mat_a_loading_iterations.size, self.NUM_TCC_COLS))
+            # ...and test how many iterations we need in all
+            mat_a_loading_iterations = np.sum(np.ceil(np.array([np.amax(i) for i in tcc_loading_iters])))
+            return mat_a_loading_iterations
 
-        total_ops =  self.total_ops(exp_dat=self.__exp_dat, compress_row=compress_row, chain_len=cascade_len)
-        
-        chain_loading_lat = 3 * (cascade_len + 1)
-        block_matA_size = (3, matA_size[1])
-        block_matB_size = (matA_size[1], chain_loading_lat)
-        a_loading_grps = round(matA_size[1] / (cascade_len * 10))
+        # sort rows based on the sparsity if sorting is enabled
+        if sort_rows_by_sparsity:
+            sorted_sparse_mat = sparse_mat[(sparse_mat == 0.0).sum(axis=-1).argsort()]
+            sparse_mat = sorted_sparse_mat
 
-        compute_block_ops = block_matA_size[0] * block_matA_size[1] * 2 * block_matB_size[1]
-        
-        # compute the latency of a block: 
-        # init load + computation that can be hidden by B loading + TC core latency 
-        #   + sum chain latency + accumulation latency from cascade input to output
-        total_latency = chain_loading_lat + (chain_loading_lat-3) * a_loading_grps + \
-                            4 + cascade_len * 2 + 2
+        # count none zeros per row, mimicing the padding zeros to every 3 rows
+        # we need to split it into chunks of bfp groups because only when a group that's entirely
+        # zero can be ignored
+        none_zeros = []
+        if using_single_column:
+            # if only using one column, there's no need to block the matrix
+            none_zeros = np.count_nonzero(sparse_mat, axis=-1)
+            max_none_zeros_per_grp = none_zeros
+        else:
+            # if using all three columns, the matrix is blocked into 3xtc core size blocks.
+            # find the max latency of each block which uses most of the time.
+            # first pad the rows to be divisible by 3
+            zeros_padded = sparse_mat.shape[0] % 3
+            if zeros_padded > 0:
+                sparse_mat = np.pad(sparse_mat, (0, 3 - zeros_padded), "constant", constant_values=0)
+            # then block them into 3xtc core size and select the max length to compute delay
+            mat_in_row_grps = np.split(sparse_mat, np.arange(3, sparse_mat.shape[0], 3), axis=0)
+            for row_grp in mat_in_row_grps:
+                compressed_row_grp = []
+                row_blocks = np.split(row_grp, np.arange(sparse_block_size, row_grp.shape[1], sparse_block_size), axis=-1)
+                for block in row_blocks:
+                    if np.sum(block) != 0:
+                        compressed_row_grp.append(block)
 
-        num_cores = round(self.NUM_TCs / (cascade_len + 2))
-        num_blocks = round(total_ops / compute_block_ops)
-        pipeline_iters = round(num_blocks / num_cores)
-        total_latency *= pipeline_iters * 1./self.FREQ * 1e-6
+                compressed_row_grp = np.concatenate(compressed_row_grp, axis=-1)
+                # recover 3 columns
+                none_zeros += [compressed_row_grp.shape[-1]]
+            
+            max_none_zeros_per_grp = np.array(none_zeros)
 
-        # print("num_cores for fpga 21: ", num_cores)
+        # DEBUG: select fully dense matrices
+        # try:
+        #     assert(np.sum(none_zeros) == 384*384)
+        # except:
+        #     return 0, 10000, 0
 
-        #FIXME: may need to change total_ops to the total ops of the 
-        # mat mul
-        flops = total_ops / total_latency / 1e12
-        return flops
+        # split matA rows into groups, each one can be consumed by all the tc columns
+        mat_a_array_iter_grps = np.array_split(max_none_zeros_per_grp, round(max_none_zeros_per_grp.shape[0] / self.NUM_TCC_COLS))
+        # use max len of the row in the group to finish loading 
+        mat_a_to_load_in_row_grps = [np.amax(curr_mat_a_rows) for curr_mat_a_rows in mat_a_array_iter_grps]
+        mat_b_cols_used_to_hide_a_loading = floor(self.b_w / self.NUM_TCC_ROWS)
+        # figure out actual time of each group loading
+        mat_a_loading_latency = []
+        for max_a_loading in mat_a_to_load_in_row_grps:
+            chain_loading_a_lat = 0.0
+            a = max(self.CHAIN_LEN * 3, mat_b_cols_used_to_hide_a_loading)
+            if (self.CHAIN_LEN * 3) < mat_b_cols_used_to_hide_a_loading:
+                logging.info("mat b computing dominants the a loading")
+            
+            chain_loading_grps = round(max_a_loading / (self.CHAIN_LEN * self.TCCORE_SIZE))
+            chain_loading_a_lat = (chain_loading_grps-1) * a + (self.CHAIN_LEN + 1) * 3
+            mat_a_loading_latency.append(chain_loading_a_lat)
+
+        # compute the latency block by block
+        # first iteration of loading: including the latency of entry tc
+        total_latency = np.sum(np.array(mat_a_loading_latency))
+        total_latency += 4 + self.CHAIN_LEN * 2 + 2
+
+        # compute throughput
+        total_ops = self.a_h * self.a_w * 2 * self.b_w
+        time_latency = total_latency * 1./self.FREQ * 1e-6
+        flops = total_ops / time_latency / 1e12
+
+        return flops, total_latency
     
     def ideal_tops(self):
         ops = (10*2*3) * self.NUM_TCs
