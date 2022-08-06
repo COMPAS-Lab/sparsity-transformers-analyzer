@@ -121,8 +121,10 @@ def compute_matmul_performance(data_path, chain_len, out_w, hw_array_shape, \
 
     for exps in bfp_att_probes:
         print("dim: ", exps.shape)
+        # use a dense mat to calculate dens mat base lat
+        fake_dense_data = np.random.rand(exps.shape[0], exps.shape[1])
         base_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
-                                        freq=500, num_tcs=3960, tcc_array_shape=hw_array_shape, \
+                                        exp_dat=fake_dense_data, freq=500, num_tcs=3960, tcc_array_shape=hw_array_shape, \
                                         tcc_chainlen=chain_len)
         base_model.set_tccore_size(20)
         sparse_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
@@ -130,7 +132,9 @@ def compute_matmul_performance(data_path, chain_len, out_w, hw_array_shape, \
                                         tcc_chainlen=chain_len)
         sparse_model.set_tccore_size(20)
 
-        base_flops, base_lat = base_model.tensor_fpga21_mat_flops(chain_len, False, False)
+        base_flops, base_lat = base_model.tensor_fpga21_mat_sparse_flops(fake_dense_data, \
+                                                    sort_row_sparsity, False, \
+                                                    using_single_column=False, sparse_block_size=sparse_block_size)
         sparse_flops, sparse_lat = sparse_model.tensor_fpga21_mat_sparse_flops(exps, \
                                                     sort_row_sparsity, False, \
                                                     using_single_column, sparse_block_size)
@@ -170,7 +174,7 @@ def plot_perf_sparsity(data_path, output_path, chain_len_list, hw_array_shape_li
     plt.title(f"latency vs. sparsity{attached_to_fig_name}")
     plt.ylim(0.0, 1.0)
     plt.xlabel("sparsity")
-    plt.ylabel("latency (cycles)")
+    plt.ylabel("sparse latency/dense latency")
     plt.legend()
     plt.grid(linewidth=0.3)
     plt.savefig(output_path + "lat_sparsity" + sorted_fig_path + attached_to_fig_name + ".pdf")
@@ -308,9 +312,9 @@ def main():
     for l_idx, (fname, f_seq_len) in enumerate(zip(files_list, seq_len_list)):
         plot_perf_sparsity(data_path + fname, output_path, chain_len_list, \
                                 hw_array_shape_list, sort_row_sparsity=True, \
-                                using_single_column=False, sparse_block_size=1, \
+                                using_single_column=False, sparse_block_size=2, \
                                 seq_len_path=data_path+f_seq_len, seq_len_range=(200, 384), \
-                                attached_to_fig_name=f"_L{l_idx}_spblk_1")
+                                attached_to_fig_name=f"_L{l_idx}_spblk_2_advsort")
 
 if __name__ == "__main__":
     main()
