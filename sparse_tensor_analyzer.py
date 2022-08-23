@@ -117,10 +117,10 @@ def compute_matmul_performance(data_path, chain_len, out_w, hw_array_shape, \
         data = torch.load(data_path).cpu().detach().numpy()
         bfp_att_probes = list(data.reshape(-1, data.shape[-2], data.shape[-1]))
 
-    res = {"latency": [], "sparsity": [], "s2l ratio": [], "tp": []}
+    res = {"latency":[] ,"sparsity": [], "s2l ratio": [], "tp": []}
 
+    total_sparse_lat, total_base_lat, total_min_sparse_lat = 0, 0, 0
     for exps in bfp_att_probes:
-        print("dim: ", exps.shape)
         # use a dense mat to calculate dens mat base lat
         fake_dense_data = np.random.rand(exps.shape[0], exps.shape[1])
         base_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
@@ -138,8 +138,13 @@ def compute_matmul_performance(data_path, chain_len, out_w, hw_array_shape, \
         sparse_flops, sparse_lat = sparse_model.tensor_fpga21_mat_sparse_flops(exps, \
                                                     sort_row_sparsity, False, \
                                                     using_single_column, sparse_block_size)
+        min_sparse_flops, min_sparse_lat = sparse_model.tensor_fpga21_mat_sparse_flops(exps, \
+                                                    sort_row_sparsity, True, False, sparse_block_size, True)
         curr_sparsity = 1. - np.count_nonzero(exps) / exps.size
-        print(sparse_lat, base_lat, curr_sparsity)
+
+        total_sparse_lat += sparse_lat
+        total_base_lat += base_lat
+        total_min_sparse_lat += min_sparse_lat
         res["latency"].append(sparse_lat/base_lat)
         res["sparsity"].append(curr_sparsity)
         res["tp"].append(sparse_flops)
@@ -147,32 +152,34 @@ def compute_matmul_performance(data_path, chain_len, out_w, hw_array_shape, \
                 
     res_df = pd.DataFrame(res, columns=res.keys())
     res_df.sort_values(by=["sparsity"], inplace=True)
-    return res_df
+    return res_df, total_sparse_lat/total_base_lat, total_sparse_lat/total_min_sparse_lat
 
 def plot_perf_sparsity(data_path, output_path, chain_len_list, hw_array_shape_list, sort_row_sparsity, \
                             using_single_column, sparse_block_size, \
                             seq_len_path = None, seq_len_range = None, \
                             attached_to_fig_name=""):
-    res_df_list = []
+    res_df_list, relative_slat_list, slat_min_list = [], [], []
     sorted_fig_path = "_sorted" if sort_row_sparsity else "_unsorted"
 
     for chain_len, hw_array_shape in zip(chain_len_list, hw_array_shape_list):
-        res_df = compute_matmul_performance(data_path, chain_len, 768, \
+        res_df, relative_slat, slat_min = compute_matmul_performance(data_path, chain_len, 768, \
                                                             hw_array_shape, sort_row_sparsity, \
                                                             using_single_column, sparse_block_size, 
                                                             seq_len_path, seq_len_range)
         res_df_list.append(res_df)
+        relative_slat_list.append(relative_slat)
+        slat_min_list.append(slat_min)
     
     # plot latency vs sparsity
-    for idx, (chain_len, res_df) in enumerate(zip(chain_len_list, res_df_list)):
+    for idx, (chain_len, res_df, relative_slat) in enumerate(zip(chain_len_list, res_df_list, relative_slat_list)):
         plt.scatter(x=res_df["sparsity"], y=res_df["latency"], alpha=0.6, \
                             linewidth=0.1, linestyle='-', marker='s', color=f"C{idx}", label=f"chain len={chain_len}")
-        # plt.axhline(base_latency, linestyle='--', color=f'C{idx}', alpha=0.5)
-        plt.axvline(res_df["sparsity"].mean(), linestyle='--', color=f'C{idx}', alpha=0.5)
+        plt.axhline(relative_slat, linestyle='--', color=f'C{idx}', alpha=0.5)
+        plt.axvline(res_df["sparsity"].mean(), linestyle='--', color='black', alpha=0.5)
 
 
     plt.title(f"latency vs. sparsity{attached_to_fig_name}")
-    plt.ylim(0.0, 1.0)
+    plt.ylim(0.0, 1.1)
     plt.xlabel("sparsity")
     plt.ylabel("sparse latency/dense latency")
     plt.legend()
@@ -192,6 +199,9 @@ def plot_perf_sparsity(data_path, output_path, chain_len_list, hw_array_shape_li
     plt.grid(linewidth=0.3)
     plt.savefig(output_path + "tp_sparsity" + sorted_fig_path + attached_to_fig_name + ".pdf")
     plt.clf()
+
+    for chain_len, relative_slat, slat_min in zip(chain_len_list, relative_slat_list, slat_min_list):
+        print(f"chain len: {chain_len}, relative lat: {relative_slat:.2f}, lat relative to min: {slat_min:.2f}")
 
 def compute_selfatt_layer_perf(data_path, seq_len, chain_len, hw_array_shape, sort_row_sparsity, layer_idx=0):
     bfp_att_path = data_path + "act/bfp_attprobs/"
@@ -312,9 +322,9 @@ def main():
     for l_idx, (fname, f_seq_len) in enumerate(zip(files_list, seq_len_list)):
         plot_perf_sparsity(data_path + fname, output_path, chain_len_list, \
                                 hw_array_shape_list, sort_row_sparsity=True, \
-                                using_single_column=False, sparse_block_size=2, \
+                                using_single_column=False, sparse_block_size=1, \
                                 seq_len_path=data_path+f_seq_len, seq_len_range=(200, 384), \
-                                attached_to_fig_name=f"_L{l_idx}_spblk_2_advsort")
+                                attached_to_fig_name=f"_L{l_idx}_spblk_1_advsort")
 
 if __name__ == "__main__":
     main()

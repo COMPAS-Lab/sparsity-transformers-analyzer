@@ -1,8 +1,8 @@
-from itertools import chain, compress
 from math import ceil, floor, exp, log2, gcd, sqrt, pow
-from re import template
+from os import chdir
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.spatial.distance import hamming
 import random
 import sys, logging
 import skimage.measure
@@ -472,7 +472,7 @@ class StratixDpuModel(DpuModel):
 
         return flops, total_latency
 
-    def tensor_fpga21_mat_sparse_flops(self, sparse_mat, sort_rows_by_sparsity=False, ideal=False, using_single_column=False, sparse_block_size = 10.0):
+    def tensor_fpga21_mat_sparse_flops(self, sparse_mat, sort_rows_by_sparsity=False, ideal=False, using_single_column=False, sparse_block_size = 10.0, maximize_sparsity=False):
         ''' 
         compute flops and latency with a given number of cascaded chain and b cols
         considering skipping the zeros in the mat A
@@ -494,37 +494,48 @@ class StratixDpuModel(DpuModel):
             mat_a_loading_iterations = np.sum(np.ceil(np.array([np.amax(i) for i in tcc_loading_iters])))
             return mat_a_loading_iterations
 
-        def get_spar_pattern_distance(mat):
-            dense_mask = np.where(mat > 0, '1', '0')
-            #split into chunks of 64
-            dense_mask_list = np.split(dense_mask, np.arange(63, dense_mask.shape[-1], 63), axis=-1)
-            sp_pattern = []
-            for block in dense_mask_list:
-                mask2int = lambda x: int(''.join(list(x)), base=2)
-                dense_mask_int = np.apply_along_axis(mask2int, 1, block)
-                sp_pattern.append(dense_mask_int)
-
-            sp_pattern = np.transpose(np.array(sp_pattern))
-            return sp_pattern
-
         # sort rows based on the sparsity if sorting is enabled
         if sort_rows_by_sparsity:
-            if using_single_column:
-                sorted_sparse_mat = sparse_mat[(sparse_mat == 0.0).sum(axis=-1).argsort()]
-                sparse_mat = sorted_sparse_mat
-            else:
-                import pandas as pd
-                spar_pattern = get_spar_pattern_distance(sparse_mat)
-                df_col_list = [str(c) for c in range(spar_pattern.shape[1])]
-                sorted_df = pd.DataFrame(columns=df_col_list)
-                for r_idx, r in enumerate(spar_pattern):
-                    sorted_df.loc[len(sorted_df)] = r
-                sorted_df.sort_values(by=df_col_list[:-1], ascending=True, inplace=True)
-                sorted_mat = []
-                for i in list(sorted_df.index):
-                    sorted_mat.append(sparse_mat[i])
-                
-                sparse_mat = np.array(sorted_mat)
+            sorted_sparse_mat = sparse_mat[(sparse_mat == 0.0).sum(axis=-1).argsort()]
+            sparse_mat = sorted_sparse_mat
+            if not using_single_column:
+                # skip if matrix is fully dense
+                if np.count_nonzero(sparse_mat) / sparse_mat.size < 1.:
+                    dense_mask = np.where(sparse_mat > 0.0, 1, 0)
+                    zeros_padded = dense_mask.shape[0] % 3
+                    if zeros_padded > 0:
+                        dense_mask = np.pad(dense_mask, (0, 3 - zeros_padded), "constant", \
+                                                constant_values=0)
+                        sparse_mat = np.pad(sparse_mat, (0, 3 - zeros_padded), "constant", \
+                                                constant_values=0)
+                    res = []
+                    h_dist = lambda x, y: hamming(x, y) * len(x)
+
+                    while dense_mask.shape[0] > 3:
+                        to_compare = dense_mask[0]
+                        dense_mask = np.delete(dense_mask, 0, axis=0)
+                        res.append(sparse_mat[0])
+                        sparse_mat = np.delete(sparse_mat, 0, axis=0)
+
+                        min_hdist = [len(to_compare), len(to_compare)]
+                        min_idx = [0, 0]
+                        for idx, r in enumerate(dense_mask):
+                            c_hdist = h_dist(to_compare, r)
+                            if c_hdist < min_hdist[0]:
+                                min_hdist = [c_hdist, min_hdist[0]]
+                                min_idx = [idx, min_idx[0]]
+                            elif c_hdist < min_hdist[1]:
+                                min_hdist[1] = c_hdist
+                                min_idx[1] = idx
+                        
+                        res.append(sparse_mat[min_idx[0]])
+                        res.append(sparse_mat[min_idx[1]])
+                        sparse_mat = np.delete(sparse_mat, min_idx, axis=0)
+                        dense_mask = np.delete(dense_mask, min_idx, axis=0)
+
+                    for r in sparse_mat: res.append(r)
+                    sparse_mat = np.array(res)
+
 
         # count none zeros per row, mimicing the padding zeros to every 3 rows
         # we need to split it into chunks of bfp groups because only when a group that's entirely
@@ -544,15 +555,18 @@ class StratixDpuModel(DpuModel):
             # then block them into 3xtc core size and select the max length to compute delay
             mat_in_row_grps = np.split(sparse_mat, np.arange(3, sparse_mat.shape[0], 3), axis=0)
             for row_grp in mat_in_row_grps:
-                compressed_row_grp = []
-                row_blocks = np.split(row_grp, np.arange(sparse_block_size, row_grp.shape[1], sparse_block_size), axis=-1)
-                for block in row_blocks:
-                    if np.sum(block) != 0:
-                        compressed_row_grp.append(block)
+                if maximize_sparsity:
+                    none_zeros += [max(np.count_nonzero(row_grp, axis=-1))]
+                else:
+                    compressed_row_grp = []
+                    row_blocks = np.split(row_grp, np.arange(sparse_block_size, row_grp.shape[1], sparse_block_size), axis=-1)
+                    for block in row_blocks:
+                        if np.sum(block) != 0:
+                            compressed_row_grp.append(block)
 
-                compressed_row_grp = np.concatenate(compressed_row_grp, axis=-1)
-                # recover 3 columns
-                none_zeros += [compressed_row_grp.shape[-1]]
+                    compressed_row_grp = np.concatenate(compressed_row_grp, axis=-1)
+                    # record max none zero values for each 3-row grp
+                    none_zeros += [compressed_row_grp.shape[-1]]
             
             max_none_zeros_per_grp = np.array(none_zeros)
 
