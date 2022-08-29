@@ -191,7 +191,8 @@ class StratixDpuModel(DpuModel):
             self.NUM_TCs = num_tcs
         if tcc_array_shape is not None:
             self.NUM_TCC_ROWS, self.NUM_TCC_COLS = tcc_array_shape
-        if tcc_chainlen > 0:
+        if (type(tcc_chainlen) is int and tcc_chainlen > 0) or \
+            (type(tcc_chainlen) is tuple):
             self.CHAIN_LEN = tcc_chainlen
 
     def set_tccore_size(self, size): 
@@ -472,7 +473,7 @@ class StratixDpuModel(DpuModel):
 
         return flops, total_latency
 
-    def tensor_fpga21_mat_sparse_flops(self, sparse_mat, sort_rows_by_sparsity=False, ideal=False, using_single_column=False, sparse_block_size = 10.0, maximize_sparsity=False):
+    def tensor_fpga21_mat_sparse_flops(self, sparse_mat, sort_rows_by_sparsity=False, ideal=False, using_single_column=False, sparse_block_size = 10.0, maximize_sparsity=False, short_to_long_ratio=0.0):
         ''' 
         compute flops and latency with a given number of cascaded chain and b cols
         considering skipping the zeros in the mat A
@@ -577,7 +578,45 @@ class StratixDpuModel(DpuModel):
         #     return 0, 10000, 0
 
         # split matA rows into groups, each one can be consumed by all the tc columns
-        mat_a_array_iter_grps = np.array_split(max_none_zeros_per_grp, round(max_none_zeros_per_grp.shape[0] / self.NUM_TCC_COLS))
+        mat_a_array_iter_grps = []
+        effective_loading_lat = 0.0
+        if type(self.CHAIN_LEN) is int:
+            # if the chain length is uniform
+            mat_a_array_iter_grps = \
+                np.array_split(max_none_zeros_per_grp, round(max_none_zeros_per_grp.shape[0] / self.NUM_TCC_COLS))
+            effective_loading_lat = self.CHAIN_LEN
+        elif type(self.CHAIN_LEN) is tuple:
+            # if two types of chain on the chip, effectively assign vectors to different chains
+            short_chain_len, long_chain_len = self.CHAIN_LEN
+            if short_chain_len > long_chain_len: 
+                short_chain_len, long_chain_len = long_chain_len, short_chain_len
+            effective_loading_lat = long_chain_len
+            # keep the rows to have same type of tc cores
+            num_short_chain_rows = ceil(self.NUM_TCC_ROWS * short_to_long_ratio / (short_to_long_ratio+1.0))
+            num_long_chain_rows = self.NUM_TCC_ROWS - num_short_chain_rows
+            num_short_chains = num_short_chain_rows * self.NUM_TCC_COLS * floor(long_chain_len/short_chain_len)
+            num_long_chains = num_long_chain_rows * self.NUM_TCC_COLS
+
+            #dividing rows into two pools:
+            short_chain_pool = \
+                max_none_zeros_per_grp[np.where(max_none_zeros_per_grp <= (short_chain_len * self.TCCORE_SIZE))].tolist()
+            long_chain_pool = \
+                max_none_zeros_per_grp[np.where(max_none_zeros_per_grp > (short_chain_len * self.TCCORE_SIZE))].tolist()
+            logging.info(\
+                f"short chain pool size: {len(short_chain_pool)}, long chain pool size: {len(long_chain_pool)}")
+            while (len(short_chain_pool) > 0 or len(long_chain_pool) > 0):
+                curr_grp = []
+                if len(short_chain_pool) > 0:
+                    curr_grp += short_chain_pool[0:num_short_chains]
+                    short_chain_pool = short_chain_pool[num_short_chains:]
+                if len(long_chain_pool) > 0:
+                    curr_grp += long_chain_pool[0:num_long_chains]
+                    long_chain_pool = long_chain_pool[num_long_chains:]
+                mat_a_array_iter_grps.append(curr_grp)
+
+        else:
+            raise Exception("Illegal chain length type")
+
         # use max len of the row in the group to finish loading 
         mat_a_to_load_in_row_grps = [np.amax(curr_mat_a_rows) for curr_mat_a_rows in mat_a_array_iter_grps]
         mat_b_cols_used_to_hide_a_loading = floor(self.b_w / self.NUM_TCC_ROWS)
@@ -585,18 +624,18 @@ class StratixDpuModel(DpuModel):
         mat_a_loading_latency = []
         for max_a_loading in mat_a_to_load_in_row_grps:
             chain_loading_a_lat = 0.0
-            a = max(self.CHAIN_LEN * 3, mat_b_cols_used_to_hide_a_loading)
-            if (self.CHAIN_LEN * 3) < mat_b_cols_used_to_hide_a_loading:
+            a = max(effective_loading_lat * 3, mat_b_cols_used_to_hide_a_loading)
+            if (effective_loading_lat * 3) < mat_b_cols_used_to_hide_a_loading:
                 logging.info("mat b computing dominants the a loading")
             
-            chain_loading_grps = round(max_a_loading / (self.CHAIN_LEN * self.TCCORE_SIZE))
-            chain_loading_a_lat = (chain_loading_grps-1) * a + (self.CHAIN_LEN + 1) * 3
+            chain_loading_grps = round(max_a_loading / (effective_loading_lat * self.TCCORE_SIZE))
+            chain_loading_a_lat = (chain_loading_grps-1) * a + (effective_loading_lat + 1) * 3
             mat_a_loading_latency.append(chain_loading_a_lat)
 
         # compute the latency block by block
         # first iteration of loading: including the latency of entry tc
         total_latency = np.sum(np.array(mat_a_loading_latency))
-        total_latency += 4 + self.CHAIN_LEN * 2 + 2
+        total_latency += 4 + effective_loading_lat * 2 + 2
 
         # compute throughput
         total_ops = self.a_h * self.a_w * 2 * self.b_w
