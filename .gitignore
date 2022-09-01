@@ -20,6 +20,7 @@
 
 # ignore params
 dropped_attention_params
+.opt_cache/
 
 #python
 __pycache__/
