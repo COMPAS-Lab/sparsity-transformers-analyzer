@@ -8,7 +8,7 @@ import sys, logging
 import skimage.measure
 import logging
 
-logging.basicConfig(filename='hw_modeling.log', filemode='w', format='%(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(filename='hw_modeling.log', filemode='w', format='%(name)s - %(levelname)s - %(message)s', level=logging.WARNING)
 
 class OutOfResourceError(Exception):
     pass
@@ -592,10 +592,10 @@ class StratixDpuModel(DpuModel):
                 short_chain_len, long_chain_len = long_chain_len, short_chain_len
             effective_loading_lat = long_chain_len
             # keep the rows to have same type of tc cores
-            num_short_chain_rows = ceil(self.NUM_TCC_ROWS * short_to_long_ratio / (short_to_long_ratio+1.0))
-            num_long_chain_rows = self.NUM_TCC_ROWS - num_short_chain_rows
-            num_short_chains = num_short_chain_rows * self.NUM_TCC_COLS * floor(long_chain_len/short_chain_len)
-            num_long_chains = num_long_chain_rows * self.NUM_TCC_COLS
+            num_long_chain_cols = ceil(self.NUM_TCC_COLS * (1-short_to_long_ratio))
+            num_short_chain_cols = (self.NUM_TCC_COLS - num_long_chain_cols) * floor(long_chain_len/short_chain_len)
+            num_short_chains = num_short_chain_cols * self.NUM_TCC_ROWS
+            num_long_chains = num_long_chain_cols * self.NUM_TCC_ROWS
 
             #dividing rows into two pools:
             short_chain_pool = \
@@ -607,11 +607,11 @@ class StratixDpuModel(DpuModel):
             while (len(short_chain_pool) > 0 or len(long_chain_pool) > 0):
                 curr_grp = []
                 if len(short_chain_pool) > 0:
-                    curr_grp += short_chain_pool[0:num_short_chains]
-                    short_chain_pool = short_chain_pool[num_short_chains:]
+                    curr_grp += short_chain_pool[0:num_short_chain_cols]
+                    short_chain_pool = short_chain_pool[num_short_chain_cols:]
                 if len(long_chain_pool) > 0:
-                    curr_grp += long_chain_pool[0:num_long_chains]
-                    long_chain_pool = long_chain_pool[num_long_chains:]
+                    curr_grp += long_chain_pool[0:num_long_chain_cols]
+                    long_chain_pool = long_chain_pool[num_long_chain_cols:]
                 mat_a_array_iter_grps.append(curr_grp)
 
         else:
