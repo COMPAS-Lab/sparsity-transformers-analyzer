@@ -22,7 +22,7 @@ import json
 PARAM_PATH = "./params/"
 DATA_PATH = "./data"
 CONTEXT_LEN = 512
-MODEL_NAME = "facebook/opt-125m"
+MODEL_NAME = "facebook/opt-1.3b"
 
 def tokenize(element):
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=False)
@@ -56,7 +56,7 @@ def evaluate_model():
     loss = 0.0
     losses = []
 
-    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, device_map="auto", cache_dir=".opt_cache")
+    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, device_map="auto") #, cache_dir=".opt_cache")
     tokenized_dataset = prepare_dataset_and_tokenize()
     print(tokenized_dataset)
     eval_dataloader = DataLoader(tokenized_dataset["valid"], batch_size = 32)
