@@ -1,0 +1,11 @@
+#!/bin/bash 
+#SBATCH --job-name=tiji_opt.job
+#SBATCH --output=test_out.txt
+#SBATCH --error=test_err.txt
+#SBATCH --time=2-00:00
+#SBATCH --mem=50000
+#SBATCH --gres=gpu:4
+
+source activate opt 
+echo "start job..."
+/home/tiji/.local/miniconda/envs/opt/bin/python opt_analyzer.py

@@ -21,51 +21,45 @@ import json
 
 PARAM_PATH = "./params/"
 DATA_PATH = "./data"
-CONTEXT_LEN = 512
-MODEL_NAME = "facebook/opt-1.3b"
+CONTEXT_LEN = 1024
+MODEL_NAME = "facebook/opt-30b"
 
 def tokenize(element):
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=False)
     outputs = tokenizer(
-        element["context"],
-        truncation=True,
-        padding='max_length',
-        max_length=CONTEXT_LEN,
-        return_overflowing_tokens=True,
-        return_length=True,
+        element,
+        # truncation=False,
+        # padding='max_length',
+        # max_length=CONTEXT_LEN,
+        # return_overflowing_tokens=True,
+        # return_length=True,
+        return_tensors="pt"
     )
 
-    return {"input_ids": outputs["input_ids"][:100]}
+    return outputs.input_ids
 
 def prepare_dataset_and_tokenize():
-    ed_dataset_train = load_dataset("empathetic_dialogues", split="train")
-    ed_dataset_valid = load_dataset("empathetic_dialogues", split="validation")
-    raw_datasets = DatasetDict({
-        "train": ed_dataset_train,
-        "valid": ed_dataset_valid,
-    })
+    azreview_dataset_valid = load_dataset("amazon_reviews_multi", split="test")
+    azreview_dataset_valid = azreview_dataset_valid.filter(lambda x: x["language"] == "en")
+    print(azreview_dataset_valid)
 
-    print(raw_datasets)
-
-    tokenized_datasets = raw_datasets.map(
-        tokenize, batched=True, remove_columns=raw_datasets["train"].column_names
-    )
+    tokenized_datasets = [tokenize(i) for i in azreview_dataset_valid["review_body"]]
+    # tokenized_datasets = azreview_dataset_valid.map(tokenize, batched=False)
     return tokenized_datasets
 
 def evaluate_model():
     loss = 0.0
     losses = []
 
-    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, device_map="auto") #, cache_dir=".opt_cache")
+    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, device_map="auto", cache_dir=".opt_cache")
     tokenized_dataset = prepare_dataset_and_tokenize()
-    print(tokenized_dataset)
-    eval_dataloader = DataLoader(tokenized_dataset["valid"], batch_size = 32)
-    print(f"len of eval data: {len(eval_dataloader)}")
+    # eval_dataloader = DataLoader(tokenized_dataset, batch_size = 4)
+    # print(f"len of eval data: {len(eval_dataloader)}")
     # run model
-    for step, batch in enumerate(eval_dataloader):
+    for step, input_ids_tensor in enumerate(tokenized_dataset):
         print(f"step {step} :")
         with torch.no_grad():
-            input_ids_tensor = torch.stack(batch["input_ids"])
+            input_ids_tensor = input_ids_tensor.to(model.device)
             model_output = model(input_ids_tensor, \
                                     output_hidden_states=True, \
                                     labels=input_ids_tensor)
