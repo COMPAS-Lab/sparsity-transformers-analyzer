@@ -1,6 +1,7 @@
 """
 opt analyzer: analyzer sparsity of opt
 """
+from lib2to3.pgen2 import token
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset, DatasetDict
 import torch
@@ -39,12 +40,19 @@ def tokenize(element):
     return outputs.input_ids
 
 def prepare_dataset_and_tokenize():
-    azreview_dataset_valid = load_dataset("amazon_reviews_multi", split="test")
-    azreview_dataset_valid = azreview_dataset_valid.filter(lambda x: x["language"] == "en")
-    print(azreview_dataset_valid)
+    wikitext_valid = load_dataset("wikitext", "wikitext-103-v1", split="test")
+    # wikitext_valid = wikitext_valid.filter(lambda x: x["language"] == "en")
+    print(wikitext_valid)
 
-    tokenized_datasets = [tokenize(i) for i in azreview_dataset_valid["review_body"]]
+    tokenized_datasets, tmp_long_seq = [], []
+    for i in wikitext_valid:
+        if len(i["text"]) > 600:
+            tmp_long_seq.append(i["text"])
+        if len(tmp_long_seq) is 5:
+            tokenized_datasets.append(tokenize(" ".join(tmp_long_seq)))
+            tmp_long_seq = []
     # tokenized_datasets = azreview_dataset_valid.map(tokenize, batched=False)
+    print("num insts: ", len(tokenized_datasets))
     return tokenized_datasets
 
 def evaluate_model():
@@ -56,7 +64,7 @@ def evaluate_model():
     # eval_dataloader = DataLoader(tokenized_dataset, batch_size = 4)
     # print(f"len of eval data: {len(eval_dataloader)}")
     # run model
-    for step, input_ids_tensor in enumerate(tokenized_dataset):
+    for step, input_ids_tensor in enumerate(tokenized_dataset[:100]):
         print(f"step {step} :")
         with torch.no_grad():
             input_ids_tensor = input_ids_tensor.to(model.device)
