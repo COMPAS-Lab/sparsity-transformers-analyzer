@@ -473,7 +473,8 @@ class StratixDpuModel(DpuModel):
 
         return flops, total_latency
 
-    def tensor_fpga21_mat_sparse_flops(self, sparse_mat, sort_rows_by_sparsity=False, ideal=False, using_single_column=False, sparse_block_size = 10.0, maximize_sparsity=False, short_to_long_ratio=0.0):
+    def tensor_fpga21_mat_sparse_flops(self, sparse_mat, sort_rows_by_sparsity=False, ideal=False, using_single_column=False, \
+                                        sparse_block_size = 10.0, maximize_sparsity=False, short_to_long_ratio=0.0, blocked_pruning=False):
         ''' 
         compute flops and latency with a given number of cascaded chain and b cols
         considering skipping the zeros in the mat A
@@ -562,20 +563,20 @@ class StratixDpuModel(DpuModel):
                     compressed_row_grp = []
                     row_blocks = np.split(row_grp, np.arange(sparse_block_size, row_grp.shape[1], sparse_block_size), axis=-1)
                     for block in row_blocks:
-                        if np.sum(block) != 0:
-                            compressed_row_grp.append(block)
+                        # support different pruning modes
+                        if blocked_pruning:
+                            if np.mean(block) > 0.001:
+                                compressed_row_grp.append(block)
+                        else:
+                            if np.sum(block) != 0:
+                                compressed_row_grp.append(block)
 
-                    compressed_row_grp = np.concatenate(compressed_row_grp, axis=-1)
-                    # record max none zero values for each 3-row grp
-                    none_zeros += [compressed_row_grp.shape[-1]]
+                    if len(compressed_row_grp) > 0:
+                        compressed_row_grp = np.concatenate(compressed_row_grp, axis=-1)
+                        # record max none zero values for each 3-row grp
+                        none_zeros += [compressed_row_grp.shape[-1]]
             
             max_none_zeros_per_grp = np.array(none_zeros)
-
-        # DEBUG: select fully dense matrices
-        # try:
-        #     assert(np.sum(none_zeros) == 384*384)
-        # except:
-        #     return 0, 10000, 0
 
         # split matA rows into groups, each one can be consumed by all the tc columns
         mat_a_array_iter_grps = []
@@ -583,7 +584,7 @@ class StratixDpuModel(DpuModel):
         if type(self.CHAIN_LEN) is int:
             # if the chain length is uniform
             mat_a_array_iter_grps = \
-                np.array_split(max_none_zeros_per_grp, round(max_none_zeros_per_grp.shape[0] / self.NUM_TCC_COLS))
+                np.array_split(max_none_zeros_per_grp, ceil(max_none_zeros_per_grp.shape[0] / self.NUM_TCC_COLS))
             effective_loading_lat = self.CHAIN_LEN
         elif type(self.CHAIN_LEN) is tuple:
             # if two types of chain on the chip, effectively assign vectors to different chains
@@ -593,7 +594,13 @@ class StratixDpuModel(DpuModel):
             effective_loading_lat = long_chain_len
             # keep the rows to have same type of tc cores
             num_long_chain_cols = ceil(self.NUM_TCC_COLS * (1-short_to_long_ratio))
+            # check availability of short chains:
+            if num_long_chain_cols is self.NUM_TCC_COLS:
+                logging.warning("short to long ratio smaller than expected, replacing only one col of long chains with shorts")
+                num_long_chain_cols = self.NUM_TCC_COLS - 1
+
             num_short_chain_cols = (self.NUM_TCC_COLS - num_long_chain_cols) * floor(long_chain_len/short_chain_len)
+
             num_short_chains = num_short_chain_cols * self.NUM_TCC_ROWS
             num_long_chains = num_long_chain_cols * self.NUM_TCC_ROWS
 
