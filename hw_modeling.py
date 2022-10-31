@@ -578,14 +578,38 @@ class StratixDpuModel(DpuModel):
             
             max_none_zeros_per_grp = np.array(none_zeros)
 
+        def compute_lat_by_elem_grps(mat_a_array_iter_grps):
+            # use max len of the row in the group to finish loading 
+            mat_a_to_load_in_row_grps = [np.amax(curr_mat_a_rows) for curr_mat_a_rows in mat_a_array_iter_grps]
+            mat_b_cols_used_to_hide_a_loading = floor(self.b_w / self.NUM_TCC_ROWS)
+            # figure out actual time of each group loading
+            mat_a_loading_latency = []
+            for max_a_loading in mat_a_to_load_in_row_grps:
+                chain_loading_a_lat = 0.0
+                a = max(effective_loading_lat * 3, mat_b_cols_used_to_hide_a_loading)
+                if (effective_loading_lat * 3) < mat_b_cols_used_to_hide_a_loading:
+                    logging.info("mat b computing dominants the a loading")
+                
+                chain_loading_grps = round(max_a_loading / (effective_loading_lat * self.TCCORE_SIZE))
+                chain_loading_a_lat = (chain_loading_grps-1) * a + (effective_loading_lat + 1) * 3
+                mat_a_loading_latency.append(chain_loading_a_lat)
+
+            # compute the latency block by block
+            # first iteration of loading: including the latency of entry tc
+            total_latency = np.sum(np.array(mat_a_loading_latency))
+            total_latency += 4 + effective_loading_lat * 2 + 2
+
         # split matA rows into groups, each one can be consumed by all the tc columns
         mat_a_array_iter_grps = []
+        mat_a_short_iter_grps, mat_a_long_iter_grps = [], []
         effective_loading_lat = 0.0
+        total_lat = 0.0
         if type(self.CHAIN_LEN) is int:
             # if the chain length is uniform
             mat_a_array_iter_grps = \
                 np.array_split(max_none_zeros_per_grp, ceil(max_none_zeros_per_grp.shape[0] / self.NUM_TCC_COLS))
             effective_loading_lat = self.CHAIN_LEN
+            total_lat = compute_lat_by_elem_grps(mat_a_array_iter_grps)
         elif type(self.CHAIN_LEN) is tuple:
             # if two types of chain on the chip, effectively assign vectors to different chains
             short_chain_len, long_chain_len = self.CHAIN_LEN
@@ -613,43 +637,35 @@ class StratixDpuModel(DpuModel):
                 f"short chain pool size: {len(short_chain_pool)}, long chain pool size: {len(long_chain_pool)}")
             while (len(short_chain_pool) > 0 or len(long_chain_pool) > 0):
                 curr_grp = []
+                # push short rows
                 if len(short_chain_pool) > 0:
                     curr_grp += short_chain_pool[0:num_short_chain_cols]
                     short_chain_pool = short_chain_pool[num_short_chain_cols:]
-                if len(long_chain_pool) > 0:
+                mat_a_short_iter_grps.append(curr_grp)
+
+                curr_grp = []
+                # use long chains to compute both short and long rows
+                if len(long_chain_pool) > 0: 
                     curr_grp += long_chain_pool[0:num_long_chain_cols]
                     long_chain_pool = long_chain_pool[num_long_chain_cols:]
-                mat_a_array_iter_grps.append(curr_grp)
+                elif len(short_chain_pool) > 0:
+                    curr_grp += short_chain_pool[0:num_long_chain_cols]
+                    short_chain_pool = short_chain_pool[num_long_chain_cols:]
+                mat_a_long_iter_grps.append(curr_grp)
+
+            short_iter_lat = compute_lat_by_elem_grps(mat_a_short_iter_grps)
+            long_iter_lat = compute_lat_by_elem_grps(mat_a_long_iter_grps)
+            total_lat = max(short_iter_lat, long_iter_lat)
 
         else:
             raise Exception("Illegal chain length type")
 
-        # use max len of the row in the group to finish loading 
-        mat_a_to_load_in_row_grps = [np.amax(curr_mat_a_rows) for curr_mat_a_rows in mat_a_array_iter_grps]
-        mat_b_cols_used_to_hide_a_loading = floor(self.b_w / self.NUM_TCC_ROWS)
-        # figure out actual time of each group loading
-        mat_a_loading_latency = []
-        for max_a_loading in mat_a_to_load_in_row_grps:
-            chain_loading_a_lat = 0.0
-            a = max(effective_loading_lat * 3, mat_b_cols_used_to_hide_a_loading)
-            if (effective_loading_lat * 3) < mat_b_cols_used_to_hide_a_loading:
-                logging.info("mat b computing dominants the a loading")
-            
-            chain_loading_grps = round(max_a_loading / (effective_loading_lat * self.TCCORE_SIZE))
-            chain_loading_a_lat = (chain_loading_grps-1) * a + (effective_loading_lat + 1) * 3
-            mat_a_loading_latency.append(chain_loading_a_lat)
-
-        # compute the latency block by block
-        # first iteration of loading: including the latency of entry tc
-        total_latency = np.sum(np.array(mat_a_loading_latency))
-        total_latency += 4 + effective_loading_lat * 2 + 2
-
         # compute throughput
         total_ops = self.a_h * self.a_w * 2 * self.b_w
-        time_latency = total_latency * 1./self.FREQ * 1e-6
+        time_latency = total_lat * 1./self.FREQ * 1e-6
         flops = total_ops / time_latency / 1e12
 
-        return flops, total_latency
+        return flops, total_lat
     
     def ideal_tops(self):
         ops = (10*2*3) * self.NUM_TCs

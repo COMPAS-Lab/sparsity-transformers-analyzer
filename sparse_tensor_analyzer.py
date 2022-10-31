@@ -141,7 +141,7 @@ def compute_matmul_performance(data_path, chain_len, out_w, hw_array_shape, \
                                 seq_len_path=None, seq_len_range=None, mixed_chain_length=None, \
                                 short_to_long_ratio=0.0, blocked_pruning=False):
 
-    bfp_att_probes = prepare_mat_dat(data_path, seq_len_path, seq_len_range)
+    bfp_att_probes = prepare_mat_dat(data_path, seq_len_path, seq_len_range, 100)
     res = {"latency":[] ,"sparsity": [], "s2l ratio": [], "tp": []}
 
     total_sparse_lat, total_base_lat, total_min_sparse_lat = 0, 0, 0
@@ -421,11 +421,12 @@ def single_case_analyzing(mat):
         plt.title(f"sparsity={actual_spar:.2f}, latency={latency:.2f}")
         plt.savefig(fig_name)
         plt.clf()
+        plt.close()
 
     sort_row_sparsity = True    
     sparse_block_size = 20
     out_w = 768
-    hw_array_shape = factor_int(floor(3960.0/(1.0+2.0)))
+    hw_array_shape = factor_int(floor(3960.0/(6.0+2.0)))
     print("hw array shape: ", hw_array_shape)
 
     # first pad the rows to be divisible by 3
@@ -435,25 +436,24 @@ def single_case_analyzing(mat):
         mat = np.pad(mat, ((0, rows_padded), (0, cols_padded)), "constant", constant_values=0)
 
     mixed_sparse_list, sparse_list = [],  []
-    exps_count = 0
 
     # use a dense mat to calculate dens mat base lat
     fake_dense_data = np.ones(mat.shape)
     base_model = hw_modeling.StratixDpuModel(mat.shape[0], mat.shape[1], mat.shape[1], out_w, \
                                     exp_dat=fake_dense_data, freq=500, num_tcs=3960, tcc_array_shape=hw_array_shape, \
-                                    tcc_chainlen=1)
+                                    tcc_chainlen=6)
     base_model.set_tccore_size(20)
     base_flops, base_lat = base_model.tensor_fpga21_mat_sparse_flops(fake_dense_data, \
                                                 sort_row_sparsity, False, \
                                                 using_single_column=False, sparse_block_size=sparse_block_size)
 
     dense_mat_map = np.where(mat > 0, 1, 0)
-    create_heatmap(dense_mat_map, "./res_fig/dense_heatmap.png", base_lat)
+    create_heatmap(dense_mat_map, "./res_fig/dense_heatmap_opt.png", base_lat)
 
     # evaluate sparse model
     sparse_model = hw_modeling.StratixDpuModel(mat.shape[0], mat.shape[1], mat.shape[1], out_w, \
                                     exp_dat=mat, freq=500, num_tcs=3960, tcc_array_shape=hw_array_shape, \
-                                    tcc_chainlen=1)
+                                    tcc_chainlen=6)
     sparse_model.set_tccore_size(20)
     sparse_flops, sparse_lat = sparse_model.tensor_fpga21_mat_sparse_flops(mat, \
                                                     sort_row_sparsity, False, \
@@ -490,12 +490,12 @@ def single_case_analyzing(mat):
         compressed_mat_map += [compressed_row_grp]
 
     compressed_mat_map = np.concatenate(compressed_mat_map, axis = 0)
-    create_heatmap(compressed_mat_map, "./res_fig/column_prune_heatmap.png", sparse_lat)
+    create_heatmap(compressed_mat_map, "./res_fig/column_prune_heatmap_opt.png", sparse_lat)
 
     
     sparse_model = hw_modeling.StratixDpuModel(mat.shape[0], mat.shape[1], mat.shape[1], out_w, \
                                     exp_dat=mat, freq=500, num_tcs=3960, tcc_array_shape=hw_array_shape, \
-                                    tcc_chainlen=1)
+                                    tcc_chainlen=6)
     sparse_model.set_tccore_size(20)
     mixed_sparse_flops, mixed_sparse_lat = sparse_model.tensor_fpga21_mat_sparse_flops(mat, \
                                                 sort_row_sparsity, False, \
@@ -521,10 +521,9 @@ def single_case_analyzing(mat):
         blocked_mat_map += [compressed_row_grp]
 
     blocked_mat_map = np.concatenate(blocked_mat_map, axis = 0)
-    create_heatmap(blocked_mat_map, "./res_fig/block_prune_heatmap.png", mixed_sparse_lat)
+    create_heatmap(blocked_mat_map, "./res_fig/block_prune_heatmap_opt.png", mixed_sparse_lat)
 
     print("column pruning and blocked pruning latency: ", base_lat/sparse_lat, base_lat/mixed_sparse_lat)
-    print("total instance count: ", exps_count)
     
     return {"base": (0., base_lat), 
             "column": (get_mat_sparsity(compressed_mat_map), sparse_lat), 
@@ -555,7 +554,7 @@ def plot_lat_vs_sparsity(file_path, seq_len_path, seq_len_range):
     plt.ylabel("latency (cycles)")
     plt.legend()
     plt.grid(linewidth=0.3)
-    plt.savefig(f"./res_fig/sparsity_vs_latency{seq_len_range}.png")
+    plt.savefig(f"./res_fig/sparsity_vs_latency_opt_{seq_len_range}.png")
     plt.clf()
 
 
@@ -672,15 +671,11 @@ def main():
     #     plot_selfatt_sparsity(data_path, output_path + "selfatt/", chain_len_list, hw_array_shape_list, layer_idx, False)
 
     ## verify sparsity
-    att_path = data_path + f"act/attprobs/6-0.pt"
-    seq_len_path = data_path + f"act/seqlen/6-0.pt"
-    # sampled_dat = prepare_mat_dat(att_path, seq_len_path, (0, 384), 1)
+    # att_path = data_path + f"opt_res/bfp_attn/6-0.pt"
+    # seq_len_path = data_path + f"opt_res/seqlen/6-0.pt"
+    # sampled_dat = prepare_mat_dat(att_path, seq_len_path, (0, 1024), 1)
     # single_case_analyzing(sampled_dat[0])
-
-    # plot_lat_vs_sparsity(att_path, seq_len_path, (300, 384))
-    # plot_lat_vs_sparsity(att_path, seq_len_path, (100, 200))
-    # plot_lat_vs_sparsity(att_path, seq_len_path, (0, 50))
-    # exit()
+    # plot_lat_vs_sparsity(att_path, seq_len_path, (0, 1024))
 
     ## explore average speedup of different chain lengths:
     files_list = [data_path + f"opt_res/bfp_attn/{i}-0.pt" for i in range(48)]
@@ -775,7 +770,7 @@ def main():
     # sweep across different ratios:
     curr_min_latency_mean = float("inf")
     sparselat_list_mixed_res = []
-    s2l_ratio_res = 0.0
+    s2l_ratio_res = 0.2
 
     print("computing mixed chain len latency...")
     if s2l_ratio_res > 0.0:
