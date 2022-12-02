@@ -15,10 +15,11 @@ from pprint import pprint
 PARAM_PATH = "./params/"
 DATA_PATH = "./data"
 CONTEXT_LEN = 128
-MODEL_NAME = "facebook/opt-1.3b"
+MODEL_NAME = "facebook/opt-30b"
 
 def analyze_model_params(model):
     for name, params in model.named_parameters():
+        # print(name, ":", params.shape)
         if (name == "score.weight"):
             print(params.shape)
             print(params[0])
@@ -60,9 +61,12 @@ def prepare_dataset_and_tokenize_for_training():
         )
         return outputs
 
-    ethos_dat = load_dataset("ethos", "binary")
-    print(ethos_dat)
-    tokenized_datasets = ethos_dat.map(tokenize, batched=True)
+    ethos_dat_training = load_dataset("ethos", "binary", split="train[:90%]")
+    print(ethos_dat_training)
+    ethos_dat_eval = load_dataset("ethos", "binary", split="train[:-10%]")
+
+    tokenized_datasets = {"train": ethos_dat_training.map(tokenize, batched=True), 
+                            "test": ethos_dat_eval.map(tokenize, batched=True)}
 
     return tokenized_datasets
 
@@ -73,7 +77,7 @@ def finetune_model():
         metric = evaluate.load("accuracy")
         return metric.compute(predictions=pred_res, references=labels)
 
-    model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, device_map="auto", cache_dir=".opt_cache", num_labels=2)
+    model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, cache_dir=".opt_cache", num_labels=2)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=False)
     tokenized_dataset = prepare_dataset_and_tokenize_for_training()
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
@@ -94,7 +98,7 @@ def finetune_model():
                         model=model,
                         args=training_args,
                         train_dataset=tokenized_dataset["train"],
-                        eval_dataset=tokenized_dataset["train"],
+                        eval_dataset=tokenized_dataset["test"],
                         tokenizer=tokenizer,
                         data_collator=data_collator,
                         compute_metrics=compute_metrics
@@ -110,13 +114,12 @@ def evaluate_model():
     predicted_labels = []
     num_labels_as_one = 0.0
 
-    model = AutoModelForSequenceClassification.from_pretrained(".opt_cache/opt-1.3b-finetuned", device_map="auto", num_labels=2)
+    model = AutoModelForSequenceClassification.from_pretrained(".opt_cache/opt-1.3b-finetuned", num_labels=2)
     tokenized_dataset = prepare_dataset_and_tokenize_for_evaluation()
     # eval_dataloader = DataLoader(tokenized_dataset, batch_size = 4)
     # print(f"len of eval data: {len(eval_dataloader)}")
     # run model
     analyze_model_params(model)
-    return 0, 0, 0
 
     all_attn = []
     max_seq_len = 0
