@@ -1,7 +1,10 @@
 """
 opt analyzer: analyzer sparsity of opt
 """
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, TrainingArguments, Trainer, DataCollatorWithPadding
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, \
+                            TrainingArguments, Trainer, DataCollatorWithPadding, \
+                            AdamW, get_scheduler
+from accelerate import Accelerator
 from datasets import load_dataset, DatasetDict
 import evaluate
 import torch
@@ -15,7 +18,7 @@ from pprint import pprint
 PARAM_PATH = "./params/"
 DATA_PATH = "./data"
 CONTEXT_LEN = 128
-MODEL_NAME = "facebook/opt-30b"
+MODEL_NAME = "facebook/opt-6.7b"
 
 def analyze_model_params(model):
     for name, params in model.named_parameters():
@@ -62,13 +65,15 @@ def prepare_dataset_and_tokenize_for_training():
         return outputs
 
     ethos_dat_training = load_dataset("ethos", "binary", split="train[:90%]")
-    print(ethos_dat_training)
     ethos_dat_eval = load_dataset("ethos", "binary", split="train[:-10%]")
 
-    tokenized_datasets = {"train": ethos_dat_training.map(tokenize, batched=True), 
-                            "test": ethos_dat_eval.map(tokenize, batched=True)}
+    train_dataset = ethos_dat_training.map(tokenize, batched=True)
+    train_dataset.set_format("pt", columns=["input_ids", "attention_mask"], output_all_columns=True)
 
-    return tokenized_datasets
+    eval_dataset = ethos_dat_training.map(tokenize, batched=True)
+    eval_dataset.set_format("pt", columns=["input_ids", "attention_mask"], output_all_columns=True)
+
+    return train_dataset, eval_dataset
 
 def finetune_model():
     def compute_metrics(eval_pred):
@@ -78,36 +83,39 @@ def finetune_model():
         return metric.compute(predictions=pred_res, references=labels)
 
     model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, cache_dir=".opt_cache", num_labels=2)
+    optimizer = AdamW(model.parameters(), lr=2e-5)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=False)
-    tokenized_dataset = prepare_dataset_and_tokenize_for_training()
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+    train_dataset, eval_dataset = prepare_dataset_and_tokenize_for_training()
+    train_dataset = torch.utils.data.DataLoader(train_dataset, batch_size=16)
 
-    training_args = TrainingArguments(
-                        output_dir="./params",
-                        learning_rate=2e-5,
-                        do_train=True,
-                        do_eval=True,
-                        per_device_train_batch_size=16,
-                        num_train_epochs=3,
-                        weight_decay=0.01,
-                        evaluation_strategy="epoch",
-                        fp16=True,
-                    )
+    accelerator = Accelerator()
 
-    trainer = Trainer(
-                        model=model,
-                        args=training_args,
-                        train_dataset=tokenized_dataset["train"],
-                        eval_dataset=tokenized_dataset["test"],
-                        tokenizer=tokenizer,
-                        data_collator=data_collator,
-                        compute_metrics=compute_metrics
-                    )
+    train_dataset, eval_dataset, model, optimizer = accelerator.prepare(
+        train_dataset, eval_dataset, model, optimizer
+    )
 
-    trainer.train()
-    analyze_model_params(model)
-    trainer.save_model(".opt_cache/opt-1.3b-finetuned")
+    num_epochs = 3
+    num_training_steps = num_epochs * len(train_dataset)
+    lr_scheduler = get_scheduler(
+        "linear",
+        optimizer=optimizer,
+        num_warmup_steps=0,
+        num_training_steps=num_training_steps
+    )
 
+    model.train()
+    for epoch in range(num_epochs):
+        for batch in train_dataset:
+            outputs = model(batch["input_ids"].to(model.device), labels = batch["label"], attention_mask=batch["attention_mask"].to(model.device), output_hidden_states=False, output_attentions=True)
+            loss = outputs.loss
+            accelerator.backward(loss)
+
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+
+    model.save_pretrained(".opt_cache/opt-6.7b-finetuned")
+    
 def evaluate_model():
     losses = []
     res_probs = []

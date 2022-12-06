@@ -3,8 +3,8 @@
 #SBATCH --output=test_out.txt
 #SBATCH --error=test_err.txt
 #SBATCH --time=2-00:00
-#SBATCH --gres=gpu:1
-#SBATCH --nodelist=ai04
+#SBATCH --gres=gpu:2
+#SBATCH --nodelist=ai02
 
 source activate opt 
 echo "start job..."
