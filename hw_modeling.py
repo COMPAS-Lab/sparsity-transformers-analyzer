@@ -179,6 +179,7 @@ class StratixDpuModel(DpuModel):
     CHAIN_LEN = 0.0
     NUM_TCs = 3960.0
     TCCORE_SIZE = 10
+    TCCORE_COL_SIZE = 3
     __exp_dat = None
 
     def __init__(self, a_h, a_w, b_h, b_w, exp_dat=None, freq=0.0, num_tcs=0.0, tcc_array_shape=None, tcc_chainlen = 0.0):
@@ -197,6 +198,8 @@ class StratixDpuModel(DpuModel):
 
     def set_tccore_size(self, size): 
         self.TCCORE_SIZE = size
+        if self.TCCORE_SIZE != 10 and self.TCCORE_SIZE != 20:
+            raise Exception(f"illegal tensor core size {size}")
         
     # derived parameters
     def compute_lat(self, cascade_len: int, ideal=False):
@@ -211,9 +214,9 @@ class StratixDpuModel(DpuModel):
             matB_size = (self.b_h, self.b_w)
 
             total_ops =  self.total_ops()
-            block_matA_size = (3, matA_size[1])
+            block_matA_size = (self.TCCORE_COL_SIZE, matA_size[1])
             block_matB_size = (matA_size[1], chain_loading_lat)
-            a_loading_grps = round(matA_size[1] / (cascade_len * 10))
+            a_loading_grps = round(matA_size[1] / (cascade_len * self.TCCORE_SIZE))
 
             compute_block_ops = block_matA_size[0] * block_matA_size[1] * 2 * block_matB_size[1]
             
@@ -237,19 +240,19 @@ class StratixDpuModel(DpuModel):
                 # count none zeros per row
                 none_zeros = np.count_nonzero(self.__exp_dat, axis=-1)
                 # mimicing the padding zeros to every 3 rows
-                zeros_padded = none_zeros.size % 3
-                none_zeros = np.pad(none_zeros, (0, 3 - zeros_padded), "constant", constant_values=0)
-                none_zeros = np.split(none_zeros, np.arange(3, none_zeros.size, 3))
+                zeros_padded = none_zeros.size % self.TCCORE_COL_SIZE
+                none_zeros = np.pad(none_zeros, (0, self.TCCORE_COL_SIZE - zeros_padded), "constant", constant_values=0)
+                none_zeros = np.split(none_zeros, np.arange(self.TCCORE_COL_SIZE, none_zeros.size, self.TCCORE_COL_SIZE))
                 max_none_zeros_per_grp = np.array([np.amax(i) for i in none_zeros])
 
-                a_loading_grps = round(max_none_zeros_per_grp / (cascade_len * 10))
+                a_loading_grps = round(max_none_zeros_per_grp / (cascade_len * self.TCCORE_SIZE))
                 grp_loading_lats = chain_loading_lat + chain_loading_lat * a_loading_grps + \
                                 4 + cascade_len * 2
                 grp_loading_lats *= round(self.b_w / chain_loading_lat)
                 num_cores = round(self.NUM_TCs / (cascade_len + 2))
 
                 ideal_lat = round(np.sum(grp_loading_lats) / num_cores)
-                greedy_lat = ideal_lat * ((4*num_cores-1)/(3*num_cores))
+                greedy_lat = ideal_lat * ((4*num_cores-1)/(self.TCCORE_COL_SIZE*num_cores))
                 return greedy_lat
 
 
@@ -264,9 +267,9 @@ class StratixDpuModel(DpuModel):
 
         total_ops =  self.total_ops()
         chain_loading_lat = 3 * (cascade_len + 1)
-        block_matA_size = (3, matA_size[1])
+        block_matA_size = (self.TCCORE_COL_SIZE, matA_size[1])
         block_matB_size = (matA_size[1], chain_loading_lat)
-        a_loading_grps = round(matA_size[1] / (cascade_len * 10), ceil)
+        a_loading_grps = round(matA_size[1] / (cascade_len * self.TCCORE_SIZE), ceil)
 
         compute_block_ops = block_matA_size[0] * block_matA_size[1] * 2 * block_matB_size[1]
         
@@ -421,7 +424,7 @@ class StratixDpuModel(DpuModel):
             total_ops =  self.total_ops()
             
             chain_loading_lat = 3 * (cascade_len + 1)
-            block_matA_size = (3, matA_size[1])
+            block_matA_size = (self.TCCORE_COL_SIZE, matA_size[1])
             block_matB_size = (matA_size[1], chain_loading_lat)
             a_loading_grps = round(matA_size[1] / (cascade_len * self.TCCORE_SIZE))
 
@@ -450,7 +453,7 @@ class StratixDpuModel(DpuModel):
 
             total_ops =  mA_row * mA_col * 2 * mB_col
             chain_loading_lat = 3 * (cas_len + 1)
-            block_matA_size = (3, mA_col)
+            block_matA_size = (self.TCCORE_COL_SIZE, mA_col)
             block_matB_size = (mA_col, chain_loading_lat)
             a_loading_grps = (mA_col / (cas_len * self.TCCORE_SIZE))
 
@@ -485,7 +488,7 @@ class StratixDpuModel(DpuModel):
         round = lambda x: x if ideal else ceil(x)
 
         def check_a_loading_iterations(mat):
-            split_nonezeros = np.split(mat, np.arange(3, mat.size, 3))
+            split_nonezeros = np.split(mat, np.arange(self.TCCORE_COL_SIZE, mat.size, self.TCCORE_COL_SIZE))
             max_none_zeros_per_grp = np.array([np.amax(i) for i in split_nonezeros])
             # calculate number of iterations to load each 3-row groups
             mat_a_loading_iterations = max_none_zeros_per_grp / (self.CHAIN_LEN * self.TCCORE_SIZE)
@@ -504,40 +507,58 @@ class StratixDpuModel(DpuModel):
                 # skip if matrix is fully dense
                 if np.count_nonzero(sparse_mat) / sparse_mat.size < 1.:
                     dense_mask = np.where(sparse_mat > 0.0, 1, 0)
-                    zeros_padded = dense_mask.shape[0] % 3
+                    zeros_padded = dense_mask.shape[0] % self.TCCORE_COL_SIZE
                     if zeros_padded > 0:
-                        dense_mask = np.pad(dense_mask, (0, 3 - zeros_padded), "constant", \
+                        dense_mask = np.pad(dense_mask, (0, self.TCCORE_COL_SIZE - zeros_padded), "constant", \
                                                 constant_values=0)
-                        sparse_mat = np.pad(sparse_mat, (0, 3 - zeros_padded), "constant", \
+                        sparse_mat = np.pad(sparse_mat, (0, self.TCCORE_COL_SIZE - zeros_padded), "constant", \
                                                 constant_values=0)
                     res = []
                     h_dist = lambda x, y: hamming(x, y) * len(x)
 
-                    while dense_mask.shape[0] > 3:
-                        to_compare = dense_mask[0]
-                        dense_mask = np.delete(dense_mask, 0, axis=0)
-                        res.append(sparse_mat[0])
-                        sparse_mat = np.delete(sparse_mat, 0, axis=0)
+                    if self.TCCORE_COL_SIZE == 3:
+                        while dense_mask.shape[0] > 3:
+                            to_compare = dense_mask[0]
+                            dense_mask = np.delete(dense_mask, 0, axis=0)
+                            res.append(sparse_mat[0])
+                            sparse_mat = np.delete(sparse_mat, 0, axis=0)
 
-                        min_hdist = [len(to_compare), len(to_compare)]
-                        min_idx = [0, 0]
-                        for idx, r in enumerate(dense_mask):
-                            c_hdist = h_dist(to_compare, r)
-                            if c_hdist < min_hdist[0]:
-                                min_hdist = [c_hdist, min_hdist[0]]
-                                min_idx = [idx, min_idx[0]]
-                            elif c_hdist < min_hdist[1]:
-                                min_hdist[1] = c_hdist
-                                min_idx[1] = idx
-                        
-                        res.append(sparse_mat[min_idx[0]])
-                        res.append(sparse_mat[min_idx[1]])
-                        sparse_mat = np.delete(sparse_mat, min_idx, axis=0)
-                        dense_mask = np.delete(dense_mask, min_idx, axis=0)
+                            min_hdist = [len(to_compare), len(to_compare)]
+                            min_idx = [0, 0]
+                            for idx, r in enumerate(dense_mask):
+                                c_hdist = h_dist(to_compare, r)
+                                if c_hdist < min_hdist[0]:
+                                    min_hdist = [c_hdist, min_hdist[0]]
+                                    min_idx = [idx, min_idx[0]]
+                                elif c_hdist < min_hdist[1]:
+                                    min_hdist[1] = c_hdist
+                                    min_idx[1] = idx
+                            
+                            res.append(sparse_mat[min_idx[0]])
+                            res.append(sparse_mat[min_idx[1]])
+                            sparse_mat = np.delete(sparse_mat, min_idx, axis=0)
+                            dense_mask = np.delete(dense_mask, min_idx, axis=0)
+                    if self.TCCORE_COL_SIZE == 2:
+                        while dense_mask.shape[0] > 2:
+                            to_compare = dense_mask[0]
+                            dense_mask = np.delete(dense_mask, 0, axis=0)
+                            res.append(sparse_mat[0])
+                            sparse_mat = np.delete(sparse_mat, 0, axis=0)
+
+                            min_hdist = len(to_compare)
+                            min_idx = 0
+                            for idx, r in enumerate(dense_mask):
+                                c_hdist = h_dist(to_compare, r)
+                                if c_hdist < min_hdist:
+                                    min_hdist = c_hdist
+                                    min_idx = idx
+                            
+                            res.append(sparse_mat[min_idx])
+                            sparse_mat = np.delete(sparse_mat, min_idx, axis=0)
+                            dense_mask = np.delete(dense_mask, min_idx, axis=0)
 
                     for r in sparse_mat: res.append(r)
                     sparse_mat = np.array(res)
-
 
         # count none zeros per row, mimicing the padding zeros to every 3 rows
         # we need to split it into chunks of bfp groups because only when a group that's entirely
@@ -551,11 +572,12 @@ class StratixDpuModel(DpuModel):
             # if using all three columns, the matrix is blocked into 3xtc core size blocks.
             # find the max latency of each block which uses most of the time.
             # first pad the rows to be divisible by 3
-            zeros_padded = sparse_mat.shape[0] % 3
+            zeros_padded = sparse_mat.shape[0] % self.TCCORE_COL_SIZE
             if zeros_padded > 0:
-                sparse_mat = np.pad(sparse_mat, (0, 3 - zeros_padded), "constant", constant_values=0)
+                sparse_mat = np.pad(sparse_mat, (0, self.TCCORE_COL_SIZE - zeros_padded), "constant", constant_values=0)
             # then block them into 3xtc core size and select the max length to compute delay
-            mat_in_row_grps = np.split(sparse_mat, np.arange(3, sparse_mat.shape[0], 3), axis=0)
+            mat_in_row_grps = \
+                np.split(sparse_mat, np.arange(self.TCCORE_COL_SIZE, sparse_mat.shape[0], self.TCCORE_COL_SIZE), axis=0)
             for row_grp in mat_in_row_grps:
                 if maximize_sparsity:
                     none_zeros += [max(np.count_nonzero(row_grp, axis=-1))]
@@ -578,7 +600,9 @@ class StratixDpuModel(DpuModel):
             
             max_none_zeros_per_grp = np.array(none_zeros)
 
-        def compute_lat_by_elem_grps(mat_a_array_iter_grps):
+        def compute_lat_by_elem_grps(mat_a_array_iter_grps, effective_loading_lat):
+            if len(mat_a_array_iter_grps) == 0:
+                return 0.0
             # use max len of the row in the group to finish loading 
             mat_a_to_load_in_row_grps = [np.amax(curr_mat_a_rows) for curr_mat_a_rows in mat_a_array_iter_grps]
             mat_b_cols_used_to_hide_a_loading = floor(self.b_w / self.NUM_TCC_ROWS)
@@ -598,6 +622,7 @@ class StratixDpuModel(DpuModel):
             # first iteration of loading: including the latency of entry tc
             total_latency = np.sum(np.array(mat_a_loading_latency))
             total_latency += 4 + effective_loading_lat * 2 + 2
+            return total_latency
 
         # split matA rows into groups, each one can be consumed by all the tc columns
         mat_a_array_iter_grps = []
@@ -609,7 +634,7 @@ class StratixDpuModel(DpuModel):
             mat_a_array_iter_grps = \
                 np.array_split(max_none_zeros_per_grp, ceil(max_none_zeros_per_grp.shape[0] / self.NUM_TCC_COLS))
             effective_loading_lat = self.CHAIN_LEN
-            total_lat = compute_lat_by_elem_grps(mat_a_array_iter_grps)
+            total_lat = compute_lat_by_elem_grps(mat_a_array_iter_grps, effective_loading_lat)
         elif type(self.CHAIN_LEN) is tuple:
             # if two types of chain on the chip, effectively assign vectors to different chains
             short_chain_len, long_chain_len = self.CHAIN_LEN
@@ -641,7 +666,7 @@ class StratixDpuModel(DpuModel):
                 if len(short_chain_pool) > 0:
                     curr_grp += short_chain_pool[0:num_short_chain_cols]
                     short_chain_pool = short_chain_pool[num_short_chain_cols:]
-                mat_a_short_iter_grps.append(curr_grp)
+                    mat_a_short_iter_grps.append(curr_grp)
 
                 curr_grp = []
                 # use long chains to compute both short and long rows
@@ -651,10 +676,11 @@ class StratixDpuModel(DpuModel):
                 elif len(short_chain_pool) > 0:
                     curr_grp += short_chain_pool[0:num_long_chain_cols]
                     short_chain_pool = short_chain_pool[num_long_chain_cols:]
-                mat_a_long_iter_grps.append(curr_grp)
+                if len(curr_grp) > 0:
+                    mat_a_long_iter_grps.append(curr_grp)
 
-            short_iter_lat = compute_lat_by_elem_grps(mat_a_short_iter_grps)
-            long_iter_lat = compute_lat_by_elem_grps(mat_a_long_iter_grps)
+            short_iter_lat = compute_lat_by_elem_grps(mat_a_short_iter_grps, effective_loading_lat)
+            long_iter_lat = compute_lat_by_elem_grps(mat_a_long_iter_grps, effective_loading_lat)
             total_lat = max(short_iter_lat, long_iter_lat)
 
         else:
@@ -668,7 +694,7 @@ class StratixDpuModel(DpuModel):
         return flops, total_lat
     
     def ideal_tops(self):
-        ops = (10*2*3) * self.NUM_TCs
+        ops = (self.TCCORE_SIZE*2*self.TCCORE_COL_SIZE) * self.NUM_TCs
         latency = 1/self.FREQ * 1e-6
         tops = ops / latency / 1e12
         return tops
@@ -688,7 +714,7 @@ class StratixDpuModel(DpuModel):
         '''
         num_cores = ceil(self.NUM_TCs / (cascade_len + 2))
         num_inports_per_core = cascade_len + 1
-        num_outports_per_core = 3
+        num_outports_per_core = self.TCCORE_COL_SIZE
         in_ports = num_cores * num_inports_per_core
         outports = num_outports_per_core * num_cores
         return in_ports, outports

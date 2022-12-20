@@ -15,74 +15,8 @@ from math import ceil, floor, sqrt
 import random
 import multiprocessing
 
-def plot_multi(
-    data: pd.DataFrame,
-    x: Union[str, None] = None,
-    y: Union[List[str], None] = None,
-    spacing: float = 0.1,
-    **kwargs
-) -> matplotlib.axes.Axes:
-    """Plot multiple Y axes on the same chart with same x axis.
-
-    Args:
-        data: dataframe which contains x and y columns
-        x: column to use as x axis. If None, use index.
-        y: list of columns to use as Y axes. If None, all columns are used
-            except x column.
-        spacing: spacing between the plots
-        **kwargs: keyword arguments to pass to data.plot()
-
-    Returns:
-        a matplotlib.axes.Axes object returned from data.plot()
-
-    Example:
-    >>> plot_multi(df, figsize=(22, 10))
-    >>> plot_multi(df, x='time', figsize=(22, 10))
-    >>> plot_multi(df, y='price qty value'.split(), figsize=(22, 10))
-    >>> plot_multi(df, x='time', y='price qty value'.split(), figsize=(22, 10))
-    >>> plot_multi(df[['time price qty'.split()]], x='time', figsize=(22, 10))
-
-    See Also:
-        This code is mentioned in https://stackoverflow.com/q/11640243/2593810
-    """
-    from pandas.plotting._matplotlib.style import get_standard_colors
-
-    # Get default color style from pandas - can be changed to any other color list
-    if y is None:
-        y = data.columns
-
-    # remove x_col from y_cols
-    if x:
-        y = [col for col in y if col != x]
-
-    if len(y) == 0:
-        return
-    colors = get_standard_colors(num_colors=len(y))
-
-    if "legend" not in kwargs:
-        kwargs["legend"] = False  # prevent multiple legends
-
-        # First axis
-    ax = data.plot(x=x, y=y[0], color=colors[0], **kwargs)
-    ax.set_ylabel(ylabel=y[0])
-    lines, labels = ax.get_legend_handles_labels()
-
-    for i in range(1, len(y)):
-        # Multiple y-axes
-        ax_new = ax.twinx()
-        ax_new.spines["right"].set_position(("axes", 1 + spacing * (i - 1)))
-        data.boxplot(
-            ax=ax_new, x=x, y=y[i], color=colors[i % len(colors)], **kwargs
-        )
-        ax_new.set_ylabel(ylabel=y[i])
-
-        # Proper legend position
-        line, label = ax_new.get_legend_handles_labels()
-        lines += line
-        labels += label
-
-    ax.legend(lines, labels, loc=0)
-    return ax
+TCCORE_COL_SIZE = 3
+TCCORE_SIZE = 20
 
 def factor_int(n: int):
     val = ceil(sqrt(float(n)))
@@ -152,7 +86,7 @@ def compute_matmul_performance(data_path, chain_len, out_w, hw_array_shape, \
         base_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
                                         exp_dat=fake_dense_data, freq=500, num_tcs=3960, tcc_array_shape=hw_array_shape, \
                                         tcc_chainlen=chain_len)
-        base_model.set_tccore_size(20)
+        base_model.set_tccore_size(TCCORE_SIZE)
         base_flops, base_lat = base_model.tensor_fpga21_mat_sparse_flops(fake_dense_data, \
                                                     sort_row_sparsity, False, \
                                                     using_single_column=False, sparse_block_size=sparse_block_size)
@@ -161,7 +95,7 @@ def compute_matmul_performance(data_path, chain_len, out_w, hw_array_shape, \
         sparse_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
                                         exp_dat=exps, freq=500, num_tcs=3960, tcc_array_shape=hw_array_shape, \
                                         tcc_chainlen=chain_len)
-        sparse_model.set_tccore_size(20)
+        sparse_model.set_tccore_size(TCCORE_SIZE)
         min_sparse_flops, min_sparse_lat = sparse_model.tensor_fpga21_mat_sparse_flops(exps, \
                                                     sort_row_sparsity, True, False, sparse_block_size, True)
         if mixed_chain_length is None:
@@ -173,7 +107,7 @@ def compute_matmul_performance(data_path, chain_len, out_w, hw_array_shape, \
             sparse_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
                                             exp_dat=exps, freq=500, num_tcs=3960, tcc_array_shape=hw_array_shape, \
                                             tcc_chainlen=mixed_chain_length)
-            sparse_model.set_tccore_size(20)
+            sparse_model.set_tccore_size(TCCORE_SIZE)
             sparse_flops, sparse_lat = sparse_model.tensor_fpga21_mat_sparse_flops(exps, \
                                                         sort_row_sparsity, False, \
                                                         using_single_column, sparse_block_size, False, short_to_long_ratio, \
@@ -271,13 +205,13 @@ def short_chain_len_profiling(data_path_list, seq_len_list, seq_len_range):
                 res_dat+=(none_zeros_row)
 
     avg_none_zeros = np.mean(res_dat)
-    min_len = ceil(avg_none_zeros / 20)
+    min_len = ceil(avg_none_zeros / TCCORE_SIZE)
     print(f"avg none zeros: {avg_none_zeros}, min len: {min_len}")
     print(f"quantiles: Q1: {np.quantile(res_dat, 0.25)}," + \
                         f"Q2: {np.quantile(res_dat, 0.5)}," + \
                         f"Q3: {np.quantile(res_dat, 0.75)}," + \
                         f"max: {np.amax(res_dat)}")
-    return ceil(np.quantile(res_dat, 0.75) / 20.0)
+    return ceil(np.quantile(res_dat, 0.75) / float(TCCORE_SIZE))
 
 def plot_perf_sparsity_simple_arglist (data_path, seq_len_path, s2l_ratio=0.3, fixed_chain_len = True, short_chain_len=2):
     if fixed_chain_len:
@@ -410,10 +344,12 @@ def single_case_analyzing(mat):
         fig, ax = plt.subplots()
         # ax.set_xlim((0, dat.shape[0]))
         # ax.set_ylim((0, dat.shape[1]))
+        ax.set_xlabel("K")
+        ax.set_ylabel("Q")
         ax.set_xticks([0, dat.shape[0]])
-        ax.set_xticks(np.arange(0, dat.shape[-1]+20, 20), minor=True)
+        ax.set_xticks(np.arange(0, dat.shape[-1]+TCCORE_SIZE, TCCORE_SIZE), minor=True)
         ax.set_yticks([0, dat.shape[1]])
-        ax.set_yticks(np.arange(0, dat.shape[0]+3, 3), minor=True)
+        ax.set_yticks(np.arange(0, dat.shape[0]+TCCORE_COL_SIZE, TCCORE_COL_SIZE), minor=True)
         ax.grid(which="major", alpha=0, color="green")
         ax.grid(which="minor", alpha=1, color="red")
         im = ax.imshow(dat)
@@ -424,14 +360,15 @@ def single_case_analyzing(mat):
         plt.close()
 
     sort_row_sparsity = True    
-    sparse_block_size = 20
+    sparse_block_size = TCCORE_SIZE
     out_w = 768
     hw_array_shape = factor_int(floor(3960.0/(6.0+2.0)))
     print("hw array shape: ", hw_array_shape)
 
-    # first pad the rows to be divisible by 3
-    rows_padded = (3 - mat.shape[0] % 3) if (mat.shape[0] % 3 > 0) else 0
-    cols_padded = (20 - mat.shape[1] % 20) if (mat.shape[1] % 20 > 0) else 0
+    # first pad the rows to be divisible by tensor core cols
+    rows_padded = (TCCORE_COL_SIZE - mat.shape[0] % TCCORE_COL_SIZE) \
+                    if (mat.shape[0] % TCCORE_COL_SIZE > 0) else 0
+    cols_padded = (TCCORE_SIZE - mat.shape[1] % TCCORE_SIZE) if (mat.shape[1] % TCCORE_SIZE > 0) else 0
     if rows_padded > 0 or cols_padded > 0:
         mat = np.pad(mat, ((0, rows_padded), (0, cols_padded)), "constant", constant_values=0)
 
@@ -442,7 +379,7 @@ def single_case_analyzing(mat):
     base_model = hw_modeling.StratixDpuModel(mat.shape[0], mat.shape[1], mat.shape[1], out_w, \
                                     exp_dat=fake_dense_data, freq=500, num_tcs=3960, tcc_array_shape=hw_array_shape, \
                                     tcc_chainlen=6)
-    base_model.set_tccore_size(20)
+    base_model.set_tccore_size(TCCORE_SIZE)
     base_flops, base_lat = base_model.tensor_fpga21_mat_sparse_flops(fake_dense_data, \
                                                 sort_row_sparsity, False, \
                                                 using_single_column=False, sparse_block_size=sparse_block_size)
@@ -454,7 +391,7 @@ def single_case_analyzing(mat):
     sparse_model = hw_modeling.StratixDpuModel(mat.shape[0], mat.shape[1], mat.shape[1], out_w, \
                                     exp_dat=mat, freq=500, num_tcs=3960, tcc_array_shape=hw_array_shape, \
                                     tcc_chainlen=6)
-    sparse_model.set_tccore_size(20)
+    sparse_model.set_tccore_size(TCCORE_SIZE)
     sparse_flops, sparse_lat = sparse_model.tensor_fpga21_mat_sparse_flops(mat, \
                                                     sort_row_sparsity, False, \
                                                     using_single_column=False, sparse_block_size=1, \
@@ -465,7 +402,7 @@ def single_case_analyzing(mat):
     seq_len = mat.shape[-1]
 
     # then block them into 3xtc core size and select the max length to compute delay
-    mat_in_row_grps = np.split(mat, np.arange(3, mat.shape[0], 3), axis=0)
+    mat_in_row_grps = np.split(mat, np.arange(TCCORE_COL_SIZE, mat.shape[0], TCCORE_COL_SIZE), axis=0)
     for row_grp in mat_in_row_grps:
         compressed_row_grp = []
         row_blocks = np.split(row_grp, np.arange(1, row_grp.shape[1], 1), axis=-1)
@@ -475,8 +412,8 @@ def single_case_analyzing(mat):
         if len(compressed_row_grp) > 0:
             compressed_row_grp = np.concatenate(compressed_row_grp, axis=-1)
 
-            if compressed_row_grp.shape[-1] % 20 > 0:
-                padded_ones = 20 - compressed_row_grp.shape[-1] % 20
+            if compressed_row_grp.shape[-1] % TCCORE_SIZE > 0:
+                padded_ones = TCCORE_SIZE - compressed_row_grp.shape[-1] % TCCORE_SIZE
                 compressed_row_grp = np.pad(compressed_row_grp, \
                                             ((0, 0), (0, padded_ones)), "constant", constant_values = 1)
             if compressed_row_grp.shape[-1] < seq_len:
@@ -484,7 +421,7 @@ def single_case_analyzing(mat):
                                             ((0, 0), (0, seq_len - compressed_row_grp.shape[-1])), \
                                             "constant", constant_values=0)
         else:
-            compressed_row_grp = np.zeros((3, seq_len))
+            compressed_row_grp = np.zeros((TCCORE_COL_SIZE, seq_len))
 
         # record max none zero values for each 3-row grp
         compressed_mat_map += [compressed_row_grp]
@@ -496,18 +433,18 @@ def single_case_analyzing(mat):
     sparse_model = hw_modeling.StratixDpuModel(mat.shape[0], mat.shape[1], mat.shape[1], out_w, \
                                     exp_dat=mat, freq=500, num_tcs=3960, tcc_array_shape=hw_array_shape, \
                                     tcc_chainlen=6)
-    sparse_model.set_tccore_size(20)
+    sparse_model.set_tccore_size(TCCORE_SIZE)
     mixed_sparse_flops, mixed_sparse_lat = sparse_model.tensor_fpga21_mat_sparse_flops(mat, \
                                                 sort_row_sparsity, False, \
-                                                using_single_column=False, sparse_block_size=20, \
+                                                using_single_column=False, sparse_block_size=TCCORE_SIZE, \
                                                 blocked_pruning=True)
     # create mat map for blocked pruning
     blocked_mat_map = []
     # then block them into 3xtc core size and select the max length to compute delay
-    mat_in_row_grps = np.split(mat, np.arange(3, mat.shape[0], 3), axis=0)
+    mat_in_row_grps = np.split(mat, np.arange(TCCORE_COL_SIZE, mat.shape[0], TCCORE_COL_SIZE), axis=0)
     for row_grp in mat_in_row_grps:
         compressed_row_grp = []
-        row_blocks = np.split(row_grp, np.arange(20, row_grp.shape[1], 20), axis=-1)
+        row_blocks = np.split(row_grp, np.arange(TCCORE_SIZE, row_grp.shape[1], TCCORE_SIZE), axis=-1)
         for block in row_blocks:
             if np.mean(block) > 0.001:
                 block = np.ones(block.shape)
@@ -566,11 +503,11 @@ def analyze_sparsity_blocking(file_path, seq_len_path):
         ideal_sparsity = get_mat_sparsity(att)
 
         block_sparse_mat_non_zeros = 0
-        zeros_padded = att.shape[0] % 3
+        zeros_padded = att.shape[0] % TCCORE_COL_SIZE
         if zeros_padded > 0:
-            att = np.pad(att, (0, 3 - zeros_padded), "constant", constant_values=0)
+            att = np.pad(att, (0, TCCORE_COL_SIZE - zeros_padded), "constant", constant_values=0)
         # then block them into 3xtc core size and select the max length to compute delay
-        mat_in_row_grps = np.split(att, np.arange(3, att.shape[0], 3), axis=0)
+        mat_in_row_grps = np.split(att, np.arange(TCCORE_COL_SIZE, att.shape[0], TCCORE_COL_SIZE), axis=0)
         for row_grp in mat_in_row_grps:
             compressed_row_grp = []
             row_blocks = np.split(row_grp, np.arange(1, row_grp.shape[1], 1), axis=-1)
@@ -607,48 +544,67 @@ def analyze_block_sparsity_compare(file_path, seq_len_path, transpose=True, sort
             # skip if matrix is fully dense
             if np.count_nonzero(mat) / mat.size < 1.:
                 dense_mask = np.where(mat > 0.0, 1, 0)
-                zeros_padded = dense_mask.shape[0] % 3
+                zeros_padded = dense_mask.shape[0] % TCCORE_COL_SIZE
                 if zeros_padded > 0:
-                    dense_mask = np.pad(dense_mask, (0, 3 - zeros_padded), "constant", \
+                    dense_mask = np.pad(dense_mask, (0, TCCORE_COL_SIZE - zeros_padded), "constant", \
                                             constant_values=0)
-                    mat = np.pad(mat, (0, 3 - zeros_padded), "constant", \
+                    mat = np.pad(mat, (0, TCCORE_COL_SIZE - zeros_padded), "constant", \
                                             constant_values=0)
                 res = []
                 h_dist = lambda x, y: hamming(x, y) * len(x)
 
-                while dense_mask.shape[0] > 3:
-                    to_compare = dense_mask[0]
-                    dense_mask = np.delete(dense_mask, 0, axis=0)
-                    res.append(mat[0])
-                    mat = np.delete(mat, 0, axis=0)
+                if TCCORE_COL_SIZE == 3:
+                    while dense_mask.shape[0] > 3:
+                        to_compare = dense_mask[0]
+                        dense_mask = np.delete(dense_mask, 0, axis=0)
+                        res.append(mat[0])
+                        mat = np.delete(mat, 0, axis=0)
 
-                    min_hdist = [len(to_compare), len(to_compare)]
-                    min_idx = [0, 0]
-                    for idx, r in enumerate(dense_mask):
-                        c_hdist = h_dist(to_compare, r)
-                        if c_hdist < min_hdist[0]:
-                            min_hdist = [c_hdist, min_hdist[0]]
-                            min_idx = [idx, min_idx[0]]
-                        elif c_hdist < min_hdist[1]:
-                            min_hdist[1] = c_hdist
-                            min_idx[1] = idx
-                    
-                    res.append(mat[min_idx[0]])
-                    res.append(mat[min_idx[1]])
-                    mat = np.delete(mat, min_idx, axis=0)
-                    dense_mask = np.delete(dense_mask, min_idx, axis=0)
+                        min_hdist = [len(to_compare), len(to_compare)]
+                        min_idx = [0, 0]
+                        for idx, r in enumerate(dense_mask):
+                            c_hdist = h_dist(to_compare, r)
+                            if c_hdist < min_hdist[0]:
+                                min_hdist = [c_hdist, min_hdist[0]]
+                                min_idx = [idx, min_idx[0]]
+                            elif c_hdist < min_hdist[1]:
+                                min_hdist[1] = c_hdist
+                                min_idx[1] = idx
+                        
+                        res.append(mat[min_idx[0]])
+                        res.append(mat[min_idx[1]])
+                        mat = np.delete(mat, min_idx, axis=0)
+                        dense_mask = np.delete(dense_mask, min_idx, axis=0)
+                elif TCCORE_COL_SIZE == 2:
+                    while dense_mask.shape[0] > 2:
+                        to_compare = dense_mask[0]
+                        dense_mask = np.delete(dense_mask, 0, axis=0)
+                        res.append(mat[0])
+                        mat = np.delete(mat, 0, axis=0)
+
+                        min_hdist = len(to_compare)
+                        min_idx = 0
+                        for idx, r in enumerate(dense_mask):
+                            c_hdist = h_dist(to_compare, r)
+                            if c_hdist < min_hdist:
+                                min_hdist = c_hdist
+                                min_idx = idx
+                        
+                        res.append(mat[min_idx])
+                        mat = np.delete(mat, min_idx, axis=0)
+                        dense_mask = np.delete(dense_mask, min_idx, axis=0)
 
                 for r in mat: res.append(r)
                 mat = np.array(res)
 
-        zeros_padded = mat.shape[0] % 3
+        zeros_padded = mat.shape[0] % TCCORE_COL_SIZE
         if transpose:
             mat = np.transpose(mat)
         if zeros_padded > 0:
-            mat = np.pad(mat, (0, 3 - zeros_padded), "constant", constant_values=0)
+            mat = np.pad(mat, (0, TCCORE_COL_SIZE - zeros_padded), "constant", constant_values=0)
             
         #apply sparse blocks to the matrix
-        mean_pooling_res = skimage.measure.block_reduce(mat, (3,20), np.mean)
+        mean_pooling_res = skimage.measure.block_reduce(mat, (TCCORE_COL_SIZE, TCCORE_SIZE), np.mean)
         block_sparse_mask = np.where(mean_pooling_res > 0.001, 1, 0)
         
         #compute block sparsity for the matrix with block sparse
@@ -822,7 +778,7 @@ def main():
         plt.ylabel("speed up")
         plt.legend()
         plt.grid(linewidth=0.3)
-        plt.savefig(output_path + f"speedup_vs_layer_mixed_chainlen_opt_stapruning({short_chain_len},{chain_len_idx}).png")
+        plt.savefig(output_path + f"speedup_vs_layer_mixed_chainlen_opt_stapruning_fixed({short_chain_len},{chain_len_idx}).png")
         plt.clf()
 
 if __name__ == "__main__":
