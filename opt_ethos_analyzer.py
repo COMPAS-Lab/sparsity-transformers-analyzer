@@ -14,11 +14,12 @@ import pandas as pd
 from torch import nn
 
 from pprint import pprint
+import random
 
 PARAM_PATH = "./params/"
 DATA_PATH = "./data"
 CONTEXT_LEN = 128
-MODEL_NAME = "facebook/opt-6.7b"
+MODEL_NAME = "opt-1.3b"
 
 def analyze_model_params(model):
     for name, params in model.named_parameters():
@@ -27,10 +28,10 @@ def analyze_model_params(model):
             print(params.shape)
             print(params[0])
 
-def prepare_dataset_and_tokenize_for_evaluation(split="train"):
+def prepare_dataset_and_tokenize_for_evaluation():
         
     def tokenize(element):
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=False)
+        tokenizer = AutoTokenizer.from_pretrained("facebook/"+MODEL_NAME, use_fast=False)
         outputs = tokenizer(
             element,
             # return_overflowing_tokens=True,
@@ -39,7 +40,7 @@ def prepare_dataset_and_tokenize_for_evaluation(split="train"):
         )
         return outputs.input_ids
 
-    ethos_dat = load_dataset("ethos", "binary", split=split)
+    ethos_dat = load_dataset("ethos", "binary", split="train[:-10%]")
     print(ethos_dat)
 
     tokenized_datasets = []
@@ -50,10 +51,10 @@ def prepare_dataset_and_tokenize_for_evaluation(split="train"):
     print("num insts: ", len(tokenized_datasets))
     return tokenized_datasets
 
-def prepare_dataset_and_tokenize_for_training():
+def prepare_dataset_and_tokenize_for_training(accelerator: Accelerator):
+    tokenizer = AutoTokenizer.from_pretrained("facebook/"+MODEL_NAME, use_fast=False)
     
     def tokenize(element):
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=False)
         outputs = tokenizer(
             element["text"],
             truncation=True,
@@ -64,38 +65,38 @@ def prepare_dataset_and_tokenize_for_training():
         )
         return outputs
 
-    ethos_dat_training = load_dataset("ethos", "binary", split="train[:90%]")
-    ethos_dat_eval = load_dataset("ethos", "binary", split="train[:-10%]")
+    def collate_fn(examples):
+        return tokenizer.pad(examples, padding="longest", return_tensors="pt")
 
-    train_dataset = ethos_dat_training.map(tokenize, batched=True)
-    train_dataset.set_format("pt", columns=["input_ids", "attention_mask"], output_all_columns=True)
+    ethos_dat_training = load_dataset("ethos", "binary", split=[f"train[{k}%:{k+10}%]" for k in range(0, 90, 10)])
+    train_dataset = []
+    with accelerator.main_process_first():
+        for dat in ethos_dat_training:
+            temp_dataset = dat.map(tokenize, batched=True, remove_columns=["text"])
+            temp_dataset = temp_dataset.rename_column("label", "labels")
+            temp_dataset = torch.utils.data.DataLoader(temp_dataset, shuffle=True, collate_fn=collate_fn, batch_size=16)
+            train_dataset.append(temp_dataset)
 
-    eval_dataset = ethos_dat_training.map(tokenize, batched=True)
-    eval_dataset.set_format("pt", columns=["input_ids", "attention_mask"], output_all_columns=True)
-
-    return train_dataset, eval_dataset
+    return train_dataset
 
 def finetune_model():
+    accelerator = Accelerator()
+
     def compute_metrics(eval_pred):
         logits, labels = eval_pred
         pred_res = np.argmax(logits, axis=-1)
         metric = evaluate.load("accuracy")
         return metric.compute(predictions=pred_res, references=labels)
 
-    model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, cache_dir=".opt_cache", num_labels=2)
+    model = AutoModelForSequenceClassification.from_pretrained("facebook/"+MODEL_NAME, cache_dir=".opt_cache", num_labels=2)
     optimizer = AdamW(model.parameters(), lr=2e-5)
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=False)
-    train_dataset, eval_dataset = prepare_dataset_and_tokenize_for_training()
-    train_dataset = torch.utils.data.DataLoader(train_dataset, batch_size=16)
+    train_dataset = prepare_dataset_and_tokenize_for_training(accelerator)
 
-    accelerator = Accelerator()
+    num_epochs, num_insts = 3, 0
+    for dat in train_dataset:
+        num_insts += len(dat)
 
-    train_dataset, eval_dataset, model, optimizer = accelerator.prepare(
-        train_dataset, eval_dataset, model, optimizer
-    )
-
-    num_epochs = 3
-    num_training_steps = num_epochs * len(train_dataset)
+    num_training_steps = num_epochs * num_insts
     lr_scheduler = get_scheduler(
         "linear",
         optimizer=optimizer,
@@ -103,18 +104,26 @@ def finetune_model():
         num_training_steps=num_training_steps
     )
 
+    # may not accept list
+    train_dataset, model, optimizer, lr_scheduler = accelerator.prepare(
+        train_dataset, model, optimizer, lr_scheduler
+    )
+
+    print(train_dataset)
     model.train()
     for epoch in range(num_epochs):
-        for batch in train_dataset:
-            outputs = model(batch["input_ids"].to(model.device), labels = batch["label"], attention_mask=batch["attention_mask"].to(model.device), output_hidden_states=False, output_attentions=True)
-            loss = outputs.loss
-            accelerator.backward(loss)
+        print(f"training...epoch {epoch}")
+        for epoch_dat in train_dataset:
+            for batch in epoch_dat:
+                outputs = model(**batch, output_hidden_states=False, output_attentions=True)
+                loss = outputs.loss
+                accelerator.backward(loss)
 
-            optimizer.step()
-            lr_scheduler.step()
-            optimizer.zero_grad()
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
 
-    model.save_pretrained(".opt_cache/opt-6.7b-finetuned")
+    model.save_pretrained(f".opt_cache/{MODEL_NAME}-finetuned")
     
 def evaluate_model():
     losses = []
@@ -122,7 +131,7 @@ def evaluate_model():
     predicted_labels = []
     num_labels_as_one = 0.0
 
-    model = AutoModelForSequenceClassification.from_pretrained(".opt_cache/opt-1.3b-finetuned", num_labels=2)
+    model = AutoModelForSequenceClassification.from_pretrained(f".opt_cache/{MODEL_NAME}-finetuned", num_labels=2)
     tokenized_dataset = prepare_dataset_and_tokenize_for_evaluation()
     # eval_dataloader = DataLoader(tokenized_dataset, batch_size = 4)
     # print(f"len of eval data: {len(eval_dataloader)}")
@@ -169,7 +178,7 @@ def evaluate_model():
     return res_probs, res_accu, res_f1
 
     # prepare all attention and save them
-    for l in range(48):
+    for l in range(24):
         attns_from_same_layer = []
         seq_lens = []
         for inst in all_attn:
