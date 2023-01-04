@@ -69,9 +69,12 @@ def prepare_dataset_and_tokenize_for_training(accelerator: Accelerator):
     def collate_fn(examples):
         return tokenizer.pad(examples, padding="longest", return_tensors="pt")
 
-    ethos_dat_training = load_dataset("ethos", "binary", split=[f"train[{k}:{k+90}]" for k in range(0, 900, 90)], cache_dir=OPT_CACHE)
-    random.shuffle(ethos_dat_training)
-    train_dataset = []
+    ethos_dat = load_dataset("ethos", "binary", split="train", cache_dir=OPT_CACHE)
+    indices = list(range(len(ethos_dat)))
+    random.shuffle(indices)
+    
+    ethos_dat_training = [ethos_dat.select(indices[k:k+90]) for k in range(0, 900, 90)]
+    train_dataset = []  
     with accelerator.main_process_first():
         for dat in ethos_dat_training:
             temp_dataset = dat.map(tokenize, batched=True, remove_columns=["text"])
@@ -79,10 +82,9 @@ def prepare_dataset_and_tokenize_for_training(accelerator: Accelerator):
             temp_dataset = torch.utils.data.DataLoader(temp_dataset, shuffle=True, collate_fn=collate_fn, batch_size=16)
             train_dataset.append(temp_dataset)
 
-    ethos_dat_eval = load_dataset("ethos", "binary", split="train[900:]", cache_dir=OPT_CACHE)
-    eval_dataset = None
+    eval_dataset = ethos_dat.select(indices[900:])
     with accelerator.main_process_first():
-        temp_dataset = ethos_dat_eval.map(tokenize, batched=True, remove_columns=["text"])
+        temp_dataset = eval_dataset.map(tokenize, batched=True, remove_columns=["text"])
         temp_dataset = temp_dataset.rename_column("label", "labels")
         eval_dataset = torch.utils.data.DataLoader(temp_dataset, shuffle=True, collate_fn=collate_fn, batch_size=16)
 
@@ -136,7 +138,6 @@ def finetune_model():
                 outputs = model(**batch, output_hidden_states=False, output_attentions=False)
             predictions = outputs.logits.argmax(dim=-1)
             predictions, references = accelerator.gather_for_metrics((predictions, batch["labels"]))
-            accelerator.print(predictions, references)
             eval_f1_metric.add_batch(
                 predictions = predictions,
                 references = references,
@@ -150,7 +151,7 @@ def finetune_model():
         eval_res = eval_f1_metric.compute(), eval_acc_metric.compute()
         accelerator.print(f"epoch {epoch_idx} f1 and accuracy: ", eval_res)
 
-    model.save_pretrained(f"{OPT_CACHE}/{MODEL_NAME}-finetuned")
+    model.module.save_pretrained(f"{OPT_CACHE}/{MODEL_NAME}-finetuned")
     
 def evaluate_model():
     losses = []
