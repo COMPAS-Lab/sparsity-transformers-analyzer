@@ -20,6 +20,7 @@ PARAM_PATH = "./params/"
 DATA_PATH = "./data"
 CONTEXT_LEN = 128
 MODEL_NAME = "opt-1.3b"
+OPT_CACHE = "/chronos_data/tji/opt_model_cache"
 
 def analyze_model_params(model):
     for name, params in model.named_parameters():
@@ -31,7 +32,7 @@ def analyze_model_params(model):
 def prepare_dataset_and_tokenize_for_evaluation():
         
     def tokenize(element):
-        tokenizer = AutoTokenizer.from_pretrained("facebook/"+MODEL_NAME, use_fast=False)
+        tokenizer = AutoTokenizer.from_pretrained("facebook/"+MODEL_NAME, use_fast=False, cache_dir=OPT_CACHE)
         outputs = tokenizer(
             element,
             # return_overflowing_tokens=True,
@@ -40,7 +41,7 @@ def prepare_dataset_and_tokenize_for_evaluation():
         )
         return outputs.input_ids
 
-    ethos_dat = load_dataset("ethos", "binary", split="train[:-10%]")
+    ethos_dat = load_dataset("ethos", "binary", split="train[90%:]", cache_dir=OPT_CACHE)
     print(ethos_dat)
 
     tokenized_datasets = []
@@ -52,7 +53,7 @@ def prepare_dataset_and_tokenize_for_evaluation():
     return tokenized_datasets
 
 def prepare_dataset_and_tokenize_for_training(accelerator: Accelerator):
-    tokenizer = AutoTokenizer.from_pretrained("facebook/"+MODEL_NAME, use_fast=False)
+    tokenizer = AutoTokenizer.from_pretrained("facebook/"+MODEL_NAME, use_fast=False, cache_dir=OPT_CACHE)
     
     def tokenize(element):
         outputs = tokenizer(
@@ -68,7 +69,8 @@ def prepare_dataset_and_tokenize_for_training(accelerator: Accelerator):
     def collate_fn(examples):
         return tokenizer.pad(examples, padding="longest", return_tensors="pt")
 
-    ethos_dat_training = load_dataset("ethos", "binary", split=[f"train[{k}%:{k+10}%]" for k in range(0, 90, 10)])
+    ethos_dat_training = load_dataset("ethos", "binary", split=[f"train[{k}:{k+90}]" for k in range(0, 900, 90)], cache_dir=OPT_CACHE)
+    random.shuffle(ethos_dat_training)
     train_dataset = []
     with accelerator.main_process_first():
         for dat in ethos_dat_training:
@@ -77,53 +79,78 @@ def prepare_dataset_and_tokenize_for_training(accelerator: Accelerator):
             temp_dataset = torch.utils.data.DataLoader(temp_dataset, shuffle=True, collate_fn=collate_fn, batch_size=16)
             train_dataset.append(temp_dataset)
 
-    return train_dataset
+    ethos_dat_eval = load_dataset("ethos", "binary", split="train[900:]", cache_dir=OPT_CACHE)
+    eval_dataset = None
+    with accelerator.main_process_first():
+        temp_dataset = ethos_dat_eval.map(tokenize, batched=True, remove_columns=["text"])
+        temp_dataset = temp_dataset.rename_column("label", "labels")
+        eval_dataset = torch.utils.data.DataLoader(temp_dataset, shuffle=True, collate_fn=collate_fn, batch_size=16)
+
+    return train_dataset, eval_dataset
 
 def finetune_model():
     accelerator = Accelerator()
 
-    def compute_metrics(eval_pred):
-        logits, labels = eval_pred
-        pred_res = np.argmax(logits, axis=-1)
-        metric = evaluate.load("accuracy")
-        return metric.compute(predictions=pred_res, references=labels)
-
-    model = AutoModelForSequenceClassification.from_pretrained("facebook/"+MODEL_NAME, cache_dir=".opt_cache", num_labels=2)
+    model = AutoModelForSequenceClassification.from_pretrained("facebook/"+MODEL_NAME, cache_dir=OPT_CACHE, num_labels=2)
+    model = model.to(accelerator.device)
     optimizer = AdamW(model.parameters(), lr=2e-5)
-    train_dataset = prepare_dataset_and_tokenize_for_training(accelerator)
+    train_dataset, eval_dataset = prepare_dataset_and_tokenize_for_training(accelerator)
 
-    num_epochs, num_insts = 3, 0
+    num_epochs, num_training_steps = 10, 0
+    random.shuffle(train_dataset)
     for dat in train_dataset:
-        num_insts += len(dat)
+        num_training_steps += len(dat)
 
-    num_training_steps = num_epochs * num_insts
     lr_scheduler = get_scheduler(
         "linear",
         optimizer=optimizer,
-        num_warmup_steps=0,
+        num_warmup_steps=100,
         num_training_steps=num_training_steps
     )
 
     # may not accept list
-    train_dataset, model, optimizer, lr_scheduler = accelerator.prepare(
-        train_dataset, model, optimizer, lr_scheduler
+    train_dataset, eval_dataset, model, optimizer, lr_scheduler = accelerator.prepare(
+        train_dataset, eval_dataset, model, optimizer, lr_scheduler
     )
 
-    print(train_dataset)
-    model.train()
-    for epoch in range(num_epochs):
-        print(f"training...epoch {epoch}")
-        for epoch_dat in train_dataset:
-            for batch in epoch_dat:
-                outputs = model(**batch, output_hidden_states=False, output_attentions=True)
-                loss = outputs.loss
-                accelerator.backward(loss)
+    eval_f1_metric = evaluate.load("f1")
+    eval_acc_metric = evaluate.load("accuracy")
 
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+    for epoch_idx in range(num_epochs):
+        print(f"running epoch {epoch_idx}...")
+        model.train()
+        for batch in train_dataset[epoch_idx]:
+            batch.to(accelerator.device)
+            outputs = model(**batch, output_hidden_states=False, output_attentions=True)
+            loss = outputs.loss
+            accelerator.backward(loss)
 
-    model.save_pretrained(f".opt_cache/{MODEL_NAME}-finetuned")
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+
+        model.eval()
+        for batch in eval_dataset:
+            batch.to(accelerator.device)
+            with torch.no_grad():
+                outputs = model(**batch, output_hidden_states=False, output_attentions=False)
+            predictions = outputs.logits.argmax(dim=-1)
+            predictions, references = accelerator.gather_for_metrics((predictions, batch["labels"]))
+            accelerator.print(predictions, references)
+            eval_f1_metric.add_batch(
+                predictions = predictions,
+                references = references,
+            )
+            eval_acc_metric.add_batch(
+                predictions = predictions,
+                references = references,
+            )
+
+
+        eval_res = eval_f1_metric.compute(), eval_acc_metric.compute()
+        accelerator.print(f"epoch {epoch_idx} f1 and accuracy: ", eval_res)
+
+    model.save_pretrained(f"{OPT_CACHE}/{MODEL_NAME}-finetuned")
     
 def evaluate_model():
     losses = []
@@ -131,7 +158,7 @@ def evaluate_model():
     predicted_labels = []
     num_labels_as_one = 0.0
 
-    model = AutoModelForSequenceClassification.from_pretrained(f".opt_cache/{MODEL_NAME}-finetuned", num_labels=2)
+    model = AutoModelForSequenceClassification.from_pretrained(f"{OPT_CACHE}/{MODEL_NAME}-finetuned", num_labels=2)
     tokenized_dataset = prepare_dataset_and_tokenize_for_evaluation()
     # eval_dataloader = DataLoader(tokenized_dataset, batch_size = 4)
     # print(f"len of eval data: {len(eval_dataloader)}")
@@ -170,9 +197,10 @@ def evaluate_model():
 
     print(f"number of hate speeches: {num_labels_as_one / len(tokenized_dataset)}")
     f1_metric = evaluate.load("f1")
-    acc_metric = evaluate.load("accuracy")
     res_f1 = f1_metric.compute(predictions=predicted_labels, 
                                 references = [i["label"] for i in tokenized_dataset])
+     
+    acc_metric = evaluate.load("accuracy")
     res_accu = acc_metric.compute(predictions=predicted_labels, 
                                 references = [i["label"] for i in tokenized_dataset])
     return res_probs, res_accu, res_f1
@@ -200,8 +228,8 @@ def evaluate_model():
 
 def main():
     finetune_model()
-    logits, accu, f1 = evaluate_model()
-    print("accu: ", accu, "f1: ", f1)
+    # logits, accu, f1 = evaluate_model()
+    # print("accu: ", accu, "f1: ", f1)
 
 
 if __name__ == "__main__":
