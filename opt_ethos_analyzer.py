@@ -5,7 +5,7 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer, \
                             TrainingArguments, Trainer, DataCollatorWithPadding, \
                             AdamW, get_scheduler
 from accelerate import Accelerator
-from datasets import load_dataset, DatasetDict
+from datasets import load_dataset, DatasetDict, load_from_disk
 import evaluate
 import torch
 from torch.utils.data.dataloader import DataLoader
@@ -41,7 +41,7 @@ def prepare_dataset_and_tokenize_for_evaluation():
         )
         return outputs.input_ids
 
-    ethos_dat = load_dataset("ethos", "binary", split="train[90%:]", cache_dir=OPT_CACHE)
+    ethos_dat = load_from_disk(f"{OPT_CACHE}/ethos-eval-dataset")
     print(ethos_dat)
 
     tokenized_datasets = []
@@ -83,11 +83,12 @@ def prepare_dataset_and_tokenize_for_training(accelerator: Accelerator):
             train_dataset.append(temp_dataset)
 
     eval_dataset = ethos_dat.select(indices[900:])
+    eval_dataset.save_to_disk(f"{OPT_CACHE}/ethos-eval-dataset")
     with accelerator.main_process_first():
         temp_dataset = eval_dataset.map(tokenize, batched=True, remove_columns=["text"])
         temp_dataset = temp_dataset.rename_column("label", "labels")
         eval_dataset = torch.utils.data.DataLoader(temp_dataset, shuffle=True, collate_fn=collate_fn, batch_size=16)
-
+    
     return train_dataset, eval_dataset
 
 def finetune_model():
@@ -98,7 +99,7 @@ def finetune_model():
     optimizer = AdamW(model.parameters(), lr=2e-5)
     train_dataset, eval_dataset = prepare_dataset_and_tokenize_for_training(accelerator)
 
-    num_epochs, num_training_steps = 10, 0
+    num_epochs, num_training_steps = 3, 0
     random.shuffle(train_dataset)
     for dat in train_dataset:
         num_training_steps += len(dat)
@@ -107,7 +108,7 @@ def finetune_model():
         "linear",
         optimizer=optimizer,
         num_warmup_steps=100,
-        num_training_steps=num_training_steps
+        num_training_steps=num_training_steps*num_epochs
     )
 
     # may not accept list
@@ -115,49 +116,54 @@ def finetune_model():
         train_dataset, eval_dataset, model, optimizer, lr_scheduler
     )
 
-    eval_f1_metric = evaluate.load("f1")
-    eval_acc_metric = evaluate.load("accuracy")
-
     for epoch_idx in range(num_epochs):
         print(f"running epoch {epoch_idx}...")
-        model.train()
-        for batch in train_dataset[epoch_idx]:
-            batch.to(accelerator.device)
-            outputs = model(**batch, output_hidden_states=False, output_attentions=True)
-            loss = outputs.loss
-            accelerator.backward(loss)
+        random.shuffle(train_dataset)
+        
+        eval_f1_metric = evaluate.load("f1")
+        eval_acc_metric = evaluate.load("accuracy")
 
-            optimizer.step()
-            lr_scheduler.step()
-            optimizer.zero_grad()
+        for chunk in train_dataset:
+            model.train()
+            for batch in train_dataset[epoch_idx]:
+                batch.to(accelerator.device)
+                outputs = model(**batch, output_hidden_states=False, output_attentions=True)
+                loss = outputs.loss
+                accelerator.backward(loss)
 
-        model.eval()
-        for batch in eval_dataset:
-            batch.to(accelerator.device)
-            with torch.no_grad():
-                outputs = model(**batch, output_hidden_states=False, output_attentions=False)
-            predictions = outputs.logits.argmax(dim=-1)
-            predictions, references = accelerator.gather_for_metrics((predictions, batch["labels"]))
-            eval_f1_metric.add_batch(
-                predictions = predictions,
-                references = references,
-            )
-            eval_acc_metric.add_batch(
-                predictions = predictions,
-                references = references,
-            )
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
 
+            model.eval()
+            for batch in eval_dataset:
+                batch.to(accelerator.device)
+                with torch.no_grad():
+                    outputs = model(**batch, output_hidden_states=False, output_attentions=False)
+                predictions = outputs.logits.argmax(dim=-1)
+                predictions, references = accelerator.gather_for_metrics((predictions, batch["labels"]))
+                eval_f1_metric.add_batch(
+                    predictions = predictions,
+                    references = references,
+                )
+                eval_acc_metric.add_batch(
+                    predictions = predictions,
+                    references = references,
+                )
 
-        eval_res = eval_f1_metric.compute(), eval_acc_metric.compute()
-        accelerator.print(f"epoch {epoch_idx} f1 and accuracy: ", eval_res)
+            eval_res = eval_f1_metric.compute(), eval_acc_metric.compute()
+            accelerator.print(f"epoch {epoch_idx} f1 and accuracy: ", eval_res)
 
-    model.module.save_pretrained(f"{OPT_CACHE}/{MODEL_NAME}-finetuned")
+    model.save_pretrained(f"{OPT_CACHE}/{MODEL_NAME}-finetuned")
     
 def evaluate_model():
     losses = []
     res_probs = []
     predicted_labels = []
     num_labels_as_one = 0.0
+
+    def get_mat_sparsity(dat):
+        return (1. - torch.count_nonzero(dat) / torch.numel(dat))
 
     model = AutoModelForSequenceClassification.from_pretrained(f"{OPT_CACHE}/{MODEL_NAME}-finetuned", num_labels=2)
     tokenized_dataset = prepare_dataset_and_tokenize_for_evaluation()
@@ -166,7 +172,7 @@ def evaluate_model():
     # run model
     analyze_model_params(model)
 
-    all_attn = []
+    all_attn, attn_sparsities = [], []
     max_seq_len = 0
     for step, dat in enumerate(tokenized_dataset):
         print(f"step {step} :")
@@ -174,9 +180,10 @@ def evaluate_model():
             input_ids_tensor, l = \
                 dat["ids"].to(model.device), \
                 torch.tensor(dat["label"], dtype=torch.long,  device="cpu")
+            attention_mask = torch.ones(*input_ids_tensor.size()).to(model.device)
             model_output = model(input_ids_tensor, \
                                     output_hidden_states=False, output_attentions=True, \
-                                    labels=l)
+                                    labels=l, attention_mask=attention_mask)
         losses.append(model_output.loss.item())
         prob = nn.functional.softmax(torch.squeeze(model_output.logits), dim=-1)
         res_probs.append(prob)
@@ -189,12 +196,12 @@ def evaluate_model():
             print(f"find mismatch: {predicted_label} vs. ", dat["label"])
             print(f"logits:{torch.squeeze(model_output.logits)}, prob: {prob}")
 
-        # curr_attn = torch.stack(list(model_output.attentions)).to("cpu")
-        # curr_attn = torch.squeeze(curr_attn)
-        # print(curr_attn.size())
-        # if max_seq_len < curr_attn.size()[-1]:
-        #     max_seq_len = curr_attn.size()[-1]
-        # all_attn.append(curr_attn)
+        curr_attn = torch.stack(list(model_output.attentions)).to("cpu")
+        curr_attn = torch.squeeze(curr_attn)
+        attn_sparsities.append(get_mat_sparsity(curr_attn))
+        if max_seq_len < curr_attn.size()[-1]:
+             max_seq_len = curr_attn.size()[-1]
+        all_attn.append(curr_attn)
 
     print(f"number of hate speeches: {num_labels_as_one / len(tokenized_dataset)}")
     f1_metric = evaluate.load("f1")
@@ -204,7 +211,7 @@ def evaluate_model():
     acc_metric = evaluate.load("accuracy")
     res_accu = acc_metric.compute(predictions=predicted_labels, 
                                 references = [i["label"] for i in tokenized_dataset])
-    return res_probs, res_accu, res_f1
+    print("average attention sparsity: ", np.mean(attn_sparsities))
 
     # prepare all attention and save them
     for l in range(24):
@@ -222,15 +229,15 @@ def evaluate_model():
         attns_from_same_layer = torch.stack(attns_from_same_layer)
         seq_lens = torch.tensor(seq_lens).type(torch.int)
         print(f"layer {l} attn shape: {attns_from_same_layer.size()}")
-        torch.save(attns_from_same_layer, f"./temp_dat/bfp_attn/{l}-0.pt")
-        torch.save(seq_lens, f"./temp_dat/seqlen/{l}-0.pt")
+        torch.save(attns_from_same_layer, f"./data/opt_1.3b/attns/{l}-0.pt")
+        torch.save(seq_lens, f"./data/opt_1.3b/seqlen/{l}-0.pt")
 
-    return res_probs, res_accu
+    return res_probs, res_accu, res_f1
 
 def main():
-    finetune_model()
-    # logits, accu, f1 = evaluate_model()
-    # print("accu: ", accu, "f1: ", f1)
+    # finetune_model()
+    logits, accu, f1 = evaluate_model()
+    print("accu: ", accu, "f1: ", f1)
 
 
 if __name__ == "__main__":
