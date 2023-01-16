@@ -213,6 +213,7 @@ def evaluate_model():
                                 references = [i["label"] for i in tokenized_dataset])
     print("average attention sparsity: ", np.mean(attn_sparsities))
 
+    return res_probs, res_accu, res_f1
     # prepare all attention and save them
     for l in range(24):
         attns_from_same_layer = []
