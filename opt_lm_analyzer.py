@@ -8,18 +8,17 @@ from torch.utils.data.dataloader import DataLoader
 import numpy as np
 import pandas as pd
 from math import isnan
-
+from sparse_tensor_analyzer import get_mat_sparsity
 from pprint import pprint
 
 PARAM_PATH = "./params/"
 DATA_PATH = "./data"
 CONTEXT_LEN = 1024
-MODEL_NAME = "facebook/opt-1.3b"
+MODEL_NAME = "facebook/opt-30b"
 NUM_LAYERS = 24
-OPT_CACHE = "/chronos_data/tji/opt_model_cache"
 
 def tokenize(element):
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=False, cache_dir=OPT_CACHE)
+    tokenizer = AutoTokenizer.from_pretrained("facebook/opt-13b")
     outputs = tokenizer(
         element,
         # truncation=True,
@@ -33,7 +32,7 @@ def tokenize(element):
     return outputs.input_ids
 
 def prepare_dataset_and_tokenize():
-    wikitext_valid = load_dataset("wikitext", "wikitext-103-v1", split="test", cache_dir=OPT_CACHE)
+    wikitext_valid = load_dataset("wikitext", "wikitext-103-v1", split="test")
     # wikitext_valid = wikitext_valid.filter(lambda x: x["language"] == "en")
     print(wikitext_valid)
 
@@ -55,7 +54,7 @@ def evaluate_model():
     loss = 0.0
     losses = []
 
-    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, device_map="auto", cache_dir=OPT_CACHE)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, device_map="auto")
     tokenized_dataset = prepare_dataset_and_tokenize()
     # eval_dataloader = DataLoader(tokenized_dataset, batch_size = 4)
     # print(f"len of eval data: {len(eval_dataloader)}")
@@ -63,11 +62,10 @@ def evaluate_model():
 
     all_attn = []
     max_seq_len = 0
+    attn_sparsities = []
     for step, input_ids_tensor in enumerate(tokenized_dataset):
         print(f"step {step} :")
         with torch.no_grad():
-            # input_ids_tensor = input_ids_tensor.to(model.device)
-            print(input_ids_tensor)
             model_output = model(input_ids_tensor["ids"].to(model.device), \
                                     output_hidden_states=False, output_attentions=True, \
                                     labels=input_ids_tensor["ids"].to(model.device))
@@ -75,10 +73,9 @@ def evaluate_model():
         curr_attn = torch.stack(list(model_output.attentions)).to("cpu")
         curr_attn = torch.squeeze(curr_attn)
 
-        print(curr_attn.size())
         if max_seq_len < curr_attn.size()[-1]:
             max_seq_len = curr_attn.size()[-1]
-        all_attn.append(curr_attn)
+        attn_sparsities.append(get_mat_sparsity(curr_attn, causal_mask=True))
 
     # prepare all attention and save them
     # for l in range(NUM_LAYERS):
@@ -103,11 +100,12 @@ def evaluate_model():
     except OverflowError:
         pplx = float("inf")
 
-    return pplx.item()
+    return pplx.item(), attn_sparsities
 
 def main():
-    pplx = evaluate_model()
+    pplx, attn_sparsity = evaluate_model()
     print("ppl: ", pplx)
+    print("average sparsity: ", np.mean(attn_sparsity))
 
 
 if __name__ == "__main__":

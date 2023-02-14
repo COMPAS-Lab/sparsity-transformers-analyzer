@@ -104,9 +104,17 @@ def factor_int(n: int):
 # print(max_flops, chain_len)
 # hw_array_shape = (22, 12)
 
-def get_mat_sparsity(dat):
+def get_mat_sparsity(dat, causal_mask = False):
     if type(dat) == torch.Tensor:
-        return (1. - torch.count_nonzero(dat) / torch.numel(dat))
+        if causal_mask:
+            total_num_elems = sum(np.arange(1, dat.size()[-1], 1))
+            total_num_elems *= dat.view(-1, dat.size()[-1], dat.size()[-1]).size()[0]
+            nonzeros_per_row = torch.count_nonzero(dat, dim=-1)
+            proposed_nonzeros = torch.tensor(np.arange(1, dat.size()[-1]+1, 1))
+            actual_zeros = torch.sum(proposed_nonzeros - nonzeros_per_row).item()
+            return float(actual_zeros) / total_num_elems
+        else:
+            return (1. - torch.count_nonzero(dat) / torch.numel(dat))
     else:
         return (1. - np.count_nonzero(dat) / dat.size)
 
