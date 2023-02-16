@@ -71,7 +71,7 @@ def prepare_mat_dat(data_path, seq_len_path, seq_len_range, samples=-1):
     return bfp_att_probes
 
 def compute_matmul_performance(data_path, chain_len, out_w, hw_array_shape, \
-                                sort_row_sparsity, using_single_column, sparse_block_size, \
+                                sort_row_sparsity, using_single_column, sparse_block_size, freq=500, \
                                 seq_len_path=None, seq_len_range=None, mixed_chain_length=None, \
                                 short_to_long_ratio=0.0, blocked_pruning=False):
 
@@ -84,7 +84,7 @@ def compute_matmul_performance(data_path, chain_len, out_w, hw_array_shape, \
         # use a dense mat to calculate dens mat base lat
         fake_dense_data = np.ones(exps.shape)
         base_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
-                                        exp_dat=fake_dense_data, freq=500, num_tcs=3960, tcc_array_shape=hw_array_shape, \
+                                        exp_dat=fake_dense_data, freq=freq, num_tcs=3960, tcc_array_shape=hw_array_shape, \
                                         tcc_chainlen=chain_len)
         base_model.set_tccore_size(TCCORE_SIZE)
         base_flops, base_lat = base_model.tensor_fpga21_mat_sparse_flops(fake_dense_data, \
@@ -93,7 +93,7 @@ def compute_matmul_performance(data_path, chain_len, out_w, hw_array_shape, \
 
         # evaluate sparse model
         sparse_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
-                                        exp_dat=exps, freq=500, num_tcs=3960, tcc_array_shape=hw_array_shape, \
+                                        exp_dat=exps, freq=freq, num_tcs=3960, tcc_array_shape=hw_array_shape, \
                                         tcc_chainlen=chain_len)
         sparse_model.set_tccore_size(TCCORE_SIZE)
         min_sparse_flops, min_sparse_lat = sparse_model.tensor_fpga21_mat_sparse_flops(exps, \
@@ -105,7 +105,7 @@ def compute_matmul_performance(data_path, chain_len, out_w, hw_array_shape, \
                                                         blocked_pruning=blocked_pruning)
         else:
             sparse_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
-                                            exp_dat=exps, freq=500, num_tcs=3960, tcc_array_shape=hw_array_shape, \
+                                            exp_dat=exps, freq=freq, num_tcs=3960, tcc_array_shape=hw_array_shape, \
                                             tcc_chainlen=mixed_chain_length)
             sparse_model.set_tccore_size(TCCORE_SIZE)
             sparse_flops, sparse_lat = sparse_model.tensor_fpga21_mat_sparse_flops(exps, \
@@ -128,14 +128,14 @@ def compute_matmul_performance(data_path, chain_len, out_w, hw_array_shape, \
     return res_df, total_sparse_lat/num_insts, total_min_sparse_lat/num_insts, total_base_lat/num_insts
 
 def plot_perf_sparsity(data_path, output_path, chain_len_list, hw_array_shape_list, sort_row_sparsity, \
-                            using_single_column, sparse_block_size, \
+                            using_single_column, sparse_block_size, freq_list, \
                             seq_len_path = None, seq_len_range = None, \
                             attached_to_fig_name="", mixed_short_chain_len = 0.0, short_to_long_ratio = 0.0, \
                             plot_latency_by_insts = False, blocked_pruning=False):
     res_df_list, sparselat_list, ideallat_list, baselat_list = [], [], [], []
     sorted_fig_path = "_sorted" if sort_row_sparsity else "_unsorted"
 
-    for chain_len, hw_array_shape in zip(chain_len_list, hw_array_shape_list):
+    for chain_len, hw_array_shape, freq in zip(chain_len_list, hw_array_shape_list, freq_list):
         if mixed_short_chain_len > 0:
             mixed_chain_len = (mixed_short_chain_len, chain_len)
         else:
@@ -143,7 +143,7 @@ def plot_perf_sparsity(data_path, output_path, chain_len_list, hw_array_shape_li
 
         res_df, sparse_lat, ideal_lat, base_lat = compute_matmul_performance(data_path, chain_len, 768, \
                                                             hw_array_shape, sort_row_sparsity, \
-                                                            using_single_column, sparse_block_size, 
+                                                            using_single_column, sparse_block_size, freq, \
                                                             seq_len_path, seq_len_range, \
                                                             mixed_chain_len, \
                                                             short_to_long_ratio, blocked_pruning)
@@ -213,15 +213,17 @@ def short_chain_len_profiling(data_path_list, seq_len_list, seq_len_range):
                         f"max: {np.amax(res_dat)}")
     return ceil(np.quantile(res_dat, 0.75) / float(TCCORE_SIZE))
 
-def plot_perf_sparsity_simple_arglist (data_path, seq_len_path, s2l_ratio=0.3, fixed_chain_len = True, short_chain_len=2):
+def plot_perf_sparsity_simple_arglist (data_path, seq_len_path, freq=500, s2l_ratio=0.3, fixed_chain_len = True, short_chain_len=2):
     if fixed_chain_len:
-        chain_len_list = [short_chain_len, 10, 20, 34]
+        chain_len_list = [short_chain_len, 14, 32]
         hw_array_shape_list = [factor_int(floor(3960.0/(i+2.0))) for i in chain_len_list]
+        hw_array_shape_list = [(15, 20), (15, 10), (15, 5)]
+        freq_list = [223, 248, 258]
         return plot_perf_sparsity(data_path = data_path, output_path="./res_fig/", 
                                 chain_len_list = chain_len_list, \
                                 hw_array_shape_list = hw_array_shape_list, \
                                 sort_row_sparsity=True, \
-                                using_single_column=False, sparse_block_size=1, \
+                                using_single_column=False, sparse_block_size=1, freq_list=freq_list, \
                                 seq_len_path=seq_len_path, seq_len_range=(0, 2048), \
                                 plot_latency_by_insts=False, blocked_pruning=False)
     else:
@@ -627,10 +629,10 @@ def main():
     #     plot_selfatt_sparsity(data_path, output_path + "selfatt/", chain_len_list, hw_array_shape_list, layer_idx, False)
 
     ## verify sparsity
-    # att_path = data_path + f"opt_res/bfp_attn/6-0.pt"
-    # seq_len_path = data_path + f"opt_res/seqlen/6-0.pt"
-    # sampled_dat = prepare_mat_dat(att_path, seq_len_path, (0, 1024), 1)
-    # single_case_analyzing(sampled_dat[0])
+    att_path = data_path + f"opt_res/bfp_attn/6-0.pt"
+    seq_len_path = data_path + f"opt_res/seqlen/6-0.pt"
+    sampled_dat = prepare_mat_dat(att_path, seq_len_path, (0, 1024), 1)
+    single_case_analyzing(sampled_dat[0])
     # plot_lat_vs_sparsity(att_path, seq_len_path, (0, 1024))
 
     ## explore average speedup of different chain lengths:
@@ -669,6 +671,7 @@ def main():
 
     ## analyze min len:
     short_chain_len = short_chain_len_profiling(files_list, seq_len_list, (0, 2048))
+    short_chain_len = 6
 
     print("computing fixed chain len latency...")
     with multiprocessing.Pool() as pool:
@@ -683,22 +686,26 @@ def main():
     sparselat_speedup_list = baselat_list / sparselat_list
     ideallat_speedup_list = baselat_list / ideallat_list
 
-    # for chain_len_idx in [8, 10, 20]:
-    #     plt.plot(np.arange(1, 13, 1), sparselat_speedup_list[chain_len_idx-1], \
-    #                             linestyle='-', marker='s', color=f"blue", label=f"w/ TC 3-col limit")
-    #     plt.axhline(np.average(sparselat_speedup_list[chain_len_idx-1]), linestyle='--', color=f'blue', alpha=0.5)
-    #     plt.plot(np.arange(1, 13, 1), ideallat_speedup_list[chain_len_idx-1], \
-    #                             linestyle='-', marker='s', color=f"red", label=f"w/o TC 3-col limit")
-    #     plt.axhline(np.average(ideallat_speedup_list[chain_len_idx-1]), linestyle='--', color=f'red', alpha=0.5)
-    #     plt.title(f"speedup per layer")
-    #     plt.xticks(np.arange(0, num_layers+1, 1))
-    #     plt.xlabel("layer")
-    #     plt.ylim(0, 9)
-    #     plt.ylabel("latency speedup")
-    #     plt.legend()
-    #     plt.grid(linewidth=0.3)
-    #     plt.savefig(output_path + f"speedup_vs_layer_chainlen{chain_len_idx}.png")
-    #     plt.clf()
+    plt.plot(np.arange(1, num_layers+1, 1), sparselat_speedup_list[0], \
+                            linestyle='-', marker='s', color=f"blue", label=f"chain len=6")
+    plt.plot(np.arange(1, num_layers+1, 1), sparselat_speedup_list[1], \
+                            linestyle='-', marker='s', color=f"red", label=f"chain len=14")
+    plt.plot(np.arange(1, num_layers+1, 1), sparselat_speedup_list[2], \
+                            linestyle='-', marker='s', color=f"black", label=f"chain len=32")
+    # plt.axhline(np.average(sparselat_speedup_list[chain_len_idx-1]), linestyle='--', color=f'blue', alpha=0.5)
+    # plt.plot(np.arange(1, 13, 1), ideallat_speedup_list[chain_len_idx-1], \
+    #                         linestyle='-', marker='s', color=f"red", label=f"w/o TC 3-col limit")
+    # plt.axhline(np.average(ideallat_speedup_list[chain_len_idx-1]), linestyle='--', color=f'red', alpha=0.5)
+    plt.title(f"speedup per layer")
+    plt.xticks(np.arange(0, num_layers+1, 1))
+    plt.xlabel("layer")
+    plt.ylabel("latency speedup")
+    plt.legend()
+    plt.grid(linewidth=0.3)
+    plt.savefig(output_path + f"speedup_vs_layer_chainlen_real_freq.png")
+    plt.clf()
+
+    exit()
         
     # sparselat_sum = np.add.reduce([i[0] for i in res_list])
     # ideallat_sum = np.add.reduce([i[1] for i in res_list])
