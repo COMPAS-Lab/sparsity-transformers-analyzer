@@ -14,7 +14,7 @@ from scipy.spatial import distance
 from math import isnan, fsum, log, log2, ceil, floor
 from itertools import compress, product, groupby
 
-RES_FIG_PATH = "./res_fig/"
+RES_FIG_PATH = "./res_fig/opt/attn_ori/"
 NUM_LAYERS = 12
 NUM_HEADS = 12
 
@@ -153,7 +153,7 @@ def get_focused_token_mean_std(count, percentage, model_name=''):
     fig.savefig(RES_FIG_PATH + 'head_consistency_percent_{}.pdf'.format(model_name))
     plt.clf()
 
-def plot_heatmap(data, sparsity_bar=0.025, auto_scale=False, binarize=True, layer_aggregration='mean', attached_title=''):
+def plot_heatmap(data, sparsity_bar=0.025, auto_scale=False, binarize=True, layer_aggregration='mean', fig_gird=(3, 4), attached_title=''):
     '''
     Plot the heat map to visualize the relation between each subwords in the
     self attention of each attention head in each layer
@@ -165,15 +165,15 @@ def plot_heatmap(data, sparsity_bar=0.025, auto_scale=False, binarize=True, laye
     binarize: if true, all values > sparsity_bar will be 1 and < will be 0
     '''
     for layer_idx, layer in enumerate(data):
-        fig, axs = plt.subplots(3, 4, figsize=(19, 12))
+        fig, axs = plt.subplots(fig_gird[0], fig_gird[1], figsize=(12*(fig_gird[1]/fig_gird[0]), 12))
         print("Plotting heatmap for layer {}...".format(layer_idx))
-        for head_idx, head in enumerate(layer[0]):
+        for head_idx, head in enumerate(layer):
             sparsity = (head <= sparsity_bar).sum() / head.flatten().shape[0]
-            info = 'head_{}, max: {:.4f}, min: {:.4f}, spars: {:.4f}, sparsity_bar: {:.4f}'.format(
+            info = 'head_{}, max: {:.2f}, min: {:.2f}, spars: {:.2f}, sparsity_bar: {:.2f}'.format(
                 head_idx, np.amax(head), np.amin(head), sparsity, sparsity_bar)
             if binarize:
                 head = np.array((head > sparsity_bar)).astype("float")
-            ax = axs[int(head_idx/4), int(head_idx % 4)]
+            ax = axs[int(head_idx/fig_gird[1]), int(head_idx % fig_gird[1])]
             ax.invert_yaxis()
             ax.xaxis.tick_top()
             c = ax.pcolormesh(head) if auto_scale else ax.pcolormesh(

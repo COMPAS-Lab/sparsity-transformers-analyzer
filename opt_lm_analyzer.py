@@ -14,7 +14,7 @@ from pprint import pprint
 PARAM_PATH = "./params/"
 DATA_PATH = "./data"
 CONTEXT_LEN = 1024
-MODEL_NAME = "facebook/opt-30b"
+MODEL_NAME = "facebook/opt-13b"
 NUM_LAYERS = 24
 
 def tokenize(element):

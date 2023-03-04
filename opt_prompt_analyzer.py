@@ -17,6 +17,7 @@ import random, logging, sys, re
 from tqdm import tqdm
 from sparse_tensor_analyzer import get_mat_sparsity
 from transformer_visualization import plot_heatmap
+from accelerate import Accelerator
 
 # MODEL_NAME = "facebook/opt-iml-max-1.3b"
 MODEL_NAME = "facebook/opt-13b"
@@ -84,7 +85,7 @@ def load_and_prepare_dataset(tokenizer, num_examples=-1, split="validation", pad
     print(tokenized_data)
 
     tokenized_dataloader = DataLoader(
-        tokenized_data, shuffle=False, collate_fn=default_data_collator, batch_size=batch_size
+        tokenized_data, shuffle=True, collate_fn=default_data_collator, batch_size=batch_size
     )
 
     return tokenized_dataloader
@@ -122,12 +123,13 @@ def infer_ans_directly(
 
     return model_res, ref, model_res_avaliable_ans_only, ref_ans_only
 
-def infer_by_logits(
-        model_res, ref,
-        model_res_avaliable_ans_only, ref_ans_only,
-        prompt_ans_dict: dict      
-    ):
+def infer_by_logits(prompt_ans_dict: dict, device):
 
+    model_res, ref = \
+        torch.tensor([]).to(device), torch.tensor([]).to(device)
+    model_res_avaliable_ans_only, ref_ans_only = \
+        torch.tensor([]).to(device), torch.tensor([]).to(device)
+        
     out_strs = prompt_ans_dict.get("out_strs", None)
     transition_probs = prompt_ans_dict.get("transition_probs", None)
     answers = prompt_ans_dict.get("answers", None)
@@ -136,24 +138,31 @@ def infer_by_logits(
 
     for generated_str, probability, answer in zip(out_strs, transition_probs, answers):
         generated_str = generated_str.lower()
+        ref_ans = torch.tensor([answer]).to(ref.device)
         
         re_yes_match = re.fullmatch(r"[_|\W]*(yes)[_|\W]*", generated_str)
         re_no_match = re.fullmatch(r"[_|\W]*(no|not)[_|\W]*", generated_str)
+
+        tc_true = torch.tensor([True])
+        tc_false = torch.tensor([False])
         
         if re_yes_match:
-            model_res.append("True")
-            model_res_avaliable_ans_only.append(True)
-            ref_ans_only.append(answer.item())
+            model_res = torch.cat((model_res, tc_true.to(model_res.device)))
+            model_res_avaliable_ans_only = \
+                torch.cat((model_res_avaliable_ans_only, tc_true.to(model_res_avaliable_ans_only.device)))
+            ref_ans_only = torch.cat((ref_ans_only, ref_ans))
         elif re_no_match:
-            model_res.append("False")
-            model_res_avaliable_ans_only.append(False)
-            ref_ans_only.append(answer.item())
+            model_res = torch.cat((model_res, tc_false.to(model_res.device)))
+            model_res_avaliable_ans_only = \
+                torch.cat((model_res_avaliable_ans_only, tc_false.to(model_res_avaliable_ans_only.device)))
+            ref_ans_only = torch.cat((ref_ans_only, ref_ans))
         else:
             yes_prob_sum = sum([probability[idx] for idx in yes_ids])
             no_prob_sum = sum([probability[idx] for idx in no_ids])
-            model_res.append(str((yes_prob_sum > no_prob_sum).item()))
+            prob_res = tc_true if yes_prob_sum > no_prob_sum else tc_false
+            model_res = torch.cat((model_res, prob_res.to(model_res.device)))
 
-        ref.append(str(answer.item()))
+        ref = torch.cat((ref, ref_ans))
 
     return model_res, ref, model_res_avaliable_ans_only, ref_ans_only
 
@@ -237,16 +246,16 @@ def run_eval_with_constraints(
     '''
     Examine only yes or no answers
     '''
-    # Load the model. Alpa automatically downloads the weights to the specificed path
+    accelerator = Accelerator(fp16=True)
+
+    # Load the model.
     model = OPTForCausalLM.from_pretrained(MODEL_NAME)
-    model = model.to(device)
     # model = get_model(model_name="alpa/opt-30b", path=OPT_CACHE)
 
-    # Generate
-    model_res, ref = [], []
+    model, test_data = accelerator.prepare(model, test_data)
+
+    # Generate    
     num_true, num_false = 0, 0
-    model_res_avaliable_ans_only, ref_ans_only = [], []
-    attn_sparsities = []
     
     force_words_ids = None
     if is_forcing_words:
@@ -256,8 +265,19 @@ def run_eval_with_constraints(
         print(force_words_ids)
 
     num_examples = 0
+
+    model_res_all, ref_all = [], []
+    model_res_avaliable_ans_only_all, ref_ans_only_all = [], []
+    attn_sparsities_all = []
+
+    metric_all_acc = evaluate.load("accuracy")
+    metric_all_f1 = evaluate.load("f1")
+    f1_metric = evaluate.load("f1")
+    acc_metric = evaluate.load("accuracy")
+
+    model.eval()
     for step, batch in tqdm(enumerate(test_data), total=len(test_data)):
-        batch = move_to(batch, device)
+        batch = move_to(batch, accelerator.device)
         num_beams = 1
         batch_size = len(batch["input_ids"])
         gen_params = {
@@ -279,21 +299,26 @@ def run_eval_with_constraints(
         transition_probs = nn.functional.softmax(output.scores[0], dim=-1)
 
         ori_prompt = tokenizer.batch_decode(seq_ids)
+        generated_string = tokenizer.batch_decode(seq_ids, skip_special_tokens=True)
         out_strs = []
         for out_inst in ori_prompt:
             out_strs.append(out_inst.split("\n\n")[-1])
+
+        all_attens = output.attentions[0]
         
         # check attention
         # expected atten size: layer_size, num_beamsxbatch_sizexhead_size, len, len
-        attens = [i.to("cpu") for i in output.attentions[0]]
+        attens = [i.to("cpu") for i in all_attens]
         attens = torch.stack(attens)
         layer_size, head_size, seq_len, _ = attens.size()
         attens = attens.view(layer_size, head_size // (num_beams*batch_size), 
                                 num_beams*batch_size, seq_len, seq_len)
+        attn_sparsities = torch.tensor([]).to(accelerator.device)
         for i in range(num_beams*batch_size):
             actual_input_len = torch.count_nonzero(batch["attention_mask"][i], dim=-1).item()
             curr_attens = torch.squeeze(attens[:,:,i,-actual_input_len:,-actual_input_len:])
-            attn_sparsities.append(get_mat_sparsity(curr_attens, causal_mask=True))
+            curr_sparsity = torch.tensor([get_mat_sparsity(curr_attens, causal_mask=True)])
+            attn_sparsities = torch.cat((attn_sparsities, curr_sparsity.to(accelerator.device)), dim=-1)
         
         # batch_idx, layer_idx = 0, 10
         # ori_prompt = tokenizer.decode(seq_ids[batch_idx][-actual_input_len:])
@@ -315,53 +340,60 @@ def run_eval_with_constraints(
         #     c_word = tokenizer.decode(c_id)
         #     logger.info(f"head {head} focusing {r_word} on {c_word}, attn val: {sampled_attn[layer_idx][head][r][c]:.4f}")
 
-        generated_string = tokenizer.batch_decode(seq_ids, skip_special_tokens=True)
         model_res, ref, model_res_avaliable_ans_only, ref_ans_only = \
-            eval_method(model_res, ref, model_res_avaliable_ans_only, ref_ans_only, 
-                        {
+            eval_method({
                             "generated_string": generated_string, 
                             "answers": batch["answer"],
                             "out_strs": out_strs,
                             "transition_probs": transition_probs,
                             "yes_ids": yes_ids,
                             "no_ids": no_ids,
-                            }
-                        )
+                            },
+                        accelerator.device)
         
         num_examples += batch_size
+        
+        # attn_sparsities = accelerator.pad_across_processes(attn_sparsities, dim=1, pad_index=-100)
+        # attn_sparsities_gathered = accelerator.gather_for_metrics(attn_sparsities).cpu().numpy()
+
+        model_res_all.append(accelerator.gather(model_res).cpu().numpy())
+        ref_all.append(accelerator.gather(ref).cpu().numpy())
+        attn_sparsities_all.append(accelerator.gather(attn_sparsities).cpu().numpy())
+        # model_res_avaliable_ans_only_all.append(accelerator.gather(model_res_avaliable_ans_only).cpu().numpy)
+        # ref_ans_only_all.append(accelerator.gather(ref_ans_only).cpu().numpy)
+
+    print("gathering finished")
     
-    avg_sparsity = np.mean(attn_sparsities)
-    logger.info(f"avg sparsity: {avg_sparsity:.4f}")
-    metric_all = evaluate.load("exact_match")
-    res_em = metric_all.compute(predictions=model_res, 
-                                references=ref)
-    logger.info(f"exact match: {res_em}")
-    print("exact match: ", res_em)
+    # logger.info(f"attn_sparsities, {attn_sparsities}")
+    # avg_sparsity = np.mean(attn_sparsities)
+    # logger.info(f"avg sparsity: {avg_sparsity}")
 
-    for i in range(len(model_res)):
-        model_res[i] = True if model_res[i] == "True" else False
-        ref[i] = True if ref[i] == "True" else False
+    model_res_all = np.concatenate(model_res_all)
+    ref_all = np.concatenate(ref_all)
+    attn_sparsities_all = np.concatenate(attn_sparsities_all)
 
-    metric_all = evaluate.load("f1")
-    res_f1_all = metric_all.compute(predictions=model_res, 
-                                references=ref)
-    logger.info(f"f1 for all: {res_f1_all}")
-    print("f1 for all: ", res_f1_all)
+    if accelerator.is_main_process:
+        avg_sparsity = np.mean(attn_sparsities_all)
+        logger.info(f"avg sparsity: {avg_sparsity}")
 
-    if (len(model_res_avaliable_ans_only) > 0):
-        f1_metric = evaluate.load("f1")
-        res_f1 = f1_metric.compute(predictions=model_res_avaliable_ans_only, 
-                                    references=ref_ans_only)
-        acc_metric = evaluate.load("accuracy")
-        res_acc = acc_metric.compute(predictions=model_res_avaliable_ans_only,
-                                    references=ref_ans_only)
+        res_em = metric_all_acc.compute(predictions=model_res_all, references=ref_all)
+        logger.info(f"acc for all: {res_em}")
+        print("acc for all: ", res_em)
 
-        logger.info(f"accuracy: {res_acc}")
-        print("accuracy: ", res_acc)
-        logger.info(f"f1: {res_f1}")
-        print("f1: ", res_f1)
+        res_f1_all = metric_all_f1.compute(predictions=model_res_all, references=ref_all)
+        logger.info(f"f1 for all: {res_f1_all}")
+        print("f1 for all: ", res_f1_all)
 
-        print(f"Freq of True: {num_true/num_examples}, False: {num_false/num_examples}")
+    # if (len(model_res_avaliable_ans_only) > 0):
+    #     res_f1 = f1_metric.compute()
+    #     res_acc = acc_metric.compute()
+
+    #     logger.info(f"accuracy for meaningful ans: {res_acc}")
+    #     print("accuracy for meaningful ans: ", res_acc)
+    #     logger.info(f"f1 for meaningful ans: {res_f1}")
+    #     print("f1 for meaningful ans: ", res_f1)
+
+    #     print(f"Freq of True: {num_true/num_examples}, False: {num_false/num_examples}")
 
 def get_yes_no_ids(tokenizer):
     vocab = tokenizer.get_vocab()
