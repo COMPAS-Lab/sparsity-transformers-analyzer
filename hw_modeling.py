@@ -8,7 +8,7 @@ import sys, logging
 import skimage.measure
 import logging
 
-logging.basicConfig(filename='hw_modeling.log', filemode='w', format='%(name)s - %(levelname)s - %(message)s', level=logging.WARNING)
+logging.basicConfig(filename='hw_modeling.log', filemode='w', format='%(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 class OutOfResourceError(Exception):
     pass
@@ -487,6 +487,8 @@ class StratixDpuModel(DpuModel):
         '''
         round = lambda x: x if ideal else ceil(x)
 
+        logging.info(f"tc array: {self.NUM_TCC_ROWS} x {self.NUM_TCC_COLS}")
+
         def check_a_loading_iterations(mat):
             split_nonezeros = np.split(mat, np.arange(self.TCCORE_COL_SIZE, mat.size, self.TCCORE_COL_SIZE))
             max_none_zeros_per_grp = np.array([np.amax(i) for i in split_nonezeros])
@@ -605,22 +607,29 @@ class StratixDpuModel(DpuModel):
                 return 0.0
             # use max len of the row in the group to finish loading 
             mat_a_to_load_in_row_grps = [np.amax(curr_mat_a_rows) for curr_mat_a_rows in mat_a_array_iter_grps]
-            mat_b_cols_used_to_hide_a_loading = floor(self.b_w / self.NUM_TCC_ROWS)
+            mat_b_cols_used_to_hide_a_loading = round(self.b_w / self.NUM_TCC_ROWS)
             # figure out actual time of each group loading
             mat_a_loading_latency = []
-            for max_a_loading in mat_a_to_load_in_row_grps:
+            for idx, max_a_loading in enumerate(mat_a_to_load_in_row_grps):
                 chain_loading_a_lat = 0.0
                 a = max(effective_loading_lat * 3, mat_b_cols_used_to_hide_a_loading)
+                logging.info(f"loading lat vs. computing: {effective_loading_lat*3}, {mat_b_cols_used_to_hide_a_loading}")
                 if (effective_loading_lat * 3) < mat_b_cols_used_to_hide_a_loading:
                     logging.info("mat b computing dominants the a loading")
                 
                 chain_loading_grps = round(max_a_loading / (effective_loading_lat * self.TCCORE_SIZE))
-                chain_loading_a_lat = (chain_loading_grps-1) * a + (effective_loading_lat + 1) * 3
+                
+                # first iteration of loading: including the latency of entry tc
+                chain_loading_a_lat = chain_loading_grps * a
+                if idx == 0:
+                    chain_loading_a_lat += (effective_loading_lat + 1) * 3
                 mat_a_loading_latency.append(chain_loading_a_lat)
 
             # compute the latency block by block
-            # first iteration of loading: including the latency of entry tc
+            logging.info(f"#iters: {len(mat_a_loading_latency)}")
+            logging.info(f"lat per iter: {mat_a_loading_latency}")
             total_latency = np.sum(np.array(mat_a_loading_latency))
+            # last accumulator's latency
             total_latency += 4 + effective_loading_lat * 2 + 2
             return total_latency
 
