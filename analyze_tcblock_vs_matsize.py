@@ -146,8 +146,8 @@ def tcchain_len_sweep():
     matplotlib.rcParams.update({'ytick.labelsize': fsize})
     matplotlib.rcParams['lines.markersize'] = 3
     
-    mats = [{"size": (1024, 2048, 2048, 1024), "row_sparsity": frac, "label": "sparse_attn_h"} \
-            for frac in np.arange(0.2, 1.0, 0.2)
+    mats = [{"size": (512, 512, 512, 768), "row_sparsity": frac, "label": "sparse_attn_h"} \
+            for frac in np.arange(0.1, 1.0, 0.1)
             ]
     
     mats += [
@@ -161,46 +161,87 @@ def tcchain_len_sweep():
             # {"size": (1024, 1024, 1024, 4096), "row_sparsity": 0.0, "label": "attxv proj"}, 
             # {"size": (1024, 4096, 4096, 16384), "row_sparsity": 0.0, "label": "dense_ffn_fc1"}, 
             # {"size": (1024, 16384, 16384, 4096), "row_sparsity": 0.0, "label": "dense_ffn_fc2"}, 
+            # 125m-small
+            {"size": (512, 768, 768, 768), "row_sparsity": 0.0, "label": "qkv proj"}, 
+            {"size": (512, 512, 512, 768), "row_sparsity": 0.0, "label": "attxv proj"}, 
+            {"size": (512, 768, 768, 3072), "row_sparsity": 0.0, "label": "dense_ffn_fc1"}, 
+            {"size": (512, 3072, 3072, 768), "row_sparsity": 0.0, "label": "dense_ffn_fc2"}, 
             # 125m
-            {"size": (1024, 768, 768, 768), "row_sparsity": 0.0, "label": "qkv proj"}, 
-            {"size": (1024, 1024, 1024, 768), "row_sparsity": 0.0, "label": "attxv proj"}, 
-            {"size": (1024, 768, 768, 3072), "row_sparsity": 0.0, "label": "dense_ffn_fc1"}, 
-            {"size": (1024, 3072, 3072, 768), "row_sparsity": 0.0, "label": "dense_ffn_fc2"}, 
+            # {"size": (1024, 768, 768, 768), "row_sparsity": 0.0, "label": "qkv proj"}, 
+            # {"size": (1024, 1024, 1024, 768), "row_sparsity": 0.0, "label": "attxv proj"}, 
+            # {"size": (1024, 768, 768, 3072), "row_sparsity": 0.0, "label": "dense_ffn_fc1"}, 
+            # {"size": (1024, 3072, 3072, 768), "row_sparsity": 0.0, "label": "dense_ffn_fc2"}, 
             # 350m
-            {"size": (1024, 1024, 1024, 1024), "row_sparsity": 0.0, "label": "qkv proj"}, 
-            {"size": (1024, 1024, 1024, 1024), "row_sparsity": 0.0, "label": "attxv proj"}, 
-            {"size": (1024, 1024, 1024, 4096), "row_sparsity": 0.0, "label": "dense_ffn_fc1"}, 
-            {"size": (1024, 4096, 4096, 1024), "row_sparsity": 0.0, "label": "dense_ffn_fc2"}, 
+            # {"size": (1024, 1024, 1024, 1024), "row_sparsity": 0.0, "label": "qkv proj"}, 
+            # {"size": (1024, 1024, 1024, 1024), "row_sparsity": 0.0, "label": "attxv proj"}, 
+            # {"size": (1024, 1024, 1024, 4096), "row_sparsity": 0.0, "label": "dense_ffn_fc1"}, 
+            # {"size": (1024, 4096, 4096, 1024), "row_sparsity": 0.0, "label": "dense_ffn_fc2"}, 
             #1.3b
-            {"size": (1024, 2048, 2048, 2048), "row_sparsity": 0.0, "label": "qkv proj"}, 
-            {"size": (1024, 1024, 1024, 2048), "row_sparsity": 0.0, "label": "attxv proj"}, 
+            # {"size": (1024, 2048, 2048, 2048), "row_sparsity": 0.0, "label": "qkv proj"}, 
+            # {"size": (1024, 1024, 1024, 2048), "row_sparsity": 0.0, "label": "attxv proj"}, 
             # {"size": (1024, 2048, 2048, 8192), "row_sparsity": 0.0, "label": "dense_ffn_fc1"}, 
             # {"size": (1024, 8192, 8192, 2048), "row_sparsity": 0.0, "label": "dense_ffn_fc2"}, 
     ]
 
     mats.sort(key=lambda s: s["size"][0] * s["size"][1] * (1. - s["row_sparsity"]) * s["size"][3])
+    mats.sort(key=lambda s: 1. - s["row_sparsity"])
 
-    chain_len_list = {str(i): [] for i in range(2, 20, 4)}
+    # chain_len_list = {str(i): [] for i in range(2, 20, 4)}
+    chain_len_list = {"5": [], "5-10": [], "10": [], "6":[], "6-12": [], "12": [], "8":[], "8-16": [], "16": []}
     flops_vs_chain_len = chain_len_list.copy()
     util_vs_chain_len = chain_len_list.copy()
-    tcc_array_shapes = {l: closest_factors_to_target(int(l), 3960) for l in flops_vs_chain_len.keys()}
+    dens_vs_chain_len = chain_len_list.copy()
+    # construct shapes
+    tcc_array_shapes = {}
+    for len in flops_vs_chain_len.keys():
+        if len.isnumeric():
+            tcc_array_shapes[len] = closest_factors_to_target(int(len), 3960)
+        else:
+            short, long = len.split("-")
+            long_shape = closest_factors_to_target(int(long), 3960)
+            short_shape = (long_shape[0]*2, long_shape[1])
+            tcc_array_shapes[len] = (short_shape, long_shape)
+    # tcc_array_shapes = {l: closest_factors_to_target(int(l), 3960) for l in flops_vs_chain_len.keys()}
     # tcc_array_shapes = {"3": (48, 16), "6": (24, 16), "9":(16, 16), "18": (8, 16)}
     tcc_array_util_percentage = {k: (0., 0.) for k in chain_len_list.keys()}
 
     print(tcc_array_shapes)
 
     for chain_len_str in flops_vs_chain_len.keys():
-        chain_len = int(chain_len_str)
-        tcc_array_shape = tcc_array_shapes[chain_len_str]
-        dsp_percentage = tcc_array_shape[0]*tcc_array_shape[1]*(chain_len+2)/3960.0
-        dot_size = tcc_array_shape[0]*tcc_array_shape[1]*chain_len/3960.0
-        tcc_array_util_percentage[chain_len_str] = (dot_size, dsp_percentage)
-        print(f"actual size of len {chain_len_str}: {dsp_percentage:.3f}")
-
         #sweep across mat size
-        flops, util = [], []
+        flops, util, density = [], [], []
         for m in mats:
             mat_a_row, mat_a_col, mat_b_row, mat_b_col = m["size"]
+
+            # differentiate between stat/dyna chain lengths
+            if chain_len_str.isnumeric():
+                chain_len = int(chain_len_str)
+                tcc_array_shape = tcc_array_shapes[chain_len_str]
+                dsp_percentage = tcc_array_shape[0]*tcc_array_shape[1]*(chain_len+2)/3960.0
+                dot_size = tcc_array_shape[0]*tcc_array_shape[1]*chain_len/3960.0
+                tcc_array_util_percentage[chain_len_str] = (dot_size, dsp_percentage)
+                print(f"actual size of len {chain_len_str}: {dsp_percentage:.3f}")
+            else:
+                short_chain_len, long_chain_len = chain_len_str.split("-")
+                short_chain_len, long_chain_len = int(short_chain_len), int(long_chain_len)
+                effective_a_col = mat_a_col * (1. - m["row_sparsity"])
+                #select chain len based on mat a col:
+                if effective_a_col <= short_chain_len * 20:
+                    print(f"{chain_len_str} design selects short len")
+                    tcc_array_shape = tcc_array_shapes[chain_len_str][0]
+                    chain_len = short_chain_len
+                else:
+                    print(f"{chain_len_str} design selects long len")
+                    tcc_array_shape = tcc_array_shapes[chain_len_str][1]
+                    chain_len = long_chain_len
+
+                dsp_percentage = tcc_array_shapes[chain_len_str][1][0] * \
+                                    tcc_array_shapes[chain_len_str][1][1] * \
+                                    (long_chain_len+2) / 3960.0
+                dot_size = tcc_array_shape[0]*tcc_array_shape[1]*chain_len/3960.0
+                tcc_array_util_percentage[chain_len_str] = (dot_size, dsp_percentage)
+                print(f"actual size of len {chain_len_str}: {dsp_percentage:.3f}")
+            
             total_util = get_util(m, tcc_array_shape, chain_len)
             # generate fake data to be sent to hw model:
             fake_data = None
@@ -227,23 +268,38 @@ def tcchain_len_sweep():
                                                         sparse_block_size=1)
             flops.append(curr_flops)
             util.append(total_util)
+            density.append(1. - m["row_sparsity"])
         
         flops_vs_chain_len[chain_len_str] = flops
         util_vs_chain_len[chain_len_str] = util
+        dens_vs_chain_len[chain_len_str] = density
 
     matmul_size = [i["size"][0]*ceil(i["size"][1]*(1.-i["row_sparsity"]))*i["size"][3] for i in mats]
 
     fig, axs=plt.subplots(nrows=1, ncols=3, figsize=(18, 6))
     for idx, clen in enumerate(flops_vs_chain_len.keys()):
-        axs[0].plot(matmul_size, flops_vs_chain_len[clen], linestyle='-', 
-                marker='s', linewidth=1, alpha=0.8, label=f"chain len={clen}", color=f"C{idx}")
-        axs[1].plot(matmul_size, np.array(util_vs_chain_len[clen]) * tcc_array_util_percentage[clen][0], linestyle='-', 
-                marker='s', linewidth=1, alpha=0.8, label=f"chain len={clen}", color=f"C{idx}")
-    
+        # axs[0].plot(matmul_size, flops_vs_chain_len[clen], linestyle='-', 
+        #         marker='s', linewidth=1, alpha=0.8, label=f"chain len={clen}", color=f"C{idx}")
+        axs[0].scatter(dens_vs_chain_len[clen], flops_vs_chain_len[clen], 
+                marker='o', s=24, alpha=0.6, label=f"chain len={clen}", color=f"C{idx}")
+        axs[1].scatter(matmul_size, np.array(util_vs_chain_len[clen]) * tcc_array_util_percentage[clen][0], 
+                marker='o', s=24, alpha=0.6, label=f"chain len={clen}", color=f"C{idx}")
+        
+    all_x, all_y = [], []
+    for clen in flops_vs_chain_len.keys():
+        all_x += dens_vs_chain_len[clen]
+        all_y += flops_vs_chain_len[clen]
+
+    coeffs = np.polyfit(all_x, all_y, 2)
+    tdline = np.poly1d(coeffs)
+    tdline_x = np.arange(0.1, 1.1, 0.1)
+    axs[0].plot(tdline_x, tdline(tdline_x), linestyle = "--", color = "red", alpha = 0.6, linewidth=1)
+
     print(flops_vs_chain_len)
     peak_tops = 50.0 * (300./440.) * (3960./2387.) * (20./8.0)
-    axs[0].axhline(y=peak_tops, linewidth=1, color='r', linestyle='--', )
-    axs[0].text(max(matmul_size), peak_tops+5, "theoratical", fontsize=8, va='center', ha='center')
+    axs[0].plot(tdline_x, peak_tops * 1./tdline_x, linestyle = "--", color = "blue", alpha = 0.6, linewidth=1)
+    # axs[0].axhline(y=peak_tops, linewidth=1, color='r', linestyle='--')
+    axs[0].text(0.95, peak_tops+5, "theoretical", fontsize=8, va='center', ha='center')
     
     dsp_percentage_bar = axs[2].bar(tcc_array_util_percentage.keys(), 
                 [v[1]*100.0 for v in tcc_array_util_percentage.values()], 
@@ -254,7 +310,7 @@ def tcchain_len_sweep():
                 [v[0]*100.0 for v in tcc_array_util_percentage.values()], 
                 width=0.3, 
                 align="center", 
-                color=[f"C{idx}" for idx in range(len(tcc_array_util_percentage))])
+                color=["C0", "C1", "C2"])
         
     axs[0].set_ylabel('TOPs')
     axs[0].set_xlim(xmin=0)
@@ -262,7 +318,7 @@ def tcchain_len_sweep():
     axs[0].set_ylim(ymin=0)
     # axs[0].set_ylim(ymax=100)
     axs[0].grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
-    axs[0].set_xlabel('MAC Operations')
+    axs[0].set_xlabel('Density')
     axs[0].legend()
 
     axs[1].set_ylabel(r'actual MAC size/padded MAC size X TC% used for dot-product')
@@ -281,13 +337,103 @@ def tcchain_len_sweep():
     # axs[1].set_ylim(ymax=105)
     axs[2].grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
     fig.tight_layout()
-    fig.savefig("res_fig/matsize_sweep_chainlen_fixed_totaldsp_lesshwtypes.pdf")
+    fig.savefig("res_fig/density_sweep_chainlen_fixed_totaldsp_mixedlen_125m.pdf")
     # pickle.dump(fig, open('res_fig/matsize_sweep_chainlen.fig.pickle', 'wb'))
     plt.cla()
 
+def multi_mat_exec_tops(
+        tc_len: int,
+        tc_array_shape: tuple,
+        mat_sizes: List[dict],
+        freq: int = 300,
+):
+    lat, util, density, ops = [], [], [], []
+    for m in mat_sizes:
+        mat_a_row, mat_a_col, mat_b_row, mat_b_col = m["size"]
+
+        total_util = get_util(m, tc_array_shape, tc_len)
+        # generate fake data to be sent to hw model:
+        fake_data = None
+        if m["row_sparsity"] > 0.0:
+            dense_acol_size = ceil(mat_a_col * (1.-m["row_sparsity"]))
+            fake_data = np.ones((mat_a_row, dense_acol_size))
+            fake_data = np.pad(
+                fake_data, ((0, 0), (0, mat_a_col-dense_acol_size)), "constant", constant_values=(0,))
+            print(f"padded mat size: {fake_data.shape}")
+        else:
+            fake_data = np.ones((mat_a_row, mat_a_col))
+
+        curr_model = StratixDpuModel(mat_a_row, mat_a_col, mat_b_row, mat_b_col,
+                                        exp_dat=fake_data,
+                                        freq=300,
+                                        num_tcs=3960,
+                                        tcc_array_shape=tc_array_shape,
+                                        tcc_chainlen=tc_len)
+
+        curr_model.set_tccore_size(20)
+        _, curr_lat = curr_model.tensor_fpga21_mat_sparse_flops(
+            fake_data,
+            True, False,
+            using_single_column=False,
+            sparse_block_size=1)
+        
+        curr_ops = m["size"][0] * m["size"][3] * m["size"][1] * ceil(1. - m["row_sparsity"])
+
+        lat.append(curr_lat)
+        ops.append(curr_ops)
+        util.append(total_util)
+        density.append(1. - m["row_sparsity"])
+
+    total_ops = sum(ops) * 2
+    time_latency = sum(lat) * 1./freq * 1e-6
+
+    return time_latency, total_ops
+
+def tcchain_len_multidualcore():
+    fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+    fsize = 9
+    matplotlib.rcParams.update({'xtick.labelsize': fsize})
+    matplotlib.rcParams.update({'ytick.labelsize': fsize})
+    matplotlib.rcParams['lines.markersize'] = 3
+    
+    small_mats = \
+        [{"size": (1024, 1024, 1024, 128), "row_sparsity": 0.2, "label": "attxv"}] * 40 + \
+        [{"size": (1024, 128, 128, 1024), "row_sparsity": 0.0, "label": "att"}] * 40
+    
+    large_mats = \
+        [{"size": (1024, 5120, 5120, 5120), "row_sparsity": 0.0, "label": "qkv proj"}] * 3 + \
+        [{"size": (1024, 5120, 5120, 20480), "row_sparsity": 0.0, "label": "dense_ffn_fc1"}] + \
+        [{"size": (1024, 20480, 20480, 5120), "row_sparsity": 0.0, "label": "dense_ffn_fc2"}]
+
+    small_mats.sort(key=lambda s: 1. - s["row_sparsity"])
+    large_mats.sort(key=lambda s: 1. - s["row_sparsity"])
+
+    short_chain_len, long_chain_len = 4, 10
+    dsp_split = (0.1, 0.9)
+    # construct shapes
+    short_chain_shape = closest_factors_to_target(short_chain_len, ceil(3960.0 * dsp_split[0]))
+    long_chain_shape = closest_factors_to_target(long_chain_len, 3960-ceil(3960.0 * dsp_split[0]))
+
+    
+    short_chain_lat, short_chain_ops = \
+        multi_mat_exec_tops(short_chain_len, short_chain_shape, small_mats)
+    long_chain_lat, long_chain_ops = \
+        multi_mat_exec_tops(long_chain_len, long_chain_shape, large_mats)
+    
+    print(f"short lat: {short_chain_lat}, long lat: {long_chain_lat}")
+
+    lat_res = max(short_chain_lat, long_chain_lat)
+    total_ops = short_chain_ops + long_chain_ops
+    flops = total_ops / lat_res / 1e12
+
+    print(f"total flops: {flops}")
+
+    return flops
+
 def main():
-    tcchain_len_sweep()
+    # tcchain_len_sweep()
     # tcchain_r_c_sweep()
+    tcchain_len_dualcore()
 
 if __name__ == "__main__":
     main()
