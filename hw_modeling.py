@@ -8,7 +8,12 @@ import sys, logging
 import skimage.measure
 import logging
 
-logging.basicConfig(filename='hw_modeling.log', filemode='w', format='%(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+formatter = logging.Formatter('%(name)s - %(levelname)s - %(message)s')
+hw_modeling_logger = logging.getLogger("hw_modeling")
+hw_modeling_logger.setLevel(logging.INFO)
+hw_modeling_logger_handler = logging.FileHandler(filename="hw_modeling.log", mode="w")
+hw_modeling_logger_handler.setFormatter(formatter)
+hw_modeling_logger.addHandler(hw_modeling_logger_handler)
 
 class OutOfResourceError(Exception):
     pass
@@ -487,7 +492,7 @@ class StratixDpuModel(DpuModel):
         '''
         round = lambda x: x if ideal else ceil(x)
 
-        logging.info(f"tc array: {self.NUM_TCC_ROWS} x {self.NUM_TCC_COLS}")
+        hw_modeling_logger.info(f"tc array: {self.NUM_TCC_ROWS} x {self.NUM_TCC_COLS}")
 
         def check_a_loading_iterations(mat):
             split_nonezeros = np.split(mat, np.arange(self.TCCORE_COL_SIZE, mat.size, self.TCCORE_COL_SIZE))
@@ -613,9 +618,9 @@ class StratixDpuModel(DpuModel):
             for idx, max_a_loading in enumerate(mat_a_to_load_in_row_grps):
                 chain_loading_a_lat = 0.0
                 a = max(effective_loading_lat * 3, mat_b_cols_used_to_hide_a_loading)
-                logging.info(f"loading lat vs. computing: {effective_loading_lat*3}, {mat_b_cols_used_to_hide_a_loading}")
+                hw_modeling_logger.info(f"loading lat vs. computing: {effective_loading_lat*3}, {mat_b_cols_used_to_hide_a_loading}")
                 if (effective_loading_lat * 3) < mat_b_cols_used_to_hide_a_loading:
-                    logging.info("mat b computing dominants the a loading")
+                    hw_modeling_logger.info("mat b computing dominants the a loading")
                 
                 chain_loading_grps = round(max_a_loading / (effective_loading_lat * self.TCCORE_SIZE))
                 
@@ -626,8 +631,8 @@ class StratixDpuModel(DpuModel):
                 mat_a_loading_latency.append(chain_loading_a_lat)
 
             # compute the latency block by block
-            logging.info(f"#iters: {len(mat_a_loading_latency)}")
-            logging.info(f"lat per iter: {mat_a_loading_latency}")
+            hw_modeling_logger.info(f"#iters: {len(mat_a_loading_latency)}")
+            hw_modeling_logger.info(f"lat per iter: {mat_a_loading_latency}")
             total_latency = np.sum(np.array(mat_a_loading_latency))
             # last accumulator's latency
             total_latency += 4 + effective_loading_lat * 2 + 2
@@ -654,7 +659,7 @@ class StratixDpuModel(DpuModel):
             num_long_chain_cols = ceil(self.NUM_TCC_COLS * (1-short_to_long_ratio))
             # check availability of short chains:
             if num_long_chain_cols is self.NUM_TCC_COLS:
-                logging.warning("short to long ratio smaller than expected, replacing only one col of long chains with shorts")
+                hw_modeling_logger.warning("short to long ratio smaller than expected, replacing only one col of long chains with shorts")
                 num_long_chain_cols = self.NUM_TCC_COLS - 1
 
             num_short_chain_cols = (self.NUM_TCC_COLS - num_long_chain_cols) * floor(long_chain_len/short_chain_len)
@@ -667,7 +672,7 @@ class StratixDpuModel(DpuModel):
                 max_none_zeros_per_grp[np.where(max_none_zeros_per_grp <= (short_chain_len * self.TCCORE_SIZE))].tolist()
             long_chain_pool = \
                 max_none_zeros_per_grp[np.where(max_none_zeros_per_grp > (short_chain_len * self.TCCORE_SIZE))].tolist()
-            logging.info(\
+            hw_modeling_logger.info(\
                 f"short chain pool size: {len(short_chain_pool)}, long chain pool size: {len(long_chain_pool)}")
             while (len(short_chain_pool) > 0 or len(long_chain_pool) > 0):
                 curr_grp = []
@@ -1499,7 +1504,7 @@ class BertModel:
         start_of_softmax_stg3_lat = qktrans_compute_lat + \
                                         self.baseline_softmax_lat(pa=p, exp_h=ceil(self.max_seq_len/r), return_2ndstg_lat=True)
         if new_score_output_lat < start_of_softmax_stg3_lat:
-            logging.warning("softmax mem in danger of overflow!")
+            hw_modeling_logger.warning("softmax mem in danger of overflow!")
             return False
 
         return True
@@ -1524,7 +1529,7 @@ class BertModel:
         if qkv_qktrans_compute_lat < softmax_stg1_incycle:
             softmax_stg1_incycle_delayed = softmax_stg1_incycle - qkv_qktrans_compute_lat
             softmax_inputs_hiding = False
-            logging.warn(f"{__name__}: softmax input cycles hidden failed")
+            hw_modeling_logger.warn(f"{__name__}: softmax input cycles hidden failed")
 
         return intermediate_lat, softmax_stg1_incycle, softmax_stg1_incycle_delayed, softmax_inputs_hiding
 
@@ -1586,7 +1591,7 @@ class BertModel:
         # softmax_compute_hiding = True
         # if softmax_first_ddl < softmax_first_finish_time:
         #     softmax_compute_hiding = False
-        #     logging.warn("softmax compute hidden failed", softmax_first_finish_time, softmax_first_ddl)
+        #     hw_modeling_logger.warn("softmax compute hidden failed", softmax_first_finish_time, softmax_first_ddl)
 
         # accumulate VxAtt
         vatt_mult_incycles, _ = \
@@ -1604,7 +1609,7 @@ class BertModel:
         softmax_compute_hiding = True
         if vatt_mult_incycles < softmax_lat:
             softmax_compute_hiding = False
-            logging.warn("softmax compute hidden failed: {}, {}".format(vatt_mult_incycles, softmax_lat))
+            hw_modeling_logger.warn("softmax compute hidden failed: {}, {}".format(vatt_mult_incycles, softmax_lat))
 
         res += output_fc_lat
         
@@ -1689,9 +1694,9 @@ class BertModel:
         intermediate_lat = max(qkv_qktrans_compute_lat, softmax_stg1_incycle)
 
         if qkv_qktrans_compute_lat > softmax_stg1_incycle:
-            logging.info(f"{__name__}: softmax hidden succeeded")
+            hw_modeling_logger.info(f"{__name__}: softmax hidden succeeded")
         else:
-            logging.info(f"{__name__}: softmax hidden failed")
+            hw_modeling_logger.info(f"{__name__}: softmax hidden failed")
 
         predessesor_heads_lat = mvm_in_cycles * 2 + intermediate_lat * (self.num_heads-1)
         # softmax finish time (absolute time)

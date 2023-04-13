@@ -8,7 +8,13 @@ import matplotlib.pyplot as plt
 from typing import List, Union
 from math import ceil, floor, sqrt
 from hw_modeling import StratixDpuModel
-import pickle
+
+import logging
+
+tcblocks_logger = logging.getLogger("tcblocks vs matsize")
+tcblocks_logger.setLevel(logging.INFO)
+tcblocks_logger_handler = logging.FileHandler(filename="dual_vs_dyna_util.log", mode="w")
+tcblocks_logger.addHandler(tcblocks_logger_handler)
 
 def closest_factors_to_target(chain, target):
     true_chainlen = float(chain+2)
@@ -449,8 +455,15 @@ def tcchain_len_multidualcore(small_mats, large_mats, dsp_split=None):
         small_split = (small_split_l + small_split_r) / 2.0
 
         short_chain_lat, long_chain_lat = 0., 1.
+        thres = 0.00001
+        
+        last_iter_diff = 0
 
-        while(abs(long_chain_lat-short_chain_lat) > 0.001):
+        while(abs(long_chain_lat-short_chain_lat) > thres and \
+              abs(last_iter_diff - abs(long_chain_lat-short_chain_lat)) > 1e-5):
+            
+            last_iter_diff = abs(long_chain_lat-short_chain_lat)
+            
             short_chain_shape = closest_factors_to_target(short_chain_len, ceil(3960.0 * small_split))
             long_chain_shape = closest_factors_to_target(long_chain_len, 3960-ceil(3960.0 * small_split))
             short_chain_lat, short_chain_ops = \
@@ -463,7 +476,7 @@ def tcchain_len_multidualcore(small_mats, large_mats, dsp_split=None):
             elif (short_chain_lat - long_chain_lat) < 0.0:
                 small_split_r = small_split
             
-            if abs(long_chain_lat-short_chain_lat) > 0.001:
+            if abs(long_chain_lat-short_chain_lat) > thres:
                 small_split = (small_split_l + small_split_r) / 2.0
             
             print(f"l: {small_split_l}, r: {small_split_r}, next sel: {small_split}")
@@ -482,10 +495,25 @@ def tcchain_len_multidualcore(small_mats, large_mats, dsp_split=None):
     
     print(f"short lat: {short_chain_lat}, long lat: {long_chain_lat}")
 
+    for m in small_mats:
+        frag_util = get_util(m, short_chain_shape, short_chain_len)
+        stat_util = short_chain_len * short_chain_shape[0] * short_chain_shape[1]
+        stat_util /= (short_chain_len+2) * short_chain_shape[0] * short_chain_shape[1]
+        eff_util = frag_util * stat_util
+        tcblocks_logger.info(f"DUAL: effective util for short: {eff_util:.2f}")
+
+    for m in large_mats:
+        frag_util = get_util(m, long_chain_shape, long_chain_len)
+        stat_util = long_chain_len * long_chain_shape[0] * long_chain_shape[1]
+        stat_util /= long_chain_len * long_chain_shape[0] * long_chain_shape[1]
+        eff_util = frag_util * stat_util
+        tcblocks_logger.info(f"DUAL: effective util for long: {eff_util:.2f}")
+
     lat_res = max(short_chain_lat, long_chain_lat)
     total_ops = short_chain_ops + long_chain_ops
     flops = total_ops / lat_res / 1e12
 
+    print("total ops: ", total_ops)
     print(f"total flops: {flops}")
 
     return flops, (short_chain_lat, long_chain_lat)
@@ -495,10 +523,19 @@ def tcchain_len_dynacore(small_mats, large_mats):
     small_mats.sort(key=lambda s: 1. - s["row_sparsity"])
     large_mats.sort(key=lambda s: 1. - s["row_sparsity"])
 
-    short_chain_len, long_chain_len = 7, 14
+    short_chain_len, long_chain_len = 0, 0
+    # find out short chain len with max util on att head
+    for smat in small_mats:
+        if smat["label"] == "att":
+            short_chain_len = max_eff_util_chainlen(smat)
+    # find out long chain len with max util on dense_ffn
+    for lmat in large_mats:
+        if lmat["label"] == "dense_ffn_fc2":
+            long_chain_len = max_eff_util_chainlen(lmat)
     # construct shapes
     long_chain_shape = closest_factors_to_target(long_chain_len, 3960)
-    short_chain_shape = (long_chain_shape[0]*2, long_chain_shape[1])
+    longchain_split_factor = long_chain_len // short_chain_len 
+    short_chain_shape = (long_chain_shape[0] * longchain_split_factor, long_chain_shape[1])
     
     short_chain_lat, short_chain_ops = \
         multi_mat_exec_tops(short_chain_len, short_chain_shape, small_mats)
@@ -507,10 +544,25 @@ def tcchain_len_dynacore(small_mats, large_mats):
     
     print(f"short lat: {short_chain_lat}, long lat: {long_chain_lat}")
 
+    for m in small_mats:
+        frag_util = get_util(m, short_chain_shape, short_chain_len)
+        stat_util = short_chain_len * short_chain_shape[0] * short_chain_shape[1]
+        stat_util /= 3960.0
+        eff_util = frag_util * stat_util
+        tcblocks_logger.info(f"DYNA: effective util for short: {eff_util:.2f}")
+
+    for m in large_mats:
+        frag_util = get_util(m, long_chain_shape, long_chain_len)
+        stat_util = long_chain_len * long_chain_shape[0] * long_chain_shape[1]
+        stat_util /= 3960.0
+        eff_util = frag_util * stat_util
+        tcblocks_logger.info(f"DYNA: effective util for long: {eff_util:.2f}")
+
     lat_res = short_chain_lat + long_chain_lat
     total_ops = short_chain_ops + long_chain_ops
     flops = total_ops / lat_res / 1e12
 
+    print("total ops: ", total_ops)
     print(f"total flops: {flops}")
 
     return flops, (short_chain_lat, long_chain_lat)
@@ -569,60 +621,95 @@ def tops_diff_mats(small_mats_list, large_mats_list):
     matplotlib.rcParams.update({'ytick.labelsize': fsize})
     matplotlib.rcParams['lines.markersize'] = 3
 
-    dual_core_tops_list = {i: 0 for i in small_mats_list.keys()}
-    dyna_core_tops_list = {i: 0 for i in small_mats_list.keys()}
+    mat_names = list(small_mats_list.keys())
 
-    for model_name in small_mats_list.keys():
-        dualcore_tops, _ = tcchain_len_multidualcore(small_mats_list[model_name], large_mats_list[model_name])
-        dual_core_tops_list[model_name] = dualcore_tops
-        dynacore_tops, _ = tcchain_len_dynacore(small_mats_list[model_name], large_mats_list[model_name])
-        dyna_core_tops_list[model_name] = dynacore_tops
+    dual_core_perf_list = {i: (0, 0) for i in mat_names}
+    dyna_core_perf_list = {i: (0, 0) for i in mat_names}
 
-    ax.scatter(list(small_mats_list.keys()), list(dual_core_tops_list.values()), 
+    for model_name in mat_names:
+        tcblocks_logger.info(f"on mat {model_name}...")
+        dualcore_tops, dualcore_lats = tcchain_len_multidualcore(small_mats_list[model_name], large_mats_list[model_name])
+        dualcore_lat_combined = max(dualcore_lats)
+        dual_core_perf_list[model_name] = (dualcore_tops, dualcore_lat_combined)
+        dynacore_tops, dynacore_lats = tcchain_len_dynacore(small_mats_list[model_name], large_mats_list[model_name])
+        dynacore_lat_combined = sum(dynacore_lats)
+        dyna_core_perf_list[model_name] = (dynacore_tops, dynacore_lat_combined)
+
+    ax.scatter(mat_names, [i[0] for i in dual_core_perf_list.values()], 
                 marker='o', s=24, alpha=0.6, label=f"dual core", color=f"C0")
-    ax.scatter(list(small_mats_list.keys()), list(dyna_core_tops_list.values()), 
+    ax.scatter(mat_names, [i[0] for i in dyna_core_perf_list.values()], 
                 marker='o', s=24, alpha=0.6, label=f"dyna core", color=f"C1")
+
+    ax2 = ax.twinx()
+    ax2.bar(mat_names, [i[1] for i in dual_core_perf_list.values()], 
+            width=-0.2, align="edge", color="C0")
+    ax2.bar(mat_names, [i[1] for i in dyna_core_perf_list.values()], 
+            width=0.2, align="edge", color="C1")
     
     ax.set_ylabel('TOPs')
-    ax.set_xlim(xmin=0)
+    ax.set_xlim(xmin=-0.4)
+    ax2.set_ylabel('latency/s')
     # ax[0].set_xlim(xmax=2*1e10)
     ax.set_ylim(ymin=0)
+    ax2.set_ylim(ymin=0)
+    # ax2.set_ylim(ymax=0.012)
     # ax[0].set_ylim(ymax=100)
     ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
-    ax.set_xlabel('Density')
+    ax.set_xlabel('model')
     ax.legend()
     fig.tight_layout()
-    fig.savefig("res_fig/diff_model_new.pdf")
+    fig.savefig("res_fig/diff_model_new_multisplit.pdf")
     plt.cla()
 
 def main():
     # tcchain_len_sweep()
     # tcchain_r_c_sweep()
     small_mats = {\
+        "opt-350m":
+            [{"size": (1024, 1024, 1024, 64), "row_sparsity": 0.2, "label": "attxv"}] * 16 + \
+            [{"size": (1024, 64, 64, 1024), "row_sparsity": 0.0, "label": "att"}] * 16,  
+        "opt-1.3b":
+            [{"size": (1024, 1024, 1024, 64), "row_sparsity": 0.2, "label": "attxv"}] * 24 + \
+            [{"size": (1024, 64, 64, 1024), "row_sparsity": 0.0, "label": "att"}] * 24,        
         "opt-13b":
             [{"size": (1024, 1024, 1024, 128), "row_sparsity": 0.2, "label": "attxv"}] * 40 + \
             [{"size": (1024, 128, 128, 1024), "row_sparsity": 0.0, "label": "att"}] * 40,
-        "opt-1.3b":
-            [{"size": (1024, 1024, 1024, 64), "row_sparsity": 0.2, "label": "attxv"}] * 24 + \
-            [{"size": (1024, 64, 64, 1024), "row_sparsity": 0.0, "label": "att"}] * 24, 
-        "opt-350m":
-            [{"size": (1024, 1024, 1024, 64), "row_sparsity": 0.2, "label": "attxv"}] * 16 + \
-            [{"size": (1024, 64, 64, 1024), "row_sparsity": 0.0, "label": "att"}] * 16, 
+        "opt-30b":
+            [{"size": (1024, 1024, 1024, 128), "row_sparsity": 0.2, "label": "attxv"}] * 56 + \
+            [{"size": (1024, 128, 128, 1024), "row_sparsity": 0.0, "label": "att"}] * 56,
+        "opt-66b":
+            [{"size": (1024, 1024, 1024, 128), "row_sparsity": 0.2, "label": "attxv"}] * 72 + \
+            [{"size": (1024, 128, 128, 1024), "row_sparsity": 0.0, "label": "att"}] * 72,
+        "opt-175b":
+            [{"size": (1024, 1024, 1024, 128), "row_sparsity": 0.2, "label": "attxv"}] * 96 + \
+            [{"size": (1024, 128, 128, 1024), "row_sparsity": 0.0, "label": "att"}] * 96,
         }
     
     large_mats = {\
-        "opt-13b":
-            [{"size": (1024, 5120, 5120, 5120), "row_sparsity": 0.0, "label": "qkv proj"}] * 3 + \
-            [{"size": (1024, 5120, 5120, 20480), "row_sparsity": 0.0, "label": "dense_ffn_fc1"}] + \
-            [{"size": (1024, 20480, 20480, 5120), "row_sparsity": 0.0, "label": "dense_ffn_fc2"}],
+        "opt-350m":
+            [{"size": (1024, 1024, 1024, 1024), "row_sparsity": 0.0, "label": "qkv proj"}] * 3 + \
+            [{"size": (1024, 1024, 1024, 4096), "row_sparsity": 0.0, "label": "dense_ffn_fc1"}] + \
+            [{"size": (1024, 4096, 4096, 1024), "row_sparsity": 0.0, "label": "dense_ffn_fc2"}],
         "opt-1.3b":
             [{"size": (1024, 2048, 2048, 2048), "row_sparsity": 0.0, "label": "qkv proj"}] * 3 + \
             [{"size": (1024, 2048, 2048, 8192), "row_sparsity": 0.0, "label": "dense_ffn_fc1"}] + \
             [{"size": (1024, 8192, 8192, 2048), "row_sparsity": 0.0, "label": "dense_ffn_fc2"}],
-        "opt-350m":
-            [{"size": (1024, 1024, 1024, 1024), "row_sparsity": 0.0, "label": "qkv proj"}] * 3 + \
-            [{"size": (1024, 1024, 1024, 4096), "row_sparsity": 0.0, "label": "dense_ffn_fc1"}] + \
-            [{"size": (1024, 4096, 4096, 1024), "row_sparsity": 0.0, "label": "dense_ffn_fc2"}]
+        "opt-13b":
+            [{"size": (1024, 5120, 5120, 5120), "row_sparsity": 0.0, "label": "qkv proj"}] * 3 + \
+            [{"size": (1024, 5120, 5120, 20480), "row_sparsity": 0.0, "label": "dense_ffn_fc1"}] + \
+            [{"size": (1024, 20480, 20480, 5120), "row_sparsity": 0.0, "label": "dense_ffn_fc2"}],
+        "opt-30b":
+            [{"size": (1024, 7168, 7168, 7168), "row_sparsity": 0.0, "label": "qkv proj"}] * 3 + \
+            [{"size": (1024, 7168, 7168, 28672), "row_sparsity": 0.0, "label": "dense_ffn_fc1"}] + \
+            [{"size": (1024, 28672, 28672, 7168), "row_sparsity": 0.0, "label": "dense_ffn_fc2"}],
+        "opt-66b":
+            [{"size": (1024, 9216, 9216, 9216), "row_sparsity": 0.0, "label": "qkv proj"}] * 3 + \
+            [{"size": (1024, 9216, 9216, 36504), "row_sparsity": 0.0, "label": "dense_ffn_fc1"}] + \
+            [{"size": (1024, 36504, 36504, 9216), "row_sparsity": 0.0, "label": "dense_ffn_fc2"}],
+        "opt-175b":
+            [{"size": (1024, 12288, 12288, 12288), "row_sparsity": 0.0, "label": "qkv proj"}] * 3 + \
+            [{"size": (1024, 12288, 12288, 49152), "row_sparsity": 0.0, "label": "dense_ffn_fc1"}] + \
+            [{"size": (1024, 49152, 49152, 12288), "row_sparsity": 0.0, "label": "dense_ffn_fc2"}],
         }
 
     tops_diff_mats(small_mats, large_mats)
