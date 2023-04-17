@@ -336,31 +336,35 @@ def plot_selfatt_sparsity(data_path, output_path, chain_len_list, hw_array_shape
     # plt.savefig(output_path + "tp_sparsity" + sorted_fig_path + attached_to_fig_name + ".pdf")
     # plt.clf()
 
-def single_case_analyzing(mat):
+def single_case_analyzing(mat, out_size: tuple, hw_array_shape = None, chain_len = None):
 
     def create_heatmap(dat, fig_name, latency):
         fig, ax = plt.subplots()
         # ax.set_xlim((0, dat.shape[0]))
         # ax.set_ylim((0, dat.shape[1]))
-        ax.set_xlabel("K")
-        ax.set_ylabel("Q")
-        ax.set_xticks([0, dat.shape[0]])
-        ax.set_xticks(np.arange(0, dat.shape[-1]+TCCORE_SIZE, TCCORE_SIZE), minor=True)
-        ax.set_yticks([0, dat.shape[1]])
-        ax.set_yticks(np.arange(0, dat.shape[0]+TCCORE_COL_SIZE, TCCORE_COL_SIZE), minor=True)
+        # ax.set_xlabel("K")
+        # ax.set_ylabel("Q")
+        # ax.set_xticks([0, dat.shape[0]])
+        # ax.set_xticks(np.arange(0, dat.shape[-1]+TCCORE_SIZE, TCCORE_SIZE), minor=True)
+        # ax.set_yticks([0, dat.shape[1]])
+        # ax.set_yticks(np.arange(0, dat.shape[0]+TCCORE_COL_SIZE, TCCORE_COL_SIZE), minor=True)
         ax.grid(which="major", alpha=0, color="green")
         ax.grid(which="minor", alpha=1, color="red")
         im = ax.imshow(dat)
+        fig.colorbar(im, ax=ax)
         actual_spar = get_mat_sparsity(dat)
         plt.title(f"sparsity={actual_spar:.2f}, latency={latency:.2f}")
         plt.savefig(fig_name)
         plt.clf()
         plt.close()
 
-    sort_row_sparsity = True    
+    sort_row_sparsity = False    
     sparse_block_size = TCCORE_SIZE
-    out_w = 768
-    hw_array_shape = factor_int(floor(3960.0/(6.0+2.0)))
+    out_w = out_size[1]
+    if hw_array_shape is None or chain_len is None:
+        chain_len = 6
+        hw_array_shape = factor_int(floor(3960.0/(chain_len+2.0)))
+    
     print("hw array shape: ", hw_array_shape)
 
     # first pad the rows to be divisible by tensor core cols
@@ -376,7 +380,7 @@ def single_case_analyzing(mat):
     fake_dense_data = np.ones(mat.shape)
     base_model = hw_modeling.StratixDpuModel(mat.shape[0], mat.shape[1], mat.shape[1], out_w, \
                                     exp_dat=fake_dense_data, freq=500, num_tcs=3960, tcc_array_shape=hw_array_shape, \
-                                    tcc_chainlen=6)
+                                    tcc_chainlen=chain_len)
     base_model.set_tccore_size(TCCORE_SIZE)
     base_flops, base_lat = base_model.tensor_fpga21_mat_sparse_flops(fake_dense_data, \
                                                 sort_row_sparsity, False, \
@@ -388,7 +392,7 @@ def single_case_analyzing(mat):
     # evaluate sparse model
     sparse_model = hw_modeling.StratixDpuModel(mat.shape[0], mat.shape[1], mat.shape[1], out_w, \
                                     exp_dat=mat, freq=500, num_tcs=3960, tcc_array_shape=hw_array_shape, \
-                                    tcc_chainlen=6)
+                                    tcc_chainlen=chain_len)
     sparse_model.set_tccore_size(TCCORE_SIZE)
     sparse_flops, sparse_lat = sparse_model.tensor_fpga21_mat_sparse_flops(mat, \
                                                     sort_row_sparsity, False, \
@@ -430,7 +434,7 @@ def single_case_analyzing(mat):
     
     sparse_model = hw_modeling.StratixDpuModel(mat.shape[0], mat.shape[1], mat.shape[1], out_w, \
                                     exp_dat=mat, freq=500, num_tcs=3960, tcc_array_shape=hw_array_shape, \
-                                    tcc_chainlen=6)
+                                    tcc_chainlen=chain_len)
     sparse_model.set_tccore_size(TCCORE_SIZE)
     mixed_sparse_flops, mixed_sparse_lat = sparse_model.tensor_fpga21_mat_sparse_flops(mat, \
                                                 sort_row_sparsity, False, \
