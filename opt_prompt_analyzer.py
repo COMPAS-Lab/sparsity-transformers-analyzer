@@ -4,7 +4,8 @@ from transformers import (
     LlamaForCausalLM, 
     LlamaTokenizer,
     OPTForCausalLM,
-    default_data_collator
+    default_data_collator,
+    get_scheduler,
 )
 from transformers.utils import logging as hf_logging
 from datasets import load_dataset
@@ -13,14 +14,15 @@ from torch.utils.data import DataLoader
 import evaluate
 import torch
 from torch import nn
+from torch.optim import AdamW
 from utils import move_to
 import numpy as np
 # from llm_serving.model.wrapper import get_model
 import random, logging, sys, re
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from sparse_tensor_analyzer import get_mat_sparsity
 from transformer_visualization import plot_heatmap
-from accelerate import Accelerator
+from accelerate import Accelerator, find_executable_batch_size
 
 # MODEL_NAME = "facebook/opt-iml-max-1.3b"
 # MODEL_NAME = "facebook/opt-13b"
@@ -546,6 +548,120 @@ def run_eval_with_constraints(
 
         logger.info(f"number of valid ans: {np.sum(num_valid_ans_all)}")
 
+def finetune(
+        train_data, 
+        eval_data,
+        tokenizer, 
+        device="cuda:0",
+        ):
+    '''
+    Examine only yes or no answers
+    '''
+    accelerator = Accelerator(fp16=True)
+
+    # Generate
+    force_words_ids = None
+    num_examples = 0
+    model_res_all, ref_all = [], []
+    attn_sparsities_all = []
+    num_valid_ans_all = []
+
+    metric_all_acc = evaluate.load("accuracy")
+    metric_all_f1 = evaluate.load("f1")
+    metric_all_rocauc = evaluate.load("roc_auc")
+
+    def inner_training_loop():
+        nonlocal accelerator, train_data, eval_data
+        accelerator.free_memory()
+
+        # Load the model.
+        model = LlamaForCausalLM.from_pretrained(MODEL_NAME)
+        optimizer = AdamW(model.parameters(), lr=2e-5)
+
+        model, optimizer, train_data, eval_data = accelerator.prepare(
+            model, optimizer, train_data, eval_data
+        )
+
+        num_train_epochs = 3
+        num_update_steps_per_epoch = len(train_data)
+        num_training_steps = num_train_epochs * num_update_steps_per_epoch
+
+        lr_scheduler = get_scheduler(
+            "linear",
+            optimizer=optimizer,
+            num_warmup_steps=100,
+            num_training_steps=num_training_steps,
+        )
+
+        progress_bar = tqdm(range(num_training_steps))
+        TRUE_ID, FALSE_ID = 1565, 2089
+
+        for epoch in range(num_train_epochs):
+            # Training
+            model.train()
+            for step, batch in enumerate(train_data):
+                batch = move_to(batch, accelerator.device)
+                num_beams = 1
+                batch_size = len(batch["input_ids"])
+                print("input size: ", batch["input_ids"].size())
+                model_params = {
+                    "input_ids": batch["input_ids"], 
+                    "attention_mask": batch["attention_mask"],
+                    "output_attentions": False,
+                    "output_hidden_states": True,
+                    "return_dict": True,
+                    }
+                outputs = model(**model_params)
+                transition_probs = nn.functional.softmax(outputs.logits[:,-1,:], dim=-1)
+                transition_probs = transition_probs.view(-1, tokenizer.vocab_size)
+                # form target from ans
+                vocab_size = tokenizer.vocab_size
+                assert vocab_size == transition_probs.size()[1], f"vocab size = {transition_probs.size()} incorrect"
+
+                formed_target = []
+                for i, i_ans in enumerate(batch["ans"]):
+                    if i_ans == 1:
+                        formed_target.append(TRUE_ID)
+                    else:
+                        formed_target.append(FALSE_ID)
+                formed_target = torch.tensor(formed_target, device = transition_probs.device, dtype=torch.long)
+                # compute loss
+                loss_fn = nn.CrossEntropyLoss()
+                loss = loss_fn(transition_probs, formed_target)
+                accelerator.backward(loss)
+
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+                progress_bar.update(1)
+
+            model.eval()
+            model_poss_res = []
+            for batch in tqdm(eval_data):
+                model_params = {
+                    "input_ids": batch["input_ids"], 
+                    "attention_mask": batch["attention_mask"],
+                    "output_attentions": False,
+                    "output_hidden_states": True,
+                    "return_dict": True,
+                    }
+                with torch.no_grad():
+                    outputs = model(**model_params)
+
+                transition_probs = nn.functional.softmax(outputs.logits[:,-1,:], dim=-1)
+                transition_probs = transition_probs.view(-1, tokenizer.vocab_size)
+
+                for inst in transition_probs:
+                    if inst[TRUE_ID] > inst[FALSE_ID]:
+                        model_poss_res.append(1)
+                    else:
+                        model_poss_res.append(0)
+
+            print(f"epoch {epoch}")
+            accelerator.wait_for_everyone()
+
+    inner_training_loop()
+
 def get_yes_no_ids(tokenizer):
     vocab = tokenizer.get_vocab()
     re_yes_code = r"[_|\W]*(yes|true)[_|\W]*"
@@ -580,10 +696,19 @@ def main():
     #     if tok_7b != tok_30b:
     #         print(f"7b tok: {a} - {tok_7b}, 30b tok: {b} - {tok_30b}")
 
-    num_examples = -1    # Load the tokenizer. All OPT models with different sizes share the same tokenizer
+    # finetuning and eval
+    num_examples = 10    # Load the tokenizer. All OPT models with different sizes share the same tokenizer
     tokenizer = LlamaTokenizer.from_pretrained(TOKENIZER_NAME)
     tokenizer.add_bos_token = False
 
+    # finetuning
+    train_data = load_and_prepare_boolq(tokenizer, batch_size=1, pad_on_right=False, num_examples=num_examples, split="train")
+    eval_data = load_and_prepare_boolq(tokenizer, batch_size=1, pad_on_right=False, num_examples=num_examples, split="validation")
+    finetune(train_data, eval_data, tokenizer)
+
+    exit()
+
+    # eval
     test_data = load_and_prepare_boolq(tokenizer, batch_size=1, pad_on_right=False, num_examples=num_examples)
     # test_data = load_and_prepare_rte(tokenizer, batch_size=1, pad_on_right=False, num_examples=num_examples, split="validation")
     # test_data = load_and_prepare_winogrande(tokenizer, batch_size=1, pad_on_right=True, num_examples=num_examples, split="validation")
