@@ -28,8 +28,8 @@ from accelerate import Accelerator, find_executable_batch_size
 # MODEL_NAME = "facebook/opt-13b"
 # TOKENIZER_NAME = "bigscience/bloom-7b1"
 # MODEL_NAME = "bigscience/bloom-7b1"
-TOKENIZER_NAME = "decapoda-research/llama-30b-hf"
-MODEL_NAME = "decapoda-research/llama-30b-hf"
+TOKENIZER_NAME = "decapoda-research/llama-7b-hf"
+MODEL_NAME = "decapoda-research/llama-7b-hf"
 
 OPT_CACHE = "/chronos_data/tji/.huggingface_cache/"
 
@@ -237,6 +237,43 @@ def load_and_prepare_winogrande(tokenizer, num_examples=-1, split="validation", 
 
     tokenized_dataloader = DataLoader(
         tokenized_data, shuffle=True, collate_fn=default_data_collator, batch_size=batch_size
+    )
+
+    return tokenized_dataloader
+
+def load_and_prepare_c4(tokenizer, num_examples=-1, split="validation", pad_on_right=False, batch_size=3, max_seq_len=1024, stride=32):
+    # raw_data = load_dataset("c4", "en", split=split)
+    raw_data = load_dataset("ola13/small-c4", split=split)
+
+    def tokenize_data(examples):
+        # examples[question_column_name] = [q.lstrip() for q in examples[question_column_name]]
+
+        tokenized_examples = tokenizer(
+            examples["text"],
+            truncation="only_second" if pad_on_right else "only_first",
+            max_length=max_seq_len,
+            stride=stride,
+            padding="do_not_pad",
+        )
+
+        return tokenized_examples
+
+    if num_examples > -1:
+        selected_idx = random.sample(range(len(raw_data)), num_examples)
+        raw_data = raw_data.select(selected_idx)
+        # raw_data = raw_data.select(range(num_examples))
+
+    logger.info(f"dataset size: {len(raw_data)}")
+    
+    tokenized_data = raw_data.map(
+        tokenize_data, 
+        batched=True,
+        remove_columns=["url", "text", "timestamp"]
+    )
+    tokenized_data.set_format("torch")
+
+    tokenized_dataloader = DataLoader(
+        tokenized_data, collate_fn=default_data_collator, batch_size=batch_size, shuffle=True
     )
 
     return tokenized_dataloader
@@ -551,7 +588,7 @@ def run_eval_with_constraints(
 def finetune(
         train_data, 
         eval_data,
-        tokenizer, 
+        tokenizer,
         device="cuda:0",
         ):
     '''
@@ -561,7 +598,6 @@ def finetune(
 
     # Generate
     force_words_ids = None
-    num_examples = 0
     model_res_all, ref_all = [], []
     attn_sparsities_all = []
     num_valid_ans_all = []
@@ -607,13 +643,13 @@ def finetune(
                 model_params = {
                     "input_ids": batch["input_ids"], 
                     "attention_mask": batch["attention_mask"],
+                    "labels": batch["input_ids"],
                     "output_attentions": False,
                     "output_hidden_states": True,
                     "return_dict": True,
                     }
                 outputs = model(**model_params)
                 transition_probs = nn.functional.softmax(outputs.logits[:,-1,:], dim=-1)
-                transition_probs = transition_probs.view(-1, tokenizer.vocab_size)
                 # form target from ans
                 vocab_size = tokenizer.vocab_size
                 assert vocab_size == transition_probs.size()[1], f"vocab size = {transition_probs.size()} incorrect"
@@ -636,30 +672,39 @@ def finetune(
                 progress_bar.update(1)
 
             model.eval()
-            model_poss_res = []
-            for batch in tqdm(eval_data):
-                model_params = {
-                    "input_ids": batch["input_ids"], 
-                    "attention_mask": batch["attention_mask"],
-                    "output_attentions": False,
-                    "output_hidden_states": True,
-                    "return_dict": True,
-                    }
-                with torch.no_grad():
-                    outputs = model(**model_params)
+            if eval_data is not None:
+                model.eval()
+                model_poss_res = []
+                for batch in tqdm(eval_data):
+                    model_params = {
+                        "input_ids": batch["input_ids"], 
+                        "attention_mask": batch["attention_mask"],
+                        "output_attentions": False,
+                        "output_hidden_states": True,
+                        "return_dict": True,
+                        }
+                    with torch.no_grad():
+                        outputs = model(**model_params)
 
-                transition_probs = nn.functional.softmax(outputs.logits[:,-1,:], dim=-1)
-                transition_probs = transition_probs.view(-1, tokenizer.vocab_size)
+                    transition_probs = nn.functional.softmax(outputs.logits[:,-1,:], dim=-1)
+                    transition_probs = transition_probs.view(-1, tokenizer.vocab_size)
 
-                for inst in transition_probs:
-                    if inst[TRUE_ID] > inst[FALSE_ID]:
-                        model_poss_res.append(1)
-                    else:
-                        model_poss_res.append(0)
+                    for inst in transition_probs:
+                        if inst[TRUE_ID] > inst[FALSE_ID]:
+                            model_poss_res.append(1)
+                        else:
+                            model_poss_res.append(0)
 
             print(f"epoch {epoch}")
             accelerator.wait_for_everyone()
 
+            # Save and upload
+            unwrapped_model = accelerator.unwrap_model(model)
+            unwrapped_model.save_pretrained(
+                "/chronos_data/tji/.huggingface_cache/transformers/llama-7b-hf-qkv-bfp12/",
+                save_function = accelerator.save
+                )
+            
     inner_training_loop()
 
 def get_yes_no_ids(tokenizer):
@@ -697,14 +742,13 @@ def main():
     #         print(f"7b tok: {a} - {tok_7b}, 30b tok: {b} - {tok_30b}")
 
     # finetuning and eval
-    num_examples = 10    # Load the tokenizer. All OPT models with different sizes share the same tokenizer
+    num_examples = 1000    # Load the tokenizer. All OPT models with different sizes share the same tokenizer
     tokenizer = LlamaTokenizer.from_pretrained(TOKENIZER_NAME)
     tokenizer.add_bos_token = False
 
     # finetuning
-    train_data = load_and_prepare_boolq(tokenizer, batch_size=1, pad_on_right=False, num_examples=num_examples, split="train")
-    eval_data = load_and_prepare_boolq(tokenizer, batch_size=1, pad_on_right=False, num_examples=num_examples, split="validation")
-    finetune(train_data, eval_data, tokenizer)
+    train_data = load_and_prepare_c4(tokenizer, batch_size=1, pad_on_right=False, num_examples=num_examples, split="train")
+    finetune(train_data, None, tokenizer)
 
     exit()
 
