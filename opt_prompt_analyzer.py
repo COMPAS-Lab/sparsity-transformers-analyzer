@@ -28,9 +28,9 @@ from accelerate import Accelerator, find_executable_batch_size
 # MODEL_NAME = "facebook/opt-13b"
 # TOKENIZER_NAME = "bigscience/bloom-7b1"
 # MODEL_NAME = "bigscience/bloom-7b1"
-TOKENIZER_NAME = "decapoda-research/llama-7b-hf"
-MODEL_NAME = "decapoda-research/llama-7b-hf"
-
+TOKENIZER_NAME = "decapoda-research/llama-30b-hf"
+MODEL_NAME = "decapoda-research/llama-30b-hf"
+NUM_LAYERS = 60
 OPT_CACHE = "/chronos_data/tji/.huggingface_cache/"
 
 # init log
@@ -463,7 +463,7 @@ def run_eval_with_constraints(
     num_examples = 0
 
     model_res_all, ref_all = [], []
-    attn_sparsities_all = []
+    attn_sparsities_all, attn_sparsities_layer_all = [], []
     num_valid_ans_all = []
 
     metric_all_acc = evaluate.load("accuracy")
@@ -512,11 +512,16 @@ def run_eval_with_constraints(
         attens = attens.view(layer_size, head_size, 
                                 num_beams*batch_size, seq_len, seq_len)
         attn_sparsities = torch.tensor([]).to(accelerator.device)
+        attn_sparsities_layer = torch.tensor([]).to(accelerator.device)
         for i in range(num_beams*batch_size):
             actual_input_len = torch.count_nonzero(batch["attention_mask"][i//num_beams], dim=-1).item()
             curr_attens = torch.squeeze(attens[:,:,i,-actual_input_len:,-actual_input_len:])
             curr_sparsity = torch.tensor([get_mat_sparsity(curr_attens, causal_mask=True)])
-            attn_sparsities = torch.cat((attn_sparsities, curr_sparsity.to(accelerator.device)), dim=-1)
+            attn_sparsities = \
+                torch.cat((attn_sparsities, curr_sparsity.to(accelerator.device)), dim=-1)
+            curr_spar_layer = get_mat_sparsity(curr_attens, causal_mask=True, per_layer=True)
+            attn_sparsities_layer = \
+                torch.cat((attn_sparsities_layer, curr_spar_layer.to(accelerator.device)), dim=-1)
         
         # batch_idx, layer_idx = 0, 10
         # ori_prompt = tokenizer.decode(seq_ids[batch_idx][-actual_input_len:])
@@ -556,6 +561,7 @@ def run_eval_with_constraints(
         model_res_all.append(accelerator.gather(model_res).cpu().numpy())
         ref_all.append(accelerator.gather(ref).cpu().numpy())
         attn_sparsities_all.append(accelerator.gather(attn_sparsities).cpu().numpy())
+        attn_sparsities_layer_all.append(accelerator.gather(attn_sparsities_layer).cpu().numpy())
         num_valid_ans_all.append(accelerator.gather(num_valid_ans).cpu().numpy())
 
     print("gathering finished")
@@ -567,12 +573,20 @@ def run_eval_with_constraints(
     model_res_all = np.concatenate(model_res_all)
     ref_all = np.concatenate(ref_all)
     attn_sparsities_all = np.concatenate(attn_sparsities_all)
+    attn_sparsities_layer_all = np.concatenate(attn_sparsities_layer_all)
+    attn_sparsities_layer_all = attn_sparsities_layer_all.reshape(NUM_LAYERS, -1)
     num_valid_ans_all = np.concatenate(num_valid_ans_all)
 
     if accelerator.is_main_process:
         logger.info(f"res: {model_res_all}\nref: {ref_all}")
+        
         avg_sparsity = np.mean(attn_sparsities_all)
         logger.info(f"avg sparsity: {avg_sparsity}")
+
+        print("layer sparsities shape: ", attn_sparsities_layer_all.shape)
+        avg_layer_spars = np.mean(attn_sparsities_layer_all, axis=-1)
+        for l in range(NUM_LAYERS):
+            logger.info(f"{avg_layer_spars[l]}")
 
         res_em = metric_all_acc.compute(predictions=model_res_all, references=ref_all)
         logger.info(f"acc for all: {res_em}")
@@ -742,15 +756,13 @@ def main():
     #         print(f"7b tok: {a} - {tok_7b}, 30b tok: {b} - {tok_30b}")
 
     # finetuning and eval
-    num_examples = 1000    # Load the tokenizer. All OPT models with different sizes share the same tokenizer
+    num_examples = -1    # Load the tokenizer. All OPT models with different sizes share the same tokenizer
     tokenizer = LlamaTokenizer.from_pretrained(TOKENIZER_NAME)
     tokenizer.add_bos_token = False
 
     # finetuning
-    train_data = load_and_prepare_c4(tokenizer, batch_size=1, pad_on_right=False, num_examples=num_examples, split="train")
-    finetune(train_data, None, tokenizer)
-
-    exit()
+    # train_data = load_and_prepare_c4(tokenizer, batch_size=1, pad_on_right=False, num_examples=num_examples, split="train")
+    # finetune(train_data, None, tokenizer)
 
     # eval
     test_data = load_and_prepare_boolq(tokenizer, batch_size=1, pad_on_right=False, num_examples=num_examples)
