@@ -36,3 +36,18 @@ def estimate_mem_usage(model_name):
         model = AutoModelForCausalLM.from_pretrained(model_name)
         
     estimate_zero3_model_states_mem_needs_all_live(model, num_gpus_per_node=2, num_nodes=1)
+
+def extract_param_names(model_name):
+    if "llama" in model_name:
+        model = LlamaForCausalLM.from_pretrained(model_name)
+    elif "opt" in model_name:
+        model = OPTForCausalLM.from_pretrained(model_name)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_name)
+
+    fname = model_name.split("/")[-1] + "-paramlist.txt"
+    with open(fname, "w+") as f:
+        f.write(str(model.config))
+        f.write("\n\n")
+        for name, params in model.named_parameters():
+            f.write(name + ": " + str(params.size()) + "\n")

@@ -15,7 +15,7 @@ import evaluate
 import torch
 from torch import nn
 from torch.optim import AdamW
-from utils import move_to
+from utils import move_to, extract_param_names
 import numpy as np
 # from llm_serving.model.wrapper import get_model
 import random, logging, sys, re
@@ -26,11 +26,12 @@ from accelerate import Accelerator, find_executable_batch_size
 
 # MODEL_NAME = "facebook/opt-iml-max-1.3b"
 # MODEL_NAME = "facebook/opt-13b"
+# TOKENIZER_NAME = "facebook/opt-13b"
 # TOKENIZER_NAME = "bigscience/bloom-7b1"
 # MODEL_NAME = "bigscience/bloom-7b1"
-TOKENIZER_NAME = "decapoda-research/llama-30b-hf"
-MODEL_NAME = "decapoda-research/llama-30b-hf"
-NUM_LAYERS = 60
+TOKENIZER_NAME = "decapoda-research/llama-7b-hf"
+MODEL_NAME = "decapoda-research/llama-7b-hf"
+NUM_LAYERS = 32
 OPT_CACHE = "/chronos_data/tji/.huggingface_cache/"
 
 # init log
@@ -95,7 +96,7 @@ def load_and_prepare_boolq(tokenizer, num_examples=-1, split="validation", pad_o
         # use templates
         boolq_prompts = DatasetTemplates("super_glue/boolq")
         # templates: ['GPT-3 Style', 'I wonder…', 'after_reading', 'based on the following passage', 'based on the previous passage', 'could you tell me…', 'exam', 'exercise', 'valid_binary', 'yes_no_question'] 
-        prompts = boolq_prompts["exercise"]
+        prompts = boolq_prompts["exam"]
         constructed = prompts.apply(a)
         # print(constructed)
         return {"full": constructed[0] + "\nAnswer:", "ans": ref_int}
@@ -439,8 +440,10 @@ def run_eval_with_constraints(
         tokenizer, 
         eval_method,
         yes_ids, no_ids,
+        load_path=None,
         device="cuda:0", 
-        is_forcing_words=False
+        is_forcing_words=False,
+        ATTN_SAMPLE_PATH="/chronos_data/tji/.huggingface_cache/transformers/"
         ):
     '''
     Examine only yes or no answers
@@ -448,7 +451,23 @@ def run_eval_with_constraints(
     accelerator = Accelerator(fp16=True)
 
     # Load the model.
-    model = LlamaForCausalLM.from_pretrained(MODEL_NAME)
+    if load_path:
+        print("loading local model ", load_path)
+        if "llama" in MODEL_NAME:
+            model = LlamaForCausalLM.from_pretrained(load_path)
+        else:
+            model = OPTForCausalLM.from_pretrained(load_path)
+        extract_param_names(load_path)
+        # examine if weights have sparsity:
+        wq_layer1_sparsity = get_mat_sparsity(model.model.layers[0].self_attn.q_proj.weight.data)
+        print("wq layer 0 sparsity: ", wq_layer1_sparsity)
+    else:
+        print("loading online model")
+        if "llama" in MODEL_NAME:
+            model = LlamaForCausalLM.from_pretrained(MODEL_NAME)
+        else:
+            model = OPTForCausalLM.from_pretrained(MODEL_NAME)
+
     model, test_data = accelerator.prepare(model, test_data)
 
     # Generate
@@ -508,14 +527,26 @@ def run_eval_with_constraints(
         attens = [i.to("cpu") for i in all_attens]
         attens = torch.stack(attens)
         print(attens.size())
-        layer_size, _, head_size, seq_len, _ = attens.size()
-        attens = attens.view(layer_size, head_size, 
+        if "llama" in MODEL_NAME:
+            layer_size, _, head_size, seq_len, _ = attens.size()
+            attens = attens.view(layer_size, head_size, 
                                 num_beams*batch_size, seq_len, seq_len)
+        elif "opt" in MODEL_NAME:
+            layer_size, head_size, seq_len, _ = attens.size()
+            head_size = head_size // (num_beams*batch_size)
+            attens = attens.view(layer_size, head_size, 
+                                num_beams*batch_size, seq_len, seq_len)
+                        
         attn_sparsities = torch.tensor([]).to(accelerator.device)
         attn_sparsities_layer = torch.tensor([]).to(accelerator.device)
         for i in range(num_beams*batch_size):
             actual_input_len = torch.count_nonzero(batch["attention_mask"][i//num_beams], dim=-1).item()
             curr_attens = torch.squeeze(attens[:,:,i,-actual_input_len:,-actual_input_len:])
+            model_name = MODEL_NAME.split("/")[1]
+            attn_path = f"{ATTN_SAMPLE_PATH}/{model_name}-attsample/attn_s{step}b{i}.pt"
+            print(f"saving attn to {attn_path}...")
+            torch.save(curr_attens, attn_path)
+
             curr_sparsity = torch.tensor([get_mat_sparsity(curr_attens, causal_mask=True)])
             attn_sparsities = \
                 torch.cat((attn_sparsities, curr_sparsity.to(accelerator.device)), dim=-1)
@@ -756,8 +787,11 @@ def main():
     #         print(f"7b tok: {a} - {tok_7b}, 30b tok: {b} - {tok_30b}")
 
     # finetuning and eval
-    num_examples = -1    # Load the tokenizer. All OPT models with different sizes share the same tokenizer
-    tokenizer = LlamaTokenizer.from_pretrained(TOKENIZER_NAME)
+    num_examples = 100    # Load the tokenizer. All OPT models with different sizes share the same tokenizer
+    if "llama" in MODEL_NAME:
+        tokenizer = LlamaTokenizer.from_pretrained(TOKENIZER_NAME)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
     tokenizer.add_bos_token = False
 
     # finetuning
@@ -775,7 +809,11 @@ def main():
         tokenizer, 
         eval_method=infer_by_logits, 
         yes_ids=yes_ids, no_ids=no_ids, 
-        is_forcing_words=False
+        is_forcing_words=False,
+        load_path = "/chronos_data/tji/.huggingface_cache/transformers/llama-7b-hf-sparsegpt-bfp",
+        # load_path = "/chronos_data/tji/.huggingface_cache/transformers/llama-7b-hf-selfattnonly-sparsegpt-bfp",
+        # load_path = "/chronos_data/tji/.huggingface_cache/transformers/llama-13b-hf-sparsegpt",
+        # load_path = "/chronos_data/tji/.huggingface_cache/transformers/llama-13b-hf-sparsegpt-bfp",
     )
 
     
