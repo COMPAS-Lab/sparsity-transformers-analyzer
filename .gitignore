@@ -22,5 +22,9 @@
 dropped_attention_params
 .opt_cache/
 
+*.log
+
 #python
 __pycache__/
+tmp*/
+config/
