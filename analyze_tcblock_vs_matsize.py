@@ -374,39 +374,78 @@ def multi_mat_exec_tops(
     lat, util, density, ops = [], [], [], []
     for m in mat_sizes:
         mat_a_row, mat_a_col, mat_b_row, mat_b_col = m["size"]
+        print("mat: ", m["label"])
 
         total_util = get_util(m, tc_array_shape, tc_len)
-        # generate fake data to be sent to hw model:
-        fake_data = None
-        if m["row_sparsity"] > 0.0: 
-            dense_acol_size = ceil(mat_a_col * (1.-m["row_sparsity"]))
-            fake_data = np.ones((mat_a_row, dense_acol_size))
-            fake_data = np.pad(
-                fake_data, ((0, 0), (0, mat_a_col-dense_acol_size)), "constant", constant_values=(0,))
-            # print(f"padded mat size: {fake_data.shape}")
+        mat_data = None
+        if m.get("file", None) is None:
+            # generate fake data to be sent to hw model:
+            mat_data = None
+            if m["row_sparsity"] > 0.0: 
+                dense_acol_size = ceil(mat_a_col * (1.-m["row_sparsity"]))
+                mat_data = np.ones((mat_a_row, dense_acol_size))
+                mat_data = np.pad(
+                    mat_data, ((0, 0), (0, mat_a_col-dense_acol_size)), "constant", constant_values=(0,))
+                # print(f"padded mat size: {fake_data.shape}")
+            else:
+                mat_data = np.ones((mat_a_row, mat_a_col))
         else:
-            fake_data = np.ones((mat_a_row, mat_a_col))
-
-        curr_model = StratixDpuModel(mat_a_row, mat_a_col, mat_b_row, mat_b_col,
-                                        exp_dat=fake_data,
-                                        freq=300,
-                                        num_tcs=3960,
-                                        tcc_array_shape=tc_array_shape,
-                                        tcc_chainlen=tc_len)
-
-        curr_model.set_tccore_size(20)
-        _, curr_lat = curr_model.tensor_fpga21_mat_sparse_flops(
-            fake_data,
-            True, False,
-            using_single_column=False,
-            sparse_block_size=1)
+            mat_data = torch.load(m["file"])
+            if type(mat_data) is torch.nn.parameter.Parameter:
+                mat_data = mat_data.data.numpy()
+            else:
+                mat_data = mat_data.numpy()
+            print(f"mat data shape: {mat_data.shape}")
+            if len(mat_data.shape) != 3:
+                seq_len = mat_data.shape[-1]
+                mat_data = mat_data.reshape(-1, seq_len, seq_len)
+                print(f"mat data reshaped to {mat_data.shape}")
+            m["repeat"] = 1
+            # apply the actual size to the record
+            m["size"][0], m["size"][1] = mat_data.shape[-2], mat_data.shape[-1]
+            m["size"][2] = m["size"][1]
         
-        curr_ops = m["size"][0] * m["size"][3] * m["size"][1] * ceil(1. - m["row_sparsity"])
+        total_lat, total_ops = 0., 0.
+        for mat in mat_data:
+            curr_model = StratixDpuModel(mat_a_row, mat_a_col, mat_b_row, mat_b_col,
+                                            exp_dat=mat,
+                                            freq=300,
+                                            num_tcs=3960,
+                                            tcc_array_shape=tc_array_shape,
+                                            tcc_chainlen=tc_len)
 
-        lat.append(curr_lat)
-        ops.append(curr_ops)
-        util.append(total_util)
-        density.append(1. - m["row_sparsity"])
+            curr_model.set_tccore_size(20)
+            _, curr_lat = curr_model.tensor_fpga21_mat_sparse_flops(
+                mat_data,
+                False, False,
+                using_single_column=False,
+                sparse_block_size=1)
+            total_lat += curr_lat
+        
+            curr_ops = m["size"][0] * m["size"][3] * m["size"][1]
+            total_ops += curr_ops
+
+        #figure out real num ops
+        if m.get("file", None) is None:
+            real_ops = m["size"][0] * m["size"][3] * m["size"][1] * (1. - m["row_sparsity"])
+        else:
+            real_num_rs = []
+            if mat_data.shape[1] % 3 != 0:
+                mat_data = np.pad(mat_data, ((0, 0), (0, 3 - mat_data.shape[1]%3), (0, 0)), 
+                                mode="constant", constant_values = ((0., 0.), (0., 0.), (0., 0.)))
+            grps_row_of_3 = np.split(mat_data, mat_data.shape[1]/3, axis=1)
+            for g in grps_row_of_3:
+                nonzero_vals = np.sum(np.abs(g), axis=1)
+                nonzero_vals = np.count_nonzero(nonzero_vals)
+                real_num_rs.append(nonzero_vals)
+            
+            real_ops = np.sum([r * 3 * m["size"][3] for r in real_num_rs])
+
+        lat += [total_lat] * m["repeat"]
+        ops += [total_ops] * m["repeat"]
+        util += [total_util] * m["repeat"]
+        #TODO: fix "fake" density here for loading from file
+        density += [1. - m["row_sparsity"]] * m["repeat"]
 
     total_ops = sum(ops) * 2
     time_latency = sum(lat) * 1./freq * 1e-6
@@ -442,7 +481,7 @@ def tcchain_len_multidualcore(small_mats, large_mats, dsp_split=None):
             short_chain_len = max_eff_util_chainlen(smat)
     # find out long chain len with max util on dense_ffn
     for lmat in large_mats:
-        if lmat["label"] == "dense_ffn_fc2":
+        if lmat["label"] == "down":
             long_chain_len = max_eff_util_chainlen(lmat)
 
     print(f"short len selected: {short_chain_len}, long len selected: {long_chain_len}")
@@ -466,6 +505,7 @@ def tcchain_len_multidualcore(small_mats, large_mats, dsp_split=None):
             
             short_chain_shape = closest_factors_to_target(short_chain_len, ceil(3960.0 * small_split))
             long_chain_shape = closest_factors_to_target(long_chain_len, 3960-ceil(3960.0 * small_split))
+            print("examing short and long ")
             short_chain_lat, short_chain_ops = \
                 multi_mat_exec_tops(short_chain_len, short_chain_shape, small_mats)
             long_chain_lat, long_chain_ops = \
@@ -530,7 +570,7 @@ def tcchain_len_dynacore(small_mats, large_mats):
             short_chain_len = max_eff_util_chainlen(smat)
     # find out long chain len with max util on dense_ffn
     for lmat in large_mats:
-        if lmat["label"] == "dense_ffn_fc2":
+        if lmat["label"] == "down":
             long_chain_len = max_eff_util_chainlen(lmat)
     # construct shapes
     long_chain_shape = closest_factors_to_target(long_chain_len, 3960)
@@ -658,61 +698,148 @@ def tops_diff_mats(small_mats_list, large_mats_list):
     ax.set_xlabel('model')
     ax.legend()
     fig.tight_layout()
-    fig.savefig("res_fig/diff_model_new_multisplit.pdf")
+    fig.savefig("res_fig/diff_sparsity_llama7b.pdf")
     plt.cla()
 
 def main():
     # tcchain_len_sweep()
     # tcchain_r_c_sweep()
-    small_mats = {\
+    small_mats_opt = {\
         "opt-350m":
-            [{"size": (1024, 1024, 1024, 64), "row_sparsity": 0.2, "label": "attxv"}] * 16 + \
+            [{"size": (1024, 1024, 1024, 64), "row_sparsity": 0.6, "label": "attxv"}] * 16 + \
             [{"size": (1024, 64, 64, 1024), "row_sparsity": 0.0, "label": "att"}] * 16,  
         "opt-1.3b":
-            [{"size": (1024, 1024, 1024, 64), "row_sparsity": 0.2, "label": "attxv"}] * 24 + \
+            [{"size": (1024, 1024, 1024, 64), "row_sparsity": 0.6, "label": "attxv"}] * 24 + \
             [{"size": (1024, 64, 64, 1024), "row_sparsity": 0.0, "label": "att"}] * 24,        
         "opt-13b":
-            [{"size": (1024, 1024, 1024, 128), "row_sparsity": 0.2, "label": "attxv"}] * 40 + \
+            [{"size": (1024, 1024, 1024, 128), "row_sparsity": 0.6, "label": "attxv"}] * 40 + \
             [{"size": (1024, 128, 128, 1024), "row_sparsity": 0.0, "label": "att"}] * 40,
         "opt-30b":
-            [{"size": (1024, 1024, 1024, 128), "row_sparsity": 0.2, "label": "attxv"}] * 56 + \
+            [{"size": (1024, 1024, 1024, 128), "row_sparsity": 0.6, "label": "attxv"}] * 56 + \
             [{"size": (1024, 128, 128, 1024), "row_sparsity": 0.0, "label": "att"}] * 56,
         "opt-66b":
-            [{"size": (1024, 1024, 1024, 128), "row_sparsity": 0.2, "label": "attxv"}] * 72 + \
+            [{"size": (1024, 1024, 1024, 128), "row_sparsity": 0.6, "label": "attxv"}] * 72 + \
             [{"size": (1024, 128, 128, 1024), "row_sparsity": 0.0, "label": "att"}] * 72,
         "opt-175b":
-            [{"size": (1024, 1024, 1024, 128), "row_sparsity": 0.2, "label": "attxv"}] * 96 + \
+            [{"size": (1024, 1024, 1024, 128), "row_sparsity": 0.6, "label": "attxv"}] * 96 + \
             [{"size": (1024, 128, 128, 1024), "row_sparsity": 0.0, "label": "att"}] * 96,
         }
     
-    large_mats = {\
+    large_mats_opt = {\
         "opt-350m":
-            [{"size": (1024, 1024, 1024, 1024), "row_sparsity": 0.0, "label": "qkv proj"}] * 3 + \
-            [{"size": (1024, 1024, 1024, 4096), "row_sparsity": 0.0, "label": "dense_ffn_fc1"}] + \
-            [{"size": (1024, 4096, 4096, 1024), "row_sparsity": 0.0, "label": "dense_ffn_fc2"}],
+            [{"size": (1024, 1024, 1024, 1024), "row_sparsity": 0.5, "label": "qkv proj"}] * 3 + \
+            [{"size": (4096, 1024, 1024, 1024), "row_sparsity": 0.5, "label": "dense_ffn_fc1"}] + \
+            [{"size": (1024, 4096, 4096, 1024), "row_sparsity": 0.5, "label": "dense_ffn_fc2"}],
         "opt-1.3b":
-            [{"size": (1024, 2048, 2048, 2048), "row_sparsity": 0.0, "label": "qkv proj"}] * 3 + \
-            [{"size": (1024, 2048, 2048, 8192), "row_sparsity": 0.0, "label": "dense_ffn_fc1"}] + \
-            [{"size": (1024, 8192, 8192, 2048), "row_sparsity": 0.0, "label": "dense_ffn_fc2"}],
+            [{"size": (1024, 2048, 2048, 2048), "row_sparsity": 0.5, "label": "qkv proj"}] * 3 + \
+            [{"size": (1024, 2048, 2048, 8192), "row_sparsity": 0.5, "label": "dense_ffn_fc1"}] + \
+            [{"size": (1024, 8192, 8192, 2048), "row_sparsity": 0.5, "label": "dense_ffn_fc2"}],
         "opt-13b":
-            [{"size": (1024, 5120, 5120, 5120), "row_sparsity": 0.0, "label": "qkv proj"}] * 3 + \
-            [{"size": (1024, 5120, 5120, 20480), "row_sparsity": 0.0, "label": "dense_ffn_fc1"}] + \
-            [{"size": (1024, 20480, 20480, 5120), "row_sparsity": 0.0, "label": "dense_ffn_fc2"}],
+            [{"size": (1024, 5120, 5120, 5120), "row_sparsity": 0.5, "label": "qkv proj"}] * 3 + \
+            [{"size": (1024, 5120, 5120, 20480), "row_sparsity": 0.5, "label": "dense_ffn_fc1"}] + \
+            [{"size": (1024, 20480, 20480, 5120), "row_sparsity": 0.5, "label": "dense_ffn_fc2"}],
         "opt-30b":
-            [{"size": (1024, 7168, 7168, 7168), "row_sparsity": 0.0, "label": "qkv proj"}] * 3 + \
-            [{"size": (1024, 7168, 7168, 28672), "row_sparsity": 0.0, "label": "dense_ffn_fc1"}] + \
-            [{"size": (1024, 28672, 28672, 7168), "row_sparsity": 0.0, "label": "dense_ffn_fc2"}],
+            [{"size": (1024, 7168, 7168, 7168), "row_sparsity": 0.5, "label": "qkv proj"}] * 3 + \
+            [{"size": (1024, 7168, 7168, 28672), "row_sparsity": 0.5, "label": "dense_ffn_fc1"}] + \
+            [{"size": (1024, 28672, 28672, 7168), "row_sparsity": 0.5, "label": "dense_ffn_fc2"}],
         "opt-66b":
-            [{"size": (1024, 9216, 9216, 9216), "row_sparsity": 0.0, "label": "qkv proj"}] * 3 + \
-            [{"size": (1024, 9216, 9216, 36504), "row_sparsity": 0.0, "label": "dense_ffn_fc1"}] + \
-            [{"size": (1024, 36504, 36504, 9216), "row_sparsity": 0.0, "label": "dense_ffn_fc2"}],
+            [{"size": (1024, 9216, 9216, 9216), "row_sparsity": 0.5, "label": "qkv proj"}] * 3 + \
+            [{"size": (1024, 9216, 9216, 36504), "row_sparsity": 0.5, "label": "dense_ffn_fc1"}] + \
+            [{"size": (1024, 36504, 36504, 9216), "row_sparsity": 0.5, "label": "dense_ffn_fc2"}],
         "opt-175b":
-            [{"size": (1024, 12288, 12288, 12288), "row_sparsity": 0.0, "label": "qkv proj"}] * 3 + \
-            [{"size": (1024, 12288, 12288, 49152), "row_sparsity": 0.0, "label": "dense_ffn_fc1"}] + \
-            [{"size": (1024, 49152, 49152, 12288), "row_sparsity": 0.0, "label": "dense_ffn_fc2"}],
+            [{"size": (1024, 12288, 12288, 12288), "row_sparsity": 0.5, "label": "qkv proj"}] * 3 + \
+            [{"size": (1024, 12288, 12288, 49152), "row_sparsity": 0.5, "label": "dense_ffn_fc1"}] + \
+            [{"size": (1024, 49152, 49152, 12288), "row_sparsity": 0.5, "label": "dense_ffn_fc2"}],
+        }
+    
+    small_mats_llama = {\
+        "llama-7b":
+            [{"size": (1024, 1024, 1024, 128), "row_sparsity": 0.6, "label": "attxv", "repeat": 32}]+ \
+            [{"size": (1024, 128, 128, 1024), "row_sparsity": 0.0, "label": "att", "repeat": 32}],        
+        "llama-13b":
+            [{"size": (1024, 1024, 1024, 128), "row_sparsity": 0.6, "label": "attxv", "repeat": 40}] + \
+            [{"size": (1024, 128, 128, 1024), "row_sparsity": 0.0, "label": "att", "repeat": 40}],
+        "llama-30b":
+            [{"size": (1024, 1024, 1024, 128), "row_sparsity": 0.6, "label": "attxv", "repeat": 52}] + \
+            [{"size": (1024, 128, 128, 1024), "row_sparsity": 0.0, "label": "att", "repeat": 52}],
+        }
+    
+    param_path_7b = "/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/llama-7b-hf-sparsegpt-bfp12/"
+    
+    large_mats_llama = {\
+        "llama-7b":
+            [{"size": (4096, 4096, 4096, 1024), "row_sparsity": 0.5, "label": "q proj", "repeat": 1, 
+              "file": param_path_7b + "model.layers.0.self_attn.q_proj.weight.pt"}]+ \
+            [{"size": (4096, 4096, 4096, 1024), "row_sparsity": 0.5, "label": "k proj", "repeat": 1, 
+              "file": param_path_7b + "model.layers.0.self_attn.k_proj.weight.pt"}]+ \
+            [{"size": (4096, 4096, 4096, 1024), "row_sparsity": 0.5, "label": "v proj", "repeat": 1, 
+              "file": param_path_7b + "model.layers.0.self_attn.v_proj.weight.pt"}]+ \
+            [{"size": (4096, 4096, 4096, 1024), "row_sparsity": 0.5, "label": "o proj", "repeat": 1, 
+              "file": param_path_7b + "model.layers.0.self_attn.o_proj.weight.pt"}]+ \
+            [{"size": (11008, 4096, 4096, 1024), "row_sparsity": 0.5, "label": "gate", "repeat": 1,
+              "file": param_path_7b + "model.layers.0.mlp.gate_proj.weight.pt"}] + \
+            [{"size": (11008, 4096, 4096, 1024), "row_sparsity": 0.5, "label": "up", "repeat": 1,
+              "file": param_path_7b + "model.layers.0.mlp.up_proj.weight.pt"}] + \
+            [{"size": (4096, 11008, 11008, 1024), "row_sparsity": 0.5, "label": "down", "repeat": 1,
+              "file": param_path_7b + "model.layers.0.mlp.down_proj.weight.pt"}],
+        "llama-13b":
+            [{"size": (5120, 5120, 5120, 1024), "row_sparsity": 0.5, "label": "qkv proj", "repeat": 4}] + \
+            [{"size": (13824, 5120, 5120, 1024), "row_sparsity": 0.5, "label": "gate & up", "repeat": 1}] + \
+            [{"size": (5120, 13824, 13824, 1024), "row_sparsity": 0.5, "label": "down", "repeat": 1}],
+        "llama-30b":
+            [{"size": (6656, 6656, 6656, 1024), "row_sparsity": 0.5, "label": "qkv proj", "repeat": 4}] + \
+            [{"size": (17920, 6656, 6656, 1024), "row_sparsity": 0.5, "label": "gate & up", "repeat": 1}] + \
+            [{"size": (6656, 17920, 17920, 1024), "row_sparsity": 0.5, "label": "down", "repeat": 1}],
         }
 
-    tops_diff_mats(small_mats, large_mats)
+
+    # analyze based on real attn data
+    param_path_7b = "/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/llama-7b-hf-sparsegpt-bfp12/"
+    attn_path_7b = "/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/llama-7b-hf-attsample/attn_s4b0.pt"
+    #figure out actual seq len
+    attn = torch.load(attn_path_7b)
+    seq_len = attn.size()[-1]
+    print(f"loaded seq len: {seq_len}")
+    
+    small_mats_llama = {\
+        "opt-blue-yellow":
+            [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.6, "label": "attxv", "repeat": 32,
+                "file": attn_path_7b}]+ \
+            [{"size": [seq_len, 128, 128, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 32,
+                "file": attn_path_7b}],
+        "opt-blue":
+            [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.6, "label": "attxv", "repeat": 32,
+                "file": attn_path_7b}]+ \
+            [{"size": [seq_len, 128, 128, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 32,
+                "file": attn_path_7b}],
+        "original":
+            [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.0, "label": "attxv", "repeat": 32}]+ \
+            [{"size": [seq_len, 128, 128, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 32}],
+        }
+    
+    large_mats_llama = {\
+        "opt-blue-yellow":
+            [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0.5, "label": "q proj", "repeat": 1, 
+              "file": param_path_7b + "model.layers.0.self_attn.q_proj.weight.pt"}]+ \
+            [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0.5, "label": "k proj", "repeat": 1, 
+              "file": param_path_7b + "model.layers.0.self_attn.k_proj.weight.pt"}]+ \
+            [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0.5, "label": "v proj", "repeat": 1, 
+              "file": param_path_7b + "model.layers.0.self_attn.v_proj.weight.pt"}]+ \
+            [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0.5, "label": "o proj", "repeat": 1, 
+              "file": param_path_7b + "model.layers.0.self_attn.o_proj.weight.pt"}], 
+        "opt-blue":
+            [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}]+ \
+            [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}]+ \
+            [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}]+ \
+            [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],  
+        "original":
+            [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}]+ \
+            [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}]+ \
+            [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}]+ \
+            [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],   
+        }
+
+    tops_diff_mats(small_mats_llama, large_mats_llama)
     # explore_dualcore_lat_thrput(small_mats["opt-1.3b"], large_mats["opt-1.3b"])
 
 if __name__ == "__main__":

@@ -481,8 +481,11 @@ class StratixDpuModel(DpuModel):
 
         return flops, total_latency
 
-    def tensor_fpga21_mat_sparse_flops(self, sparse_mat, sort_rows_by_sparsity=False, ideal=False, using_single_column=False, \
-                                        sparse_block_size = 10.0, maximize_sparsity=False, short_to_long_ratio=0.0, blocked_pruning=False):
+    def tensor_fpga21_mat_sparse_flops(self, 
+                                        sparse_mat, sort_rows_by_sparsity=False, ideal=False, 
+                                        using_single_column=False, 
+                                        sparse_block_size = 10.0, maximize_sparsity=False, short_to_long_ratio=0.0, 
+                                        blocked_pruning=False, return_time_lat = True):
         ''' 
         compute flops and latency with a given number of cascaded chain and b cols
         considering skipping the zeros in the mat A
@@ -705,7 +708,9 @@ class StratixDpuModel(DpuModel):
         time_latency = total_lat * 1./self.FREQ * 1e-6
         flops = total_ops / time_latency / 1e12
 
-        return flops, total_lat
+        lat_ret = time_latency if return_time_lat else total_ops
+
+        return flops, lat_ret
     
     def ideal_tops(self):
         ops = (self.TCCORE_SIZE*2*self.TCCORE_COL_SIZE) * self.NUM_TCs

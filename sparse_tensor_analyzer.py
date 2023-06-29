@@ -5,11 +5,13 @@ import hw_modeling
 import pandas as pd
 import matplotlib.pyplot as plt
 import skimage.measure
+from tqdm import tqdm
 from scipy.spatial.distance import hamming
 from typing import List, Union
 from math import ceil, floor, sqrt
 import random
 import multiprocessing
+from analyze_tcblock_vs_matsize import closest_factors_to_target
 
 TCCORE_COL_SIZE = 3
 TCCORE_SIZE = 20
@@ -42,12 +44,13 @@ def factor_int(n: int):
 # hw_array_shape = (22, 12)
 
 def get_mat_sparsity(dat):
-    if type(dat) == torch.Tensor:
-        return (1. - torch.count_nonzero(dat) / torch.numel(dat))
-    else:
-        return (1. - np.count_nonzero(dat) / dat.size)
+    with torch.no_grad():
+        if type(dat) == torch.Tensor:
+            return (1. - torch.count_nonzero(dat) / torch.numel(dat))
+        else:
+            return (1. - np.count_nonzero(dat) / dat.size)
 
-def prepare_mat_dat(data_path, seq_len_path, seq_len_range, samples=-1):
+def prepare_att_dat(data_path, seq_len_path, seq_len_range, sparsity=0.0, samples=-1):
     bfp_att_probes = []
     if seq_len_path is not None and seq_len_range is not None:
         seq_len = torch.load(seq_len_path).cpu().detach().numpy()
@@ -66,12 +69,21 @@ def prepare_mat_dat(data_path, seq_len_path, seq_len_range, samples=-1):
 
     return bfp_att_probes
 
-def compute_matmul_performance(data_path, chain_len, out_w, hw_array_shape, \
-                                sort_row_sparsity, using_single_column, sparse_block_size, freq=500, \
-                                seq_len_path=None, seq_len_range=None, mixed_chain_length=None, \
-                                short_to_long_ratio=0.0, blocked_pruning=False):
+def prepare_wei_dat(data_path):
+    w = torch.load(data_path).cpu().detach().numpy()
+    print("load weight with shape ", w.shape)
+    return w
 
-    bfp_att_probes = prepare_mat_dat(data_path, seq_len_path, seq_len_range, 100)
+def compute_matmul_performance(data, chain_len, out_w, hw_array_shape, \
+                                sort_row_sparsity, using_single_column, sparse_block_size, freq=500, \
+                                sparsity=0.0, seq_len_path=None, seq_len_range=None, mixed_chain_length=None, \
+                                short_to_long_ratio=0.0, blocked_pruning=False):
+    '''compute latency, throughput and sparsity of a given sparse/dense matrix operation'''
+    if type(data) is str:
+        bfp_att_probes = prepare_att_dat(data, seq_len_path, seq_len_range, sparsity)
+    else:
+        bfp_att_probes = data
+
     res = {"latency":[] ,"sparsity": [], "s2l ratio": [], "tp": []}
 
     total_sparse_lat, total_base_lat, total_min_sparse_lat = 0, 0, 0
@@ -121,7 +133,127 @@ def compute_matmul_performance(data_path, chain_len, out_w, hw_array_shape, \
                 
     res_df = pd.DataFrame(res, columns=res.keys())
     res_df.sort_values(by=["sparsity"], inplace=True)
-    return res_df, total_sparse_lat/num_insts, total_min_sparse_lat/num_insts, total_base_lat/num_insts
+    return res_df, total_sparse_lat, total_min_sparse_lat, total_base_lat
+
+def compute_stacked_matmul_performance(mats_lists, chain_len, hw_array_shape, layer_idx=0, plot_figure=False):
+    '''compute and plot performance of multiple mats in the transformers'''
+    mat_labels = [k["label"] for k in list(mats_lists[0].values())[0]]
+    mat_names = list(mats_lists[0].keys())
+
+    def compute_single_inst(mats_list, chain_len, hw_array_shape, layer_idx):
+        perf_list = {i: {k: 0. for k in mat_labels} for i in mat_names}
+        print("init perf list: ", perf_list)
+
+        for model_name in mat_names:
+            for m in mats_list[model_name]:
+                mat_data = None
+                is_loading_from_file = False if m.get("file", None) is None else True
+                if not is_loading_from_file:
+                    # generate fake data to be sent to hw model:
+                    mat_a_row, mat_a_col = m["size"][0], m["size"][1]
+                    if m["row_sparsity"] > 0.0: 
+                        dense_acol_size = ceil(mat_a_col * (1.-m["row_sparsity"]))
+                        mat_data = np.ones((mat_a_row, dense_acol_size))
+                        mat_data = np.pad(
+                            mat_data, ((0, 0), (0, mat_a_col-dense_acol_size)), "constant", constant_values=(0,))
+                    else:
+                        mat_data = np.ones((mat_a_row, mat_a_col))
+                    mat_a_row, mat_a_col = mat_data.shape[0], mat_data.shape[1]
+                    mat_data = mat_data.reshape(-1, mat_a_row, mat_a_col)
+                else:
+                    mat_data = torch.load(m["file"])
+                    if type(mat_data) is torch.nn.parameter.Parameter:
+                        mat_data = mat_data.data.numpy()
+                    else:
+                        mat_data = mat_data.numpy()
+                    if m.get("label", None) == "attxv":
+                        mat_data = mat_data[layer_idx,:,:,:]
+                    if len(mat_data.shape) != 3:
+                        seq_len = mat_data.shape[-1]
+                        mat_data = mat_data.reshape(-1, seq_len, seq_len)
+                    m["repeat"] = 1
+                    # apply the actual size to the record
+                    m["size"][0], m["size"][1] = mat_data.shape[-2], mat_data.shape[-1]
+                    m["size"][2] = m["size"][1]
+
+                print(f"on mat {model_name}...")
+                # examine the sizes of the matrix:
+                print(f"mat name: {model_name} {m['label']}, repeat {m['repeat']} times, loading: {is_loading_from_file}")
+                print(f"mat shape: {mat_data.shape}")
+
+                _, total_sparse_lat, _, total_base_lat = \
+                    compute_matmul_performance(mat_data, 
+                                            chain_len, 
+                                            m["size"][-1], 
+                                            hw_array_shape, 
+                                            sort_row_sparsity=False, 
+                                            using_single_column=True,  
+                                            sparse_block_size=1, 
+                                            freq=300, \
+                                            seq_len_path=None, seq_len_range=None, 
+                                            mixed_chain_length=None, short_to_long_ratio=0.0, 
+                                            blocked_pruning=False)
+                perf_list[model_name][m["label"]] += total_sparse_lat * m["repeat"]
+
+        return perf_list
+    
+    all_inst_perf_list = []
+    
+    for mats_list in tqdm(mats_lists):
+        curr_perf_list = compute_single_inst(mats_list, chain_len, hw_array_shape, layer_idx)
+        all_inst_perf_list.append(curr_perf_list)
+
+    # perf_list structure: [{"model name" : {"mat op name": lat}}]
+    # compute average lat:
+    avg_perf_list = {i: {k: 0. for k in mat_labels} for i in mat_names}
+    for n in mat_names:
+        for l in mat_labels:
+            avg_perf_list[n][l] = np.mean([i[n][l] for i in all_inst_perf_list])
+
+
+    if plot_figure:
+        fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        fsize = 9
+        matplotlib.rcParams.update({'xtick.labelsize': fsize})
+        matplotlib.rcParams.update({'ytick.labelsize': fsize})
+        matplotlib.rcParams['lines.markersize'] = 3
+        
+        bottom_vals = [0.0] * len(mat_names)
+        color_table = {"q proj": "#fbbc04", 
+                       "k proj": "#fbbc04",
+                       "v proj": "#fbbc04",
+                       "o proj": "#fbbc04",
+                       "attxv": "#4285f4",
+                       "att": "#ea4335",
+                       }
+        for idx_l, l in enumerate(mat_labels):
+            curr_mat_lats = [avg_perf_list[n][l] for n in mat_names]
+            ax.bar(mat_names, curr_mat_lats, bottom=bottom_vals, 
+                    width=0.2, align="center", color=color_table[l], label=l)
+            for n in range(len(mat_names)):
+                bottom_vals[n] += curr_mat_lats[n]
+
+        # ax2 = ax.twinx()
+        # ax2.bar(mat_names, [i[1] for i in dyna_core_perf_list.values()], 
+        #         width=0.2, align="edge", color="C1")
+        
+        ax.set_ylabel('latency/sec')
+        ax.set_xlim(xmin=-0.4)
+        # ax2.set_ylabel('latency/s')
+        # ax[0].set_xlim(xmax=2*1e10)
+        ax.set_ylim(ymin=0)
+        # ax2.set_ylim(ymin=0)
+        # ax2.set_ylim(ymax=0.012)
+        # ax[0].set_ylim(ymax=100)
+        ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
+        ax.set_xlabel('model')
+        # ax.legend()
+        fig.tight_layout()
+        fig.savefig(f"res_fig/llama7b_attnonly_latency_comparison_l{layer_idx}.pdf")
+        plt.cla()
+
+    return avg_perf_list
+
 
 def plot_perf_sparsity(data_path, output_path, chain_len_list, hw_array_shape_list, sort_row_sparsity, \
                             using_single_column, sparse_block_size, freq_list, \
@@ -193,7 +325,7 @@ def plot_perf_sparsity(data_path, output_path, chain_len_list, hw_array_shape_li
 def short_chain_len_profiling(data_path_list, seq_len_list, seq_len_range):
     res_dat = []
     for data_path, seq_len_path in zip(data_path_list, seq_len_list):
-        bfp_data = prepare_mat_dat(data_path, seq_len_path, seq_len_range)
+        bfp_data = prepare_att_dat(data_path, seq_len_path, seq_len_range)
         for mat in bfp_data:
             # set sparsity bar
             if get_mat_sparsity(mat) > 0.7:
@@ -336,7 +468,7 @@ def plot_selfatt_sparsity(data_path, output_path, chain_len_list, hw_array_shape
     # plt.savefig(output_path + "tp_sparsity" + sorted_fig_path + attached_to_fig_name + ".pdf")
     # plt.clf()
 
-def single_case_analyzing(mat, out_size: tuple, hw_array_shape = None, chain_len = None):
+def single_case_analyzing(mat, out_size: tuple, hw_array_shape = None, chain_len = None, fig_name_post = ""):
 
     def create_heatmap(dat, fig_name, latency):
         fig, ax = plt.subplots()
@@ -387,7 +519,7 @@ def single_case_analyzing(mat, out_size: tuple, hw_array_shape = None, chain_len
                                                 using_single_column=False, sparse_block_size=sparse_block_size)
 
     dense_mat_map = np.where(mat > 0, 1, 0)
-    create_heatmap(dense_mat_map, "./res_fig/dense_heatmap_opt.png", base_lat)
+    create_heatmap(dense_mat_map, f"./res_fig/dense_heatmap_{fig_name_post}.png", base_lat)
 
     # evaluate sparse model
     sparse_model = hw_modeling.StratixDpuModel(mat.shape[0], mat.shape[1], mat.shape[1], out_w, \
@@ -429,7 +561,7 @@ def single_case_analyzing(mat, out_size: tuple, hw_array_shape = None, chain_len
         compressed_mat_map += [compressed_row_grp]
 
     compressed_mat_map = np.concatenate(compressed_mat_map, axis = 0)
-    create_heatmap(compressed_mat_map, "./res_fig/column_prune_heatmap_opt.png", sparse_lat)
+    create_heatmap(compressed_mat_map, f"./res_fig/column_prune_heatmap_{fig_name_post}.png", sparse_lat)
 
     
     sparse_model = hw_modeling.StratixDpuModel(mat.shape[0], mat.shape[1], mat.shape[1], out_w, \
@@ -448,7 +580,7 @@ def single_case_analyzing(mat, out_size: tuple, hw_array_shape = None, chain_len
         compressed_row_grp = []
         row_blocks = np.split(row_grp, np.arange(TCCORE_SIZE, row_grp.shape[1], TCCORE_SIZE), axis=-1)
         for block in row_blocks:
-            if np.mean(block) > 0.001:
+            if np.sum(np.absolute(block)) > 0.0:
                 block = np.ones(block.shape)
             else:
                 block = np.zeros(block.shape)
@@ -460,7 +592,7 @@ def single_case_analyzing(mat, out_size: tuple, hw_array_shape = None, chain_len
         blocked_mat_map += [compressed_row_grp]
 
     blocked_mat_map = np.concatenate(blocked_mat_map, axis = 0)
-    create_heatmap(blocked_mat_map, "./res_fig/block_prune_heatmap_opt.png", mixed_sparse_lat)
+    create_heatmap(blocked_mat_map, f"./res_fig/block_prune_heatmap_{fig_name_post}.png", mixed_sparse_lat)
 
     print("column pruning and blocked pruning latency: ", base_lat/sparse_lat, base_lat/mixed_sparse_lat)
     
@@ -472,7 +604,7 @@ def plot_lat_vs_sparsity(file_path, seq_len_path, seq_len_range):
     '''
     illustrate latency under different sparsity
     '''
-    bfp_att_probes = prepare_mat_dat(file_path, seq_len_path, seq_len_range)
+    bfp_att_probes = prepare_att_dat(file_path, seq_len_path, seq_len_range)
     res = {"base": [], "column": [], "blocked": []}
     for att in bfp_att_probes:
         temp_lvss_res = single_case_analyzing(att)
@@ -498,7 +630,7 @@ def plot_lat_vs_sparsity(file_path, seq_len_path, seq_len_range):
 
 
 def analyze_sparsity_blocking(file_path, seq_len_path):
-    bfp_att_probes = prepare_mat_dat(file_path, seq_len_path, (0, 1024))
+    bfp_att_probes = prepare_att_dat(file_path, seq_len_path, (0, 1024))
 
     all_ideal_spar, all_blocked_spar = [], []
     for att in bfp_att_probes:
@@ -531,7 +663,7 @@ def analyze_sparsity_blocking(file_path, seq_len_path):
     return np.average(all_ideal_spar), np.average(all_blocked_spar)
 
 def analyze_block_sparsity_compare(file_path, seq_len_path, transpose=True, sort_rows_by_sparsity=True):
-    bfp_att_probes = prepare_mat_dat(file_path, seq_len_path, (0, 1024))
+    bfp_att_probes = prepare_att_dat(file_path, seq_len_path, (0, 1024))
     original_spar_list = []
     block_spar_list = []
 
@@ -617,10 +749,130 @@ def analyze_block_sparsity_compare(file_path, seq_len_path, transpose=True, sort
 
     return np.mean(original_spar_list), np.mean(block_spar_list)
 
+def compute_csr_comp_ratio(mat_shape: tuple, sparsity: float, bits=16, block = False):
+    mat_size = mat_shape[0] * mat_shape[1]
+    if block:
+        mat_shape_real = (mat_shape[0] // 3, mat_shape[1])
+        mat_size_blocked = mat_shape_real[0] * mat_shape_real[1]
+        block_size = 3*20
+    else:
+        mat_shape_real = mat_shape
+        mat_size_blocked = mat_size
+        block_size = 1
+        
+    num_dense_vals = mat_size_blocked * (1. - sparsity)
+    num_col_indices = num_dense_vals
+    num_row_indices = mat_shape_real[0] + 1
+    original_size = mat_size * bits
+    idx_bits = mat_size_blocked.bit_length()
+    compressed_size = num_dense_vals * block_size * bits + (num_col_indices + num_row_indices) * idx_bits
+
+    print(f"sparsity: {sparsity}")
+    print(f"required idx bits: {idx_bits}")
+    print(f"# idces: {num_col_indices + num_row_indices}")
+
+    return original_size / compressed_size
+
+def print_compress_ratio():
+    mat_shape = (4096, 4096)
+    sparsities = np.arange(0.0, 1.0, 0.1)
+    rat = [compute_csr_comp_ratio(mat_shape, sp, block=True) for sp in sparsities]
+    print(rat)
+
 def main():
     data_path = "/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/"
     output_path = "./res_fig/"
-    num_layers = 48
+    num_layers = 32
+
+    # Evaulating sparse 
+    # construct multiple instances of the llama inference
+    layer_idx = 3
+    insts_idx = list(range(50))
+    mats_lists_llama = []
+
+    for i in insts_idx:
+        param_path_7b = "/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/llama-7b-hf-sparsegpt-bfp12/"
+        attn_path_7b = f"/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/llama-7b-hf-attsample/attn_s{i}b0.pt"
+        #figure out actual seq len
+        attn = torch.load(attn_path_7b)
+        seq_len = attn.size()[-1]
+
+        print(f"loaded seq len: {seq_len}")
+
+        mats_llama = {\
+            "compress blue&yellow":
+                [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.6, "label": "attxv", "repeat": 32,
+                    "file": attn_path_7b}]+ \
+                [{"size": [seq_len, 128, 128, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 32}] + \
+                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0.5, "label": "q proj", "repeat": 1, 
+                "file": param_path_7b + f"model.layers.{layer_idx}.self_attn.q_proj.weight.pt"}]+ \
+                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0.5, "label": "k proj", "repeat": 1, 
+                "file": param_path_7b + f"model.layers.{layer_idx}.self_attn.k_proj.weight.pt"}]+ \
+                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0.5, "label": "v proj", "repeat": 1, 
+                "file": param_path_7b + f"model.layers.{layer_idx}.self_attn.v_proj.weight.pt"}]+ \
+                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0.5, "label": "o proj", "repeat": 1, 
+                "file": param_path_7b + f"model.layers.{layer_idx}.self_attn.o_proj.weight.pt"}], 
+            "compress blue":
+                [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.6, "label": "attxv", "repeat": 32,
+                    "file": attn_path_7b}] + \
+                [{"size": [seq_len, 128, 128, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 32}] + \
+                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}] + \
+                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}] + \
+                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
+                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],  
+            "original":
+                [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.0, "label": "attxv", "repeat": 32}] + \
+                [{"size": [seq_len, 128, 128, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 32}] + \
+                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}] + \
+                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}] + \
+                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
+                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],
+            }
+
+        mats_lists_llama.append(mats_llama)
+
+    compute_stacked_matmul_performance(mats_lists_llama, 14, (18, 12), layer_idx, plot_figure=True)
+    exit()
+
+    # print_compress_ratio()
+    # exploring blocked sparsity in bert parameter based on Jason's movement pruning
+    p_list = [
+        "self_attn.k_proj", 
+        "self_attn.q_proj", 
+        "self_attn.v_proj", 
+        "mlp.up_proj", 
+        "mlp.down_proj", 
+        "mlp.gate_proj", 
+    ]
+    res_spar = {p: [] for p in p_list}
+
+    for p_idx, p_name in enumerate(p_list):
+        for l in range(num_layers):
+            # w_fpath = data_path + "jason_res/sample/weights/" + p_name + f"-{l}.pt"
+            w_fpath = data_path + "llama-7b-hf-sparsegpt-bfp12/" + \
+                        f"model.layers.{l}." + p_name + ".weight.pt"
+            p_weights = prepare_wei_dat(w_fpath)
+            p_w_sparsity = get_mat_sparsity(p_weights)
+            print(f"sparsity: {p_w_sparsity}")
+
+            p_weights = p_weights.numpy()
+            res = single_case_analyzing(p_weights, 
+                                out_size=(p_weights.shape[1], 1024), 
+                                hw_array_shape=closest_factors_to_target(24, 3960.0),
+                                chain_len=24, 
+                                fig_name_post="")
+            res_spar[p_name].append(res["blocked"][0])
+
+        plt.plot(range(num_layers), res_spar[p_name], linestyle='-', marker='s', label=p_name, color=f"C{p_idx}")
+
+    plt.title(f"blocked pruning sparsity in parameters")
+    plt.xlabel("layer")
+    plt.ylim(0, 1)
+    plt.ylabel("sparsity")
+    plt.legend()
+    plt.grid(linewidth=0.3)
+    plt.savefig(output_path + f"parameters_sparsity_llama7b_wsparsegpt_and_nativeblock.png")
+    plt.clf()
 
     ## analyze performance for the entire attention layer
     # chain_len_list = [3]
@@ -631,7 +883,7 @@ def main():
     ## verify sparsity
     att_path = data_path + f"opt_res/bfp_attn/6-0.pt"
     seq_len_path = data_path + f"opt_res/seqlen/6-0.pt"
-    sampled_dat = prepare_mat_dat(att_path, seq_len_path, (0, 1024), 1)
+    sampled_dat = prepare_att_dat(att_path, seq_len_path, (0, 1024), 1)
     single_case_analyzing(sampled_dat[0])
     # plot_lat_vs_sparsity(att_path, seq_len_path, (0, 1024))
 
@@ -704,8 +956,6 @@ def main():
     plt.grid(linewidth=0.3)
     plt.savefig(output_path + f"speedup_vs_layer_chainlen_real_freq.png")
     plt.clf()
-
-    exit()
         
     # sparselat_sum = np.add.reduce([i[0] for i in res_list])
     # ideallat_sum = np.add.reduce([i[1] for i in res_list])
