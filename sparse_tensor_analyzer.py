@@ -187,7 +187,7 @@ def compute_stacked_matmul_performance(mats_lists, chain_len, hw_array_shape, la
                                             m["size"][-1], 
                                             hw_array_shape, 
                                             sort_row_sparsity=False, 
-                                            using_single_column=True,  
+                                            using_single_column=False,  
                                             sparse_block_size=1, 
                                             freq=300, \
                                             seq_len_path=None, seq_len_range=None, 
@@ -249,7 +249,7 @@ def compute_stacked_matmul_performance(mats_lists, chain_len, hw_array_shape, la
         ax.set_xlabel('model')
         # ax.legend()
         fig.tight_layout()
-        fig.savefig(f"res_fig/llama7b_attnonly_latency_comparison_l{layer_idx}.pdf")
+        fig.savefig(f"res_fig/opt350m_attnonly_latency_comparison_widehw_l{layer_idx}.pdf")
         plt.cla()
 
     return avg_perf_list
@@ -782,19 +782,20 @@ def print_compress_ratio():
 def main():
     data_path = "/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/"
     output_path = "./res_fig/"
-    num_layers = 32
+    num_layers = 24
 
     # Evaulating sparse 
     # construct multiple instances of the llama inference
-    layer_idx = 3
-    insts_idx = list(range(50))
-    mats_lists_llama = []
+    layer_idx = 0
+    insts_idx = list(range(3))
+    mats_lists_llama, mats_lists_opt = [], []
 
     for i in insts_idx:
         param_path_7b = "/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/llama-7b-hf-sparsegpt-bfp12/"
         attn_path_7b = f"/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/llama-7b-hf-attsample/attn_s{i}b0.pt"
+        attn_path_opt350m = f"/chronos_data/tji/opt_350m_sparse_attn/attn_s{i}b0.pt"
         #figure out actual seq len
-        attn = torch.load(attn_path_7b)
+        attn = torch.load(attn_path_opt350m)
         seq_len = attn.size()[-1]
 
         print(f"loaded seq len: {seq_len}")
@@ -815,9 +816,9 @@ def main():
             "compress blue":
                 [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.6, "label": "attxv", "repeat": 32,
                     "file": attn_path_7b}] + \
-                [{"size": [seq_len, 128, 128, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 32}] + \
+                [{"size": [seq_len, 64, 64, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 32}] + \
                 [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}] + \
-                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}] + \
+                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label  ": "k proj", "repeat": 1}] + \
                 [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
                 [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],  
             "original":
@@ -829,10 +830,29 @@ def main():
                 [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],
             }
 
-        mats_lists_llama.append(mats_llama)
+        mats_opt350m = {\
+            "compress blue":
+                [{"size": [seq_len, seq_len, seq_len, 64], "row_sparsity": 0.6, "label": "attxv", "repeat": 16,
+                    "file": attn_path_opt350m}] + \
+                [{"size": [seq_len, 64, 64, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 16}] + \
+                [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}] + \
+                [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}] + \
+                [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
+                [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],  
+            "original":
+                [{"size": [seq_len, seq_len, seq_len, 64], "row_sparsity": 0.0, "label": "attxv", "repeat": 16}] + \
+                [{"size": [seq_len, 64, 64, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 16}] + \
+                [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}] + \
+                [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}] + \
+                [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
+                [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],
+            }
 
-    compute_stacked_matmul_performance(mats_lists_llama, 14, (18, 12), layer_idx, plot_figure=True)
-    exit()
+        mats_lists_llama.append(mats_llama)
+        mats_lists_opt.append(mats_opt350m)
+
+    compute_stacked_matmul_performance(mats_lists_opt, 14, (1, 216), layer_idx, plot_figure=True)
+    exit() 
 
     # print_compress_ratio()
     # exploring blocked sparsity in bert parameter based on Jason's movement pruning
