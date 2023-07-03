@@ -6,9 +6,12 @@ from transformers import (
     LlamaForCausalLM, 
     LlamaTokenizer,
     OPTForCausalLM,
+    PreTrainedTokenizer,
 )
+from datasets import load_dataset
 from deepspeed.runtime.zero.stage3 import estimate_zero3_model_states_mem_needs_all_live
 import torch
+from tqdm import tqdm
 
 def move_to(obj, device):
     if torch.is_tensor(obj):
@@ -51,3 +54,27 @@ def extract_param_names(model_name):
         f.write("\n\n")
         for name, params in model.named_parameters():
             f.write(name + ": " + str(params.size()) + "\n")
+
+def examine_dataset_seqlen(tokenizer_name: str, 
+                           dataset_name: str,
+                           seqlen_bar: int,
+                           dataset_key = None,
+                           split = "validation",
+                           ):
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    dataset = load_dataset(dataset_name, split=split)
+
+    dataset_len = len(dataset)
+    insts_longer_than_bar = 0
+    for i in tqdm(list(range(dataset_len)), total=dataset_len):
+        if dataset_key is None:
+            tokenized_dat = tokenizer(dataset[i])
+        else:
+            tokenized_dat = tokenizer(dataset[i][dataset_key])
+
+        if len(tokenized_dat["input_ids"]) > seqlen_bar:
+            insts_longer_than_bar += 1
+    
+    print('''inst length detection: '''
+            f'''{insts_longer_than_bar}/{dataset_len} longer than {seqlen_bar}''')
