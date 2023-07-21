@@ -494,6 +494,7 @@ class StratixDpuModel(DpuModel):
         sparse_block_size: size of the sparse block size to reduce the loading irregularity
         '''
         round = lambda x: x if ideal else ceil(x)
+        get_padded_size = lambda x, fac: ceil(float(x)/fac) * fac
 
         hw_modeling_logger.info(f"tc array: {self.NUM_TCC_ROWS} x {self.NUM_TCC_COLS}")
 
@@ -590,7 +591,8 @@ class StratixDpuModel(DpuModel):
                 np.split(sparse_mat, np.arange(self.TCCORE_COL_SIZE, sparse_mat.shape[0], self.TCCORE_COL_SIZE), axis=0)
             for row_grp in mat_in_row_grps:
                 if maximize_sparsity:
-                    none_zeros += [max(np.count_nonzero(row_grp, axis=-1))]
+                    grp_nonzero = np.count_nonzero(row_grp, axis=-1)
+                    none_zeros += [max(grp_nonzero)]
                 else:
                     compressed_row_grp = []
                     row_blocks = np.split(row_grp, np.arange(sparse_block_size, row_grp.shape[1], sparse_block_size), axis=-1)
@@ -632,7 +634,7 @@ class StratixDpuModel(DpuModel):
                 if idx == 0:
                     chain_loading_a_lat += (effective_loading_lat + 1) * 3
                 mat_a_loading_latency.append(chain_loading_a_lat)
-
+ 
             # compute the latency block by block
             hw_modeling_logger.info(f"#iters: {len(mat_a_loading_latency)}")
             hw_modeling_logger.info(f"lat per iter: {mat_a_loading_latency}")
@@ -646,12 +648,23 @@ class StratixDpuModel(DpuModel):
         mat_a_short_iter_grps, mat_a_long_iter_grps = [], []
         effective_loading_lat = 0.0
         total_lat = 0.0
+        grp_util = 0.0
+        mat_in_row_grps = np.array(mat_in_row_grps)
         if type(self.CHAIN_LEN) is int:
             # if the chain length is uniform
             mat_a_array_iter_grps = \
                 np.array_split(max_none_zeros_per_grp, ceil(max_none_zeros_per_grp.shape[0] / self.NUM_TCC_COLS))
+            mat_a_iter_grps_origin = \
+                np.array_split(mat_in_row_grps, ceil(mat_in_row_grps.shape[0] / self.NUM_TCC_COLS))
             effective_loading_lat = self.CHAIN_LEN
             total_lat = compute_lat_by_elem_grps(mat_a_array_iter_grps, effective_loading_lat)
+            # compute total util
+            actual_total_elem_size = 0.0
+            for b_max, b_ori in zip(mat_a_array_iter_grps, mat_a_iter_grps_origin):
+                padded_row_size = get_padded_size(np.max(b_max), self.CHAIN_LEN*self.TCCORE_SIZE)
+                actual_total_elem_size += padded_row_size * self.NUM_TCC_COLS * 3
+            grp_util =  np.count_nonzero(sparse_mat) / actual_total_elem_size
+
         elif type(self.CHAIN_LEN) is tuple:
             # if two types of chain on the chip, effectively assign vectors to different chains
             short_chain_len, long_chain_len = self.CHAIN_LEN
@@ -695,7 +708,6 @@ class StratixDpuModel(DpuModel):
                     short_chain_pool = short_chain_pool[num_long_chain_cols:]
                 if len(curr_grp) > 0:
                     mat_a_long_iter_grps.append(curr_grp)
-
             short_iter_lat = compute_lat_by_elem_grps(mat_a_short_iter_grps, effective_loading_lat)
             long_iter_lat = compute_lat_by_elem_grps(mat_a_long_iter_grps, effective_loading_lat)
             total_lat = max(short_iter_lat, long_iter_lat)
@@ -710,7 +722,7 @@ class StratixDpuModel(DpuModel):
 
         lat_ret = time_latency if return_time_lat else total_ops
 
-        return flops, lat_ret
+        return flops, lat_ret, grp_util
     
     def ideal_tops(self):
         ops = (self.TCCORE_SIZE*2*self.TCCORE_COL_SIZE) * self.NUM_TCs

@@ -77,7 +77,8 @@ def prepare_wei_dat(data_path):
 def compute_matmul_performance(data, chain_len, out_w, hw_array_shape, \
                                 sort_row_sparsity, using_single_column, sparse_block_size, freq=500, \
                                 sparsity=0.0, seq_len_path=None, seq_len_range=None, mixed_chain_length=None, \
-                                short_to_long_ratio=0.0, blocked_pruning=False):
+                                short_to_long_ratio=0.0, blocked_pruning=False, 
+                                perf_eva_list = ["base", "ideal", "sparse"]):
     '''compute latency, throughput and sparsity of a given sparse/dense matrix operation'''
     if type(data) is str:
         bfp_att_probes = prepare_att_dat(data, seq_len_path, seq_len_range, sparsity)
@@ -87,50 +88,68 @@ def compute_matmul_performance(data, chain_len, out_w, hw_array_shape, \
     res = {"latency":[] ,"sparsity": [], "s2l ratio": [], "tp": []}
 
     total_sparse_lat, total_base_lat, total_min_sparse_lat = 0, 0, 0
+    total_base_util, total_sparse_util = 0.0, 0.0
     num_insts = len(bfp_att_probes)
     for exps in bfp_att_probes:
         # use a dense mat to calculate dens mat base lat
-        fake_dense_data = np.ones(exps.shape)
-        base_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
-                                        exp_dat=fake_dense_data, freq=freq, num_tcs=3960, tcc_array_shape=hw_array_shape, \
-                                        tcc_chainlen=chain_len)
-        base_model.set_tccore_size(TCCORE_SIZE)
-        base_flops, base_lat = base_model.tensor_fpga21_mat_sparse_flops(fake_dense_data, \
-                                                    sort_row_sparsity, False, \
-                                                    using_single_column=False, sparse_block_size=sparse_block_size)
-
-        # evaluate sparse model
-        sparse_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
-                                        exp_dat=exps, freq=freq, num_tcs=3960, tcc_array_shape=hw_array_shape, \
-                                        tcc_chainlen=chain_len)
-        sparse_model.set_tccore_size(TCCORE_SIZE)
-        min_sparse_flops, min_sparse_lat = sparse_model.tensor_fpga21_mat_sparse_flops(exps, \
-                                                    sort_row_sparsity, True, False, sparse_block_size, True)
-        if mixed_chain_length is None:
-            sparse_flops, sparse_lat = sparse_model.tensor_fpga21_mat_sparse_flops(exps, \
+        if "base" in perf_eva_list:
+            fake_dense_data = np.ones(exps.shape)
+            base_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
+                                            exp_dat=fake_dense_data, freq=freq, num_tcs=3960, tcc_array_shape=hw_array_shape, \
+                                            tcc_chainlen=chain_len)
+            base_model.set_tccore_size(TCCORE_SIZE)
+            base_flops, base_lat, base_util = base_model.tensor_fpga21_mat_sparse_flops(fake_dense_data, \
                                                         sort_row_sparsity, False, \
-                                                        using_single_column, sparse_block_size, \
-                                                        blocked_pruning=blocked_pruning)
+                                                        using_single_column=False, sparse_block_size=sparse_block_size)
+            total_base_lat += base_lat
+            total_base_util += base_util
         else:
+            base_flops, base_lat = None, None
+
+        if "ideal" in perf_eva_list:
+            # evaluate ideal sparse model ignoring the fragmentation
             sparse_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
                                             exp_dat=exps, freq=freq, num_tcs=3960, tcc_array_shape=hw_array_shape, \
-                                            tcc_chainlen=mixed_chain_length)
+                                            tcc_chainlen=chain_len)
             sparse_model.set_tccore_size(TCCORE_SIZE)
-            sparse_flops, sparse_lat = sparse_model.tensor_fpga21_mat_sparse_flops(exps, \
-                                                        sort_row_sparsity, False, \
-                                                        using_single_column, sparse_block_size, False, short_to_long_ratio, \
-                                                        blocked_pruning=blocked_pruning)
+            min_sparse_flops, min_sparse_lat, min_sparse_util = sparse_model.tensor_fpga21_mat_sparse_flops(exps, \
+                                                        sort_row_sparsity, True, False, sparse_block_size, True)
+            total_min_sparse_lat += min_sparse_lat
+        else:
+            min_sparse_flops, min_sparse_lat = None, None
+
+        if "sparse" in perf_eva_list:
+            # evaluate sparse model
+            if mixed_chain_length is None:            
+                sparse_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
+                                exp_dat=exps, freq=freq, num_tcs=3960, tcc_array_shape=hw_array_shape, \
+                                tcc_chainlen=chain_len)
+                sparse_model.set_tccore_size(TCCORE_SIZE)
+                sparse_flops, sparse_lat, sparse_util = sparse_model.tensor_fpga21_mat_sparse_flops(exps, \
+                                                            sort_row_sparsity, False, \
+                                                            using_single_column, sparse_block_size, \
+                                                            blocked_pruning=blocked_pruning)
+            else:
+                sparse_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
+                                                exp_dat=exps, freq=freq, num_tcs=3960, tcc_array_shape=hw_array_shape, \
+                                                tcc_chainlen=mixed_chain_length)
+                sparse_model.set_tccore_size(TCCORE_SIZE)
+                sparse_flops, sparse_lat, sparse_util = sparse_model.tensor_fpga21_mat_sparse_flops(exps, \
+                                                            sort_row_sparsity, False, \
+                                                            using_single_column, sparse_block_size, False, short_to_long_ratio, \
+                                                            blocked_pruning=blocked_pruning)
+            total_sparse_lat += sparse_lat
+            total_sparse_util += sparse_util
+        else:
+            sparse_flops, sparse_lat = None, None
                                                     
         curr_sparsity = 1. - np.count_nonzero(exps) / exps.size
-
-        total_sparse_lat += sparse_lat
-        total_base_lat += base_lat
-        total_min_sparse_lat += min_sparse_lat
-        res["latency"].append(sparse_lat/base_lat)
         res["sparsity"].append(curr_sparsity)
         res["tp"].append(sparse_flops)
+        res["latency"].append(sparse_lat)    
         res["s2l ratio"].append(curr_sparsity * 1000 / sparse_lat)
                 
+    print(f"base util mean: {np.mean(total_base_util)}, sparse_util_mean: {np.mean(total_sparse_util)}")
     res_df = pd.DataFrame(res, columns=res.keys())
     res_df.sort_values(by=["sparsity"], inplace=True)
     return res_df, total_sparse_lat, total_min_sparse_lat, total_base_lat
@@ -192,11 +211,12 @@ def compute_stacked_matmul_performance(mats_lists, chain_len, hw_array_shape, la
                                             freq=300, \
                                             seq_len_path=None, seq_len_range=None, 
                                             mixed_chain_length=None, short_to_long_ratio=0.0, 
-                                            blocked_pruning=False)
+                                            blocked_pruning=False, 
+                                            perf_eva_list = ["sparse"])
                 perf_list[model_name][m["label"]] += total_sparse_lat * m["repeat"]
 
         return perf_list
-    
+     
     all_inst_perf_list = []
     
     for mats_list in tqdm(mats_lists):
@@ -249,10 +269,37 @@ def compute_stacked_matmul_performance(mats_lists, chain_len, hw_array_shape, la
         ax.set_xlabel('model')
         # ax.legend()
         fig.tight_layout()
-        fig.savefig(f"res_fig/opt350m_attnonly_latency_comparison_widehw_l{layer_idx}.pdf")
+        fig.savefig(f"res_fig/opt1_3b_attnonly_latency_comparison_widehw_l{layer_idx}.pdf")
         plt.cla()
 
     return avg_perf_list
+
+
+def find_min_lat_mats(mats_list, chain_len):
+    mats_list_wrapped = [mats_list]
+    
+    def create_hw_array_shapes(chain_len, num_tcores = 3960.0):
+        rest_num_cores = num_tcores / (chain_len+2)
+        res = []
+        for i in np.arange(1, rest_num_cores, 1):
+            r = i
+            c = floor(rest_num_cores / r)
+            res.append((r, c))
+
+        return res
+
+    list_hwarrays = create_hw_array_shapes(chain_len)
+    curr_lat, best_lat, best_hw =  float("inf"), float("inf"), None
+    for hw in tqdm(list_hwarrays):
+        perf_list = compute_stacked_matmul_performance(mats_list_wrapped, chain_len, hw)
+        mat_name = list(perf_list.keys())[0]
+        curr_lat = np.sum(list(perf_list[mat_name].values()))
+        print(f"shape {hw} reports lat {curr_lat:.6f}")
+        if curr_lat < best_lat:
+            best_lat = curr_lat
+            best_hw = hw
+
+    return best_hw
 
 
 def plot_perf_sparsity(data_path, output_path, chain_len_list, hw_array_shape_list, sort_row_sparsity, \
@@ -303,7 +350,7 @@ def plot_perf_sparsity(data_path, output_path, chain_len_list, hw_array_shape_li
         for idx, (chain_len, res_df) in enumerate(zip(chain_len_list, res_df_list)):
             plt.scatter(x=res_df["sparsity"], y=res_df["tp"], alpha=0.6, \
                                 linewidth=0.1, linestyle='-', marker='s', color=f"C{idx}", label=f"chain len={chain_len}")
-
+    
         plt.title(f"throughput vs. sparsity{attached_to_fig_name}")
         plt.xlabel("sparsity")
         plt.ylabel("throughput (TFLOPs)")
@@ -782,13 +829,28 @@ def print_compress_ratio():
 def main():
     data_path = "/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/"
     output_path = "./res_fig/"
-    num_layers = 24
+    num_layers = 32
 
     # Evaulating sparse 
     # construct multiple instances of the llama inference
     layer_idx = 0
-    insts_idx = list(range(3))
-    mats_lists_llama, mats_lists_opt = [], []
+    insts_idx = list(range(1))
+    mats_list = []
+
+    # seq_len = 8192
+    # dmodel = 2048
+    # mats_opt = {
+    #     "original":
+    #         [{"size": [seq_len, seq_len, seq_len, 64], "row_sparsity": 0.0, "label": "attxv", "repeat": 32}] + \
+    #         [{"size": [seq_len, 64, 64, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 32}] + \
+    #         [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}] + \
+    #         [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}] + \
+    #         [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
+    #         [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],
+    #     }
+    # res = find_min_lat_mats(mats_opt, 14)
+    # print(f"best res: {res}")
+    # exit()
 
     for i in insts_idx:
         param_path_7b = "/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/llama-7b-hf-sparsegpt-bfp12/"
@@ -847,11 +909,29 @@ def main():
                 [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
                 [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],
             }
+        
+        dmodel = 12288
+        seq_len = dmodel * 4
+        mats_opt6_7b = {\
+            "compress blue":
+                [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.9, "label": "attxv", "repeat": 96}] + \
+                [{"size": [seq_len, 128, 128, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 96}] + \
+                [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}] + \
+                [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}] + \
+                [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
+                [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],  
+            "original":
+                [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.0, "label": "attxv", "repeat": 96}] + \
+                [{"size": [seq_len, 128, 128, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 96}] + \
+                [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}] + \
+                [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}] + \
+                [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
+                [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],
+            }
+     
+        mats_list.append(mats_opt6_7b)
 
-        mats_lists_llama.append(mats_llama)
-        mats_lists_opt.append(mats_opt350m)
-
-    compute_stacked_matmul_performance(mats_lists_opt, 14, (1, 216), layer_idx, plot_figure=True)
+    compute_stacked_matmul_performance(mats_list, 14, (2, 123), layer_idx, plot_figure=True)
     exit() 
 
     # print_compress_ratio()
