@@ -26,13 +26,14 @@ from accelerate import Accelerator, find_executable_batch_size
 
 # MODEL_NAME = "facebook/opt-iml-max-1.3b"
 # MODEL_NAME = "facebook/opt-13b"
-# TOKENIZER_NAME = "facebook/opt-13b"
-# TOKENIZER_NAME = "bigscience/bloom-7b1"
-# MODEL_NAME = "bigscience/bloom-7b1"
-TOKENIZER_NAME = "decapoda-research/llama-7b-hf"
-MODEL_NAME = "decapoda-research/llama-7b-hf"
-NUM_LAYERS = 32
+MODEL_NAME = "facebook/opt-350m"
+TOKENIZER_NAME = "facebook/opt-13b"
+# TOKENIZER_NAME = "decapoda-research/llama-7b-hf"
+# MODEL_NAME = "decapoda-research/llama-7b-hf"
+NUM_LAYERS = 24
 OPT_CACHE = "/chronos_data/tji/.huggingface_cache/"
+
+# torch.cuda.set_device(torch.device("cuda:3"))
 
 # init log
 log_fhandler = logging.FileHandler("opt_prompt_analyzer.log", mode="w", encoding="utf-8")
@@ -124,6 +125,95 @@ def load_and_prepare_boolq(tokenizer, num_examples=-1, split="validation", pad_o
         tokenized_data, collate_fn=default_data_collator, batch_size=batch_size, shuffle=True
     )
 
+    random.seed = 1722163
+    torch.manual_seed = 1722163
+    torch.cuda.manual_seed = 1722163
+    torch.backends.cudnn.deterministic = True
+
+    return tokenized_dataloader
+
+def load_and_prepare_stance_det(tokenizer, topic, num_examples=-1, split="test", pad_on_right=True, batch_size=1, max_seq_len=2048):
+    dataset_path = "/chronos_data/tji/.huggingface_cache/datasets/twitter_stance/"
+    test_dat = dataset_path + f"stance_{topic}_test_with_history_v2.csv"
+    train_dat = dataset_path + f"stance_{topic}_train_with_history_v2.csv"
+    raw_data = load_dataset("csv", data_files={"test": test_dat}, split=split)
+    TOPIC_LST = ["abortion", "atheism", "climate", "clinton", "feminist"]
+    assert topic in TOPIC_LST, f"selected topic not in the support list!\n Supported topics are: {TOPIC_LST}"
+
+    insts = raw_data.filter(lambda example: not example["stance"] is None)
+
+    def remove_duplicate(x):
+        res = []
+        for i in x:
+            if i not in res:
+                res.append(i)
+        return res
+
+    concat_tweets = {}
+    for uid in insts["user_id"]:
+        curr_uid_insts = raw_data.filter(lambda example: example["user_id"] == uid)
+        message_list = remove_duplicate(curr_uid_insts["message"])
+        # new_history_tweets = " ".join(message_list[:50])
+        new_history_tweets = message_list[:50]
+        concat_tweets[uid] = new_history_tweets
+
+    def replace_tweet(inst):
+        text_his = concat_tweets[inst["user_id"]]
+        text_anchor = inst["message"]
+        st_str_list = {-1: "against", 1: "favor", 0:"none"}
+        st_list = {-1: 1, 1: 2, 0: 0}
+
+        # return {"text": text, "label": st_list[inst["stance"]], "label_text": st_str_list[inst["stance"]]}
+
+        text = f"Task: Based on the tweets below, is the person's stance favor, none or against the topic {topic}? " + \
+                f"Answer \"favor\", \"none\" or \"against\" or against. \n" + \
+                f"Tweet: {text_his} \n" + \
+                f"{text_anchor} \n" + \
+                f"Answer: "
+        text = f"Tweet history: {text_his} \n" + \
+                f"Anchor Tweet: {text_anchor} \n" + \
+                f"Question: Based on the history of tweets from a person, are their stance pro or against {topic}? Answer pro or against. \n" + \
+                "Answer:\n\n"
+        text = f"Question: Does the author express any stance about {topic} in the following text? Answer favor, against or none. We say God bless America but we kill 4,000 babies a year. #SemST \n" + \
+                f"Answer: \nagainst \n" + \
+                f"Question: Does the author express any stance about {topic} in the following text? Answer favor, against or none. @user @user @user Yup. One of the MANY reasons I changed parties. #SemST \n" + \
+                f"Answer: \nnone \n" + \
+                f"Question: Does the author express any stance about {topic} in the following text? Answer favor, against or none. " + \
+                f"Progress for #AfricanAmericans check. Progress for #Gay people check. Progress for #Women. Waiting waiting waiting.... #SemST \n" + \
+                f"Answer: \nfavor \n" + \
+                f"Question: Does the author express any stance about {topic} in the following text? Answer favor, against or none. " + \
+                f"{' '.join(text_his)} " + f"{text_anchor} \n" + \
+                "Answer: \n"
+        return {"text": text, "target": topic, "ans": inst["stance"]}
+
+    column_names = insts.column_names
+    insts = insts.map(replace_tweet, remove_columns=column_names)
+
+    # # use promptsource:
+    # datTemplate = DatasetTemplates("tweet_eval/stance_abortion")
+    # # available templates: 
+    # # ['abortion', 'abortion_guess_passive', 'abortion_guess_passive_author', 'abortion_how_describe', 'abortion_option', 'abortion_predict_stance']
+    # prompt = datTemplate["abortion_predict_stance"]
+    # insts = insts.map(lambda example: {
+    #     "text": "Question: " + prompt.apply(example, truncate=False)[0] + " \nAnswer: "})
+    # column_names = insts.column_names
+
+    tokenized_data = insts.map(
+        lambda example: tokenizer(example["text"]), 
+        batched=True,
+        remove_columns=["text", "target"],
+        load_from_cache_file=True
+    )
+    tokenized_data.set_format("torch")
+
+    tokenized_data = tokenized_data.filter(lambda example: 1024 < example["input_ids"].size(0) < max_seq_len)
+    if num_examples > -1 and num_examples < len(tokenized_data):
+        selected_idx = random.sample(range(len(tokenized_data)), num_examples)
+        raw_data = raw_data.select(selected_idx)
+
+    tokenized_dataloader = DataLoader(
+        tokenized_data, collate_fn=default_data_collator, batch_size=batch_size, shuffle=True
+    )
     random.seed = 1722163
     torch.manual_seed = 1722163
     torch.cuda.manual_seed = 1722163
@@ -318,7 +408,7 @@ def infer_ans_directly(prompt_ans_dict: dict, device, true_str="yes", false_str=
 
     return model_res, ref, torch.tensor([num_avaliable_ans]).to(device)
 
-def infer_by_logits(prompt_ans_dict: dict, device):
+def infer_by_logits_boolq(prompt_ans_dict: dict, device):
 
     model_res, ref = \
         torch.tensor([]).to(device), torch.tensor([]).to(device)
@@ -362,6 +452,47 @@ def infer_by_logits(prompt_ans_dict: dict, device):
             prob_res = tc_true if yes_prob_sum > no_prob_sum else tc_false
             print(f"no valid answer, logit {prob_res.item()} wins")
             model_res = torch.cat((model_res, prob_res.to(model_res.device)))
+
+        ref = torch.cat((ref, ref_ans))
+
+    return model_res, ref, torch.tensor([num_avaliable_ans]).to(device)
+
+def infer_by_logits_stance_det(prompt_ans_dict: dict, device):
+
+    model_res, ref = \
+        torch.tensor([]).to(device), torch.tensor([]).to(device)
+    # model_res_avaliable_ans_only, ref_ans_only = \
+    #     torch.tensor([]).to(device), torch.tensor([]).to(device)
+        
+    out_strs = prompt_ans_dict.get("out_strs", None)
+    transition_probs = prompt_ans_dict.get("transition_probs", None)
+    answers = prompt_ans_dict.get("answers", None)
+    num_avaliable_ans = 0
+
+    for generated_str, probability, answer in zip(out_strs, transition_probs, answers):
+        ans_str = generated_str.split("Answer: \n")[-1].lower()
+        ref_ans = torch.tensor([answer]).to(ref.device)
+        
+        re_code = r"[_|\W]*(against|none|favor)[_|\W]*"
+        stripped_ans = "".join(re.findall(re_code, ans_str))
+        print(f"output: {generated_str} extracted: {stripped_ans}")
+
+        tc_against = torch.tensor([-1])
+        tc_none = torch.tensor([0])
+        tc_favor = torch.tensor([1])
+        tc_not_included = torch.tensor([20])
+        
+        if stripped_ans in ["against"]:
+            model_res = torch.cat((model_res, tc_against.to(model_res.device)))
+            num_avaliable_ans += 1
+        elif stripped_ans in ["none"]:
+            model_res = torch.cat((model_res, tc_none.to(model_res.device)))
+            num_avaliable_ans += 1
+        elif stripped_ans in ["favor"]:
+            model_res = torch.cat((model_res, tc_favor.to(model_res.device)))
+            num_avaliable_ans += 1
+        else:
+            model_res = torch.cat((model_res, tc_not_included.to(model_res.device)))
 
         ref = torch.cat((ref, ref_ans))
 
@@ -518,8 +649,9 @@ def run_eval_with_constraints(
         generated_string = tokenizer.batch_decode(seq_ids, skip_special_tokens=True)
         out_strs = []
         for out_inst in ori_prompt:
-            out_strs.append(out_inst.split("\n\n")[-1])
+            out_strs.append(out_inst.split("Answer: \n")[-1])
 
+        print(out_strs)
         all_attens = output.attentions[0]
         
         # check attention
@@ -542,10 +674,10 @@ def run_eval_with_constraints(
         for i in range(num_beams*batch_size):
             actual_input_len = torch.count_nonzero(batch["attention_mask"][i//num_beams], dim=-1).item()
             curr_attens = torch.squeeze(attens[:,:,i,-actual_input_len:,-actual_input_len:])
-            model_name = MODEL_NAME.split("/")[1]
-            attn_path = f"{ATTN_SAMPLE_PATH}/{model_name}-attsample/attn_s{step}b{i}.pt"
-            print(f"saving attn to {attn_path}...")
-            torch.save(curr_attens, attn_path)
+            # model_name = MODEL_NAME.split("/")[1]
+            # attn_path = f"{ATTN_SAMPLE_PATH}/{model_name}-attsample/attn_s{step}b{i}.pt"
+            # print(f"saving attn to {attn_path}...")
+            # torch.save(curr_attens, attn_path)
 
             curr_sparsity = torch.tensor([get_mat_sparsity(curr_attens, causal_mask=True)])
             attn_sparsities = \
@@ -622,11 +754,11 @@ def run_eval_with_constraints(
         res_em = metric_all_acc.compute(predictions=model_res_all, references=ref_all)
         logger.info(f"acc for all: {res_em}")
 
-        res_f1_all = metric_all_f1.compute(predictions=model_res_all, references=ref_all)
+        res_f1_all = metric_all_f1.compute(predictions=model_res_all, references=ref_all, average="micro")
         logger.info(f"f1 for all: {res_f1_all}")
 
-        res_rocauc_all = metric_all_rocauc.compute(prediction_scores=model_res_all, references=ref_all)
-        logger.info(f"roc auc: {res_rocauc_all}")
+        # res_rocauc_all = metric_all_rocauc.compute(prediction_scores=model_res_all, references=ref_all)
+        # logger.info(f"roc auc: {res_rocauc_all}")
 
         logger.info(f"number of valid ans: {np.sum(num_valid_ans_all)}")
 
@@ -752,6 +884,20 @@ def finetune(
             
     inner_training_loop()
 
+def get_str_ids(tokenizer, word: str):
+    vocab = tokenizer.get_vocab()
+    re_code = r"[_|\W]*(" + word + r")[_|\W]*"
+    word_idx = []
+    
+    for key, val in vocab.items():
+        lower_key = key.lower()
+        yes_match_res = re.fullmatch(re_code, lower_key)
+
+        if yes_match_res:
+            word_idx.append(val)
+
+    return word_idx
+
 def get_yes_no_ids(tokenizer):
     vocab = tokenizer.get_vocab()
     re_yes_code = r"[_|\W]*(yes|true)[_|\W]*"
@@ -799,18 +945,20 @@ def main():
     # finetune(train_data, None, tokenizer)
 
     # eval
-    test_data = load_and_prepare_boolq(tokenizer, batch_size=1, pad_on_right=False, num_examples=num_examples)
+    test_data = load_and_prepare_stance_det(tokenizer, "abortion",  batch_size=1, num_examples=num_examples)
+    # test_data = load_and_prepare_boolq(tokenizer, batch_size=1, pad_on_right=False, num_examples=num_examples)
     # test_data = load_and_prepare_rte(tokenizer, batch_size=1, pad_on_right=False, num_examples=num_examples, split="validation")
     # test_data = load_and_prepare_winogrande(tokenizer, batch_size=1, pad_on_right=True, num_examples=num_examples, split="validation")
+
     yes_ids, no_ids = get_yes_no_ids(tokenizer)
     # higher_freq_true = run_prob_eval(test_data, tokenizer, num_examples)
     run_eval_with_constraints(
         test_data, 
         tokenizer, 
-        eval_method=infer_by_logits, 
+        eval_method=infer_by_logits_stance_det, 
         yes_ids=yes_ids, no_ids=no_ids, 
         is_forcing_words=False,
-        load_path = "/chronos_data/tji/.huggingface_cache/transformers/llama-7b-hf-sparsegpt-bfp",
+        # load_path = "/chronos_data/tji/.huggingface_cache/transformers/llama-7b-hf-sparsegpt-bfp",
         # load_path = "/chronos_data/tji/.huggingface_cache/transformers/llama-7b-hf-selfattnonly-sparsegpt-bfp",
         # load_path = "/chronos_data/tji/.huggingface_cache/transformers/llama-13b-hf-sparsegpt",
         # load_path = "/chronos_data/tji/.huggingface_cache/transformers/llama-13b-hf-sparsegpt-bfp",
