@@ -50,6 +50,18 @@ def get_mat_sparsity(dat):
         else:
             return (1. - np.count_nonzero(dat) / dat.size)
 
+def get_mat_rspars_diversity(dat):
+    with torch.no_grad():
+        if type(dat) == torch.Tensor:
+            dat_nzero = torch.count_nonzero(dat, dim=-1)
+            dat_nzero = torch.numpy()
+        else:
+            dat_nzero = np.count_nonzero(dat, dim=-1)
+            return (1. - np.count_nonzero(dat) / dat.size)
+
+        div = np.var(dat_nzero)
+        return div
+
 def prepare_att_dat(data_path, seq_len_path, seq_len_range, sparsity=0.0, samples=-1):
     bfp_att_probes = []
     if seq_len_path is not None and seq_len_range is not None:
