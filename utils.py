@@ -61,7 +61,6 @@ def examine_dataset_seqlen(tokenizer_name: str,
                            dataset_key = None,
                            split = "validation",
                            ):
-
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     dataset = load_dataset(dataset_name, split=split)
 

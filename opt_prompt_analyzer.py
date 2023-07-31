@@ -23,14 +23,17 @@ from tqdm.auto import tqdm
 from sparse_tensor_analyzer import get_mat_sparsity
 from transformer_visualization import plot_heatmap
 from accelerate import Accelerator, find_executable_batch_size
+from functools import reduce
 
 # MODEL_NAME = "facebook/opt-iml-max-1.3b"
 # MODEL_NAME = "facebook/opt-13b"
-MODEL_NAME = "facebook/opt-350m"
-TOKENIZER_NAME = "facebook/opt-13b"
-# TOKENIZER_NAME = "decapoda-research/llama-7b-hf"
-# MODEL_NAME = "decapoda-research/llama-7b-hf"
-NUM_LAYERS = 24
+# MODEL_NAME = "facebook/opt-350m"
+# TOKENIZER_NAME = "facebook/opt-13b"
+TOKENIZER_NAME = "decapoda-research/llama-7b-hf"
+MODEL_NAME = "decapoda-research/llama-7b-hf"
+# MODEL_NAME = "tiiuae/falcon-7b-instruct"
+# TOKENIZER_NAME = "tiiuae/falcon-7b-instruct"
+NUM_LAYERS = 32
 OPT_CACHE = "/chronos_data/tji/.huggingface_cache/"
 
 # torch.cuda.set_device(torch.device("cuda:3"))
@@ -132,7 +135,7 @@ def load_and_prepare_boolq(tokenizer, num_examples=-1, split="validation", pad_o
 
     return tokenized_dataloader
 
-def load_and_prepare_stance_det(tokenizer, topic, num_examples=-1, split="test", pad_on_right=True, batch_size=1, max_seq_len=2048):
+def load_and_prepare_stance_det(tokenizer, topic, num_examples=-1, split="test", pad_on_right=True, batch_size=1, max_seq_len=2048, use_promptsource=False):
     dataset_path = "/chronos_data/tji/.huggingface_cache/datasets/twitter_stance/"
     test_dat = dataset_path + f"stance_{topic}_test_with_history_v2.csv"
     train_dat = dataset_path + f"stance_{topic}_train_with_history_v2.csv"
@@ -160,48 +163,108 @@ def load_and_prepare_stance_det(tokenizer, topic, num_examples=-1, split="test",
     def replace_tweet(inst):
         text_his = concat_tweets[inst["user_id"]]
         text_anchor = inst["message"]
+        text = '\n'.join(text_his + [text_anchor])
         st_str_list = {-1: "against", 1: "favor", 0:"none"}
         st_list = {-1: 1, 1: 2, 0: 0}
 
-        # return {"text": text, "label": st_list[inst["stance"]], "label_text": st_str_list[inst["stance"]]}
-
-        text = f"Task: Based on the tweets below, is the person's stance favor, none or against the topic {topic}? " + \
-                f"Answer \"favor\", \"none\" or \"against\" or against. \n" + \
-                f"Tweet: {text_his} \n" + \
-                f"{text_anchor} \n" + \
-                f"Answer: "
-        text = f"Tweet history: {text_his} \n" + \
-                f"Anchor Tweet: {text_anchor} \n" + \
-                f"Question: Based on the history of tweets from a person, are their stance pro or against {topic}? Answer pro or against. \n" + \
-                "Answer:\n\n"
-        text = f"Question: Does the author express any stance about {topic} in the following text? Answer favor, against or none. We say God bless America but we kill 4,000 babies a year. #SemST \n" + \
-                f"Answer: \nagainst \n" + \
-                f"Question: Does the author express any stance about {topic} in the following text? Answer favor, against or none. @user @user @user Yup. One of the MANY reasons I changed parties. #SemST \n" + \
-                f"Answer: \nnone \n" + \
-                f"Question: Does the author express any stance about {topic} in the following text? Answer favor, against or none. " + \
-                f"Progress for #AfricanAmericans check. Progress for #Gay people check. Progress for #Women. Waiting waiting waiting.... #SemST \n" + \
-                f"Answer: \nfavor \n" + \
-                f"Question: Does the author express any stance about {topic} in the following text? Answer favor, against or none. " + \
-                f"{' '.join(text_his)} " + f"{text_anchor} \n" + \
-                "Answer: \n"
-        return {"text": text, "target": topic, "ans": inst["stance"]}
+        if not use_promptsource:
+            # text = f"Task: Based on the tweets below, is the person's stance favor, none or against the topic {topic}? " + \
+            #         f"Answer \"favor\", \"none\" or \"against\". \n" + \
+            #         f"Tweet: {text_his} \n" + \
+            #         f"{text_anchor} \n" + \
+            #         f"Answer: "
+            # text = f"Tweet history: {text_his} \n" + \
+            #         f"Anchor Tweet: {text_anchor} \n" + \
+            #         f"Question: Based on the history of tweets from a person, are their stance pro or against {topic}? Answer pro or against. \n" + \
+            #         "Answer:\n\n"
+            text = f"Tweets: {text}\n" + \
+                    f"Question: In the tweets above, what is the author's stance on the {topic}, neutral, against or in favor?\n" + \
+                    "Answer:\n\n"
+            # text = f"Question: Does the author express any stance about {topic} in the following text? Answer favor, against or none. We say God bless America but we kill 4,000 babies a year. #SemST \n" + \
+            #         f"Answer: \nagainst \n" + \
+            #         f"Question: Does the author express any stance about {topic} in the following text? Answer favor, against or none. @user @user @user Yup. One of the MANY reasons I changed parties. #SemST \n" + \
+            #         f"Answer: \nnone \n" + \
+            #         f"Question: Does the author express any stance about {topic} in the following text? Answer favor, against or none. " + \
+            #         f"Progress for #AfricanAmericans check. Progress for #Gay people check. Progress for #Women. Waiting waiting waiting.... #SemST \n" + \
+            #         f"Answer: \nfavor \n" + \
+            #         f"Question: Does the author express any stance about {topic} in the following text? Answer favor, against or none. " + \
+            #         f"{' '.join(text_his)} " + f"{text_anchor} \n" + \
+            #         "Answer: \n"
+            return {"text": text, "ans": inst["stance"]}
 
     column_names = insts.column_names
     insts = insts.map(replace_tweet, remove_columns=column_names)
 
-    # # use promptsource:
-    # datTemplate = DatasetTemplates("tweet_eval/stance_abortion")
-    # # available templates: 
-    # # ['abortion', 'abortion_guess_passive', 'abortion_guess_passive_author', 'abortion_how_describe', 'abortion_option', 'abortion_predict_stance']
-    # prompt = datTemplate["abortion_predict_stance"]
-    # insts = insts.map(lambda example: {
-    #     "text": "Question: " + prompt.apply(example, truncate=False)[0] + " \nAnswer: "})
-    # column_names = insts.column_names
+    # use promptsource:
+    if use_promptsource:
+        datTemplate = DatasetTemplates("tweet_eval/stance_abortion")
+        # available templates: 
+        # ['abortion', 'abortion_guess_passive', 'abortion_guess_passive_author', 'abortion_how_describe', 'abortion_option', 'abortion_predict_stance']
+        prompt = datTemplate["abortion_guess_passive_author"]
+        insts = insts.map(lambda example: {
+            "text": "Question: " + prompt.apply(example, truncate=False)[0] + " \nAnswer: "})
+        column_names = insts.column_names
 
     tokenized_data = insts.map(
         lambda example: tokenizer(example["text"]), 
         batched=True,
-        remove_columns=["text", "target"],
+        remove_columns=["text"],
+        load_from_cache_file=True
+    )
+    tokenized_data.set_format("torch")
+
+    tokenized_data = tokenized_data.filter(lambda example: 1024 < example["input_ids"].size(0) < max_seq_len)
+    if num_examples > -1 and num_examples < len(tokenized_data):
+        selected_idx = random.sample(range(len(tokenized_data)), num_examples)
+        raw_data = raw_data.select(selected_idx)
+
+    tokenized_dataloader = DataLoader(
+        tokenized_data, collate_fn=default_data_collator, batch_size=batch_size, shuffle=True
+    )
+    random.seed = 1722163
+    torch.manual_seed = 1722163
+    torch.cuda.manual_seed = 1722163
+    torch.backends.cudnn.deterministic = True
+
+    return tokenized_dataloader
+
+def load_and_prepare_hotpotqa(tokenizer, num_examples=-1, split="test", batch_size=1, max_seq_len=2048, use_promptsource=False):
+    raw_data = load_dataset("hotpot_qa", "fullwiki", split=split)
+    insts = raw_data.filter(lambda example: len(example["context"]["sentences"]) > 0)
+
+    def prepare_context(inst):
+        text = inst["context"]["sentences"]
+        text = reduce(lambda x,y: x+y, text)
+        text = " ".join(text)
+        ques = inst["question"]
+
+        # context = f"Text: {text}\n" + \
+        #             f"Based on the text above, answer the question: {ques} \n" + \
+        #             f"Answer: \n\n"
+        context = f"Task: \nAnswer the question according to the given text. \n" + \
+                    f"Text: \n{text}\n" + \
+                    f"Question: \n{ques}\n" + \
+                    f"Answer: \n"
+
+        return {"text": context, "ans": [ord(c) for c in inst["answer"]]}
+
+    column_names = insts.column_names
+    insts = insts.map(prepare_context, remove_columns=column_names)
+
+    # # use promptsource:
+    # if use_promptsource:
+    #     datTemplate = DatasetTemplates("tweet_eval/stance_abortion")
+    #     # available templates: 
+    #     # ['abortion', 'abortion_guess_passive', 'abortion_guess_passive_author', 'abortion_how_describe', 'abortion_option', 'abortion_predict_stance']
+    #     prompt = datTemplate["abortion_guess_passive_author"]
+    #     insts = insts.map(lambda example: {
+    #         "text": "Question: " + prompt.apply(example, truncate=False)[0] + " \nAnswer: "})
+    #     column_names = insts.column_names
+
+    tokenized_data = insts.map(
+        lambda example: tokenizer(example["text"]), 
+        batched=True,
+        remove_columns=["text"],
         load_from_cache_file=True
     )
     tokenized_data.set_format("torch")
@@ -465,17 +528,16 @@ def infer_by_logits_stance_det(prompt_ans_dict: dict, device):
     #     torch.tensor([]).to(device), torch.tensor([]).to(device)
         
     out_strs = prompt_ans_dict.get("out_strs", None)
-    transition_probs = prompt_ans_dict.get("transition_probs", None)
     answers = prompt_ans_dict.get("answers", None)
     num_avaliable_ans = 0
 
-    for generated_str, probability, answer in zip(out_strs, transition_probs, answers):
-        ans_str = generated_str.split("Answer: \n")[-1].lower()
+    for generated_str, answer in zip(out_strs, answers):
+        ans_str = generated_str.split("Answer:")[-1].lower()
         ref_ans = torch.tensor([answer]).to(ref.device)
         
-        re_code = r"[_|\W]*(against|none|favor)[_|\W]*"
+        re_code = r"[_|\W]*(against|none|neutral|favor|pro)[_|\W]*"
         stripped_ans = "".join(re.findall(re_code, ans_str))
-        print(f"output: {generated_str} extracted: {stripped_ans}")
+        print(f"output: {ans_str} extracted: {stripped_ans}")
 
         tc_against = torch.tensor([-1])
         tc_none = torch.tensor([0])
@@ -485,16 +547,43 @@ def infer_by_logits_stance_det(prompt_ans_dict: dict, device):
         if stripped_ans in ["against"]:
             model_res = torch.cat((model_res, tc_against.to(model_res.device)))
             num_avaliable_ans += 1
-        elif stripped_ans in ["none"]:
+        elif stripped_ans in ["none", "neutral"]:
             model_res = torch.cat((model_res, tc_none.to(model_res.device)))
             num_avaliable_ans += 1
-        elif stripped_ans in ["favor"]:
+        elif stripped_ans in ["favor", "pro"]:
             model_res = torch.cat((model_res, tc_favor.to(model_res.device)))
             num_avaliable_ans += 1
         else:
             model_res = torch.cat((model_res, tc_not_included.to(model_res.device)))
 
         ref = torch.cat((ref, ref_ans))
+
+    return model_res, ref, torch.tensor([num_avaliable_ans]).to(device)
+
+def infer_directly_hotpot_qa(prompt_ans_dict: dict, device):
+
+    model_res, ref = \
+        torch.tensor([]).to(device), torch.tensor([]).to(device)
+    # model_res_avaliable_ans_only, ref_ans_only = \
+    #     torch.tensor([]).to(device), torch.tensor([]).to(device)
+        
+    out_strs = prompt_ans_dict.get("out_strs", None)
+    answers = prompt_ans_dict.get("answers", None).tolist()
+    num_avaliable_ans = 0
+
+    for generated_str, answer in zip(out_strs, answers):
+        ans_str = generated_str.split("Answer:")[-1].lower()
+        ref_ans = "".join([chr(i) for i in answer])
+        print(f"generated: {generated_str}")
+        print(f"output: {ans_str}, ref: {ref_ans}")
+
+        tc_correct = torch.tensor([0])
+        tc_incorret = torch.tensor([1])
+        
+        if ref_ans in ans_str:
+            model_res = torch.cat((model_res, tc_correct.to(model_res.device)))
+        else:
+            model_res = torch.cat((model_res, tc_incorret.to(model_res.device)))
 
     return model_res, ref, torch.tensor([num_avaliable_ans]).to(device)
 
@@ -579,15 +668,18 @@ def run_eval_with_constraints(
     '''
     Examine only yes or no answers
     '''
-    accelerator = Accelerator(fp16=True)
+    accelerator = Accelerator(mixed_precision="fp16")
 
     # Load the model.
     if load_path:
         print("loading local model ", load_path)
         if "llama" in MODEL_NAME:
             model = LlamaForCausalLM.from_pretrained(load_path)
-        else:
+        elif "opt" in MODEL_NAME:
             model = OPTForCausalLM.from_pretrained(load_path)
+        else:
+            model = AutoModelForCausalLM.from_pretrained(load_path)
+
         extract_param_names(load_path)
         # examine if weights have sparsity:
         wq_layer1_sparsity = get_mat_sparsity(model.model.layers[0].self_attn.q_proj.weight.data)
@@ -596,9 +688,12 @@ def run_eval_with_constraints(
         print("loading online model")
         if "llama" in MODEL_NAME:
             model = LlamaForCausalLM.from_pretrained(MODEL_NAME)
-        else:
+        elif "opt" in MODEL_NAME:
             model = OPTForCausalLM.from_pretrained(MODEL_NAME)
-
+        else:
+            model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, trust_remote_code = True)
+    
+    model = model.to(accelerator.device)
     model, test_data = accelerator.prepare(model, test_data)
 
     # Generate
@@ -628,8 +723,8 @@ def run_eval_with_constraints(
         gen_params = {
             "inputs": batch["input_ids"], 
             "attention_mask": batch["attention_mask"],
-            "max_new_tokens": 2,
-            "output_attentions": True,
+            "max_new_tokens": 8,
+            # "output_attentions": True,
             "output_scores": True,
             "return_dict_in_generate": True,
             "num_beams": num_beams,
@@ -649,42 +744,41 @@ def run_eval_with_constraints(
         generated_string = tokenizer.batch_decode(seq_ids, skip_special_tokens=True)
         out_strs = []
         for out_inst in ori_prompt:
-            out_strs.append(out_inst.split("Answer: \n")[-1])
+            out_strs.append(out_inst.split("Answer:\n")[-1])
 
-        print(out_strs)
-        all_attens = output.attentions[0]
+        # all_attens = output.attentions[0]
         
         # check attention
         # expected atten size: layer_size, num_beamsxbatch_sizexhead_size, len, len
-        attens = [i.to("cpu") for i in all_attens]
-        attens = torch.stack(attens)
-        print(attens.size())
-        if "llama" in MODEL_NAME:
-            layer_size, _, head_size, seq_len, _ = attens.size()
-            attens = attens.view(layer_size, head_size, 
-                                num_beams*batch_size, seq_len, seq_len)
-        elif "opt" in MODEL_NAME:
-            layer_size, head_size, seq_len, _ = attens.size()
-            head_size = head_size // (num_beams*batch_size)
-            attens = attens.view(layer_size, head_size, 
-                                num_beams*batch_size, seq_len, seq_len)
+        # attens = [i.to("cpu") for i in all_attens]
+        # attens = torch.stack(attens)
+        # print(attens.size())
+        # if "llama" in MODEL_NAME:
+        #     layer_size, _, head_size, seq_len, _ = attens.size()
+        #     attens = attens.view(layer_size, head_size, 
+        #                         num_beams*batch_size, seq_len, seq_len)
+        # elif "opt" in MODEL_NAME:
+        #     layer_size, head_size, seq_len, _ = attens.size()
+        #     head_size = head_size // (num_beams*batch_size)
+        #     attens = attens.view(layer_size, head_size, 
+        #                         num_beams*batch_size, seq_len, seq_len)
                         
-        attn_sparsities = torch.tensor([]).to(accelerator.device)
-        attn_sparsities_layer = torch.tensor([]).to(accelerator.device)
-        for i in range(num_beams*batch_size):
-            actual_input_len = torch.count_nonzero(batch["attention_mask"][i//num_beams], dim=-1).item()
-            curr_attens = torch.squeeze(attens[:,:,i,-actual_input_len:,-actual_input_len:])
-            # model_name = MODEL_NAME.split("/")[1]
-            # attn_path = f"{ATTN_SAMPLE_PATH}/{model_name}-attsample/attn_s{step}b{i}.pt"
-            # print(f"saving attn to {attn_path}...")
-            # torch.save(curr_attens, attn_path)
+        # attn_sparsities = torch.tensor([]).to(accelerator.device)
+        # attn_sparsities_layer = torch.tensor([]).to(accelerator.device)
+        # for i in range(num_beams*batch_size):
+        #     actual_input_len = torch.count_nonzero(batch["attention_mask"][i//num_beams], dim=-1).item()
+        #     curr_attens = torch.squeeze(attens[:,:,i,-actual_input_len:,-actual_input_len:])
+        #     # model_name = MODEL_NAME.split("/")[1]
+        #     # attn_path = f"{ATTN_SAMPLE_PATH}/{model_name}-attsample/attn_s{step}b{i}.pt"
+        #     # print(f"saving attn to {attn_path}...")
+        #     # torch.save(curr_attens, attn_path)
 
-            curr_sparsity = torch.tensor([get_mat_sparsity(curr_attens, causal_mask=True)])
-            attn_sparsities = \
-                torch.cat((attn_sparsities, curr_sparsity.to(accelerator.device)), dim=-1)
-            curr_spar_layer = get_mat_sparsity(curr_attens, causal_mask=True, per_layer=True)
-            attn_sparsities_layer = \
-                torch.cat((attn_sparsities_layer, curr_spar_layer.to(accelerator.device)), dim=-1)
+        #     curr_sparsity = torch.tensor([get_mat_sparsity(curr_attens, causal_mask=True)])
+        #     attn_sparsities = \
+        #         torch.cat((attn_sparsities, curr_sparsity.to(accelerator.device)), dim=-1)
+        #     curr_spar_layer = get_mat_sparsity(curr_attens, causal_mask=True, per_layer=True)
+        #     attn_sparsities_layer = \
+        #         torch.cat((attn_sparsities_layer, curr_spar_layer.to(accelerator.device)), dim=-1)
         
         # batch_idx, layer_idx = 0, 10
         # ori_prompt = tokenizer.decode(seq_ids[batch_idx][-actual_input_len:])
@@ -723,8 +817,8 @@ def run_eval_with_constraints(
 
         model_res_all.append(accelerator.gather(model_res).cpu().numpy())
         ref_all.append(accelerator.gather(ref).cpu().numpy())
-        attn_sparsities_all.append(accelerator.gather(attn_sparsities).cpu().numpy())
-        attn_sparsities_layer_all.append(accelerator.gather(attn_sparsities_layer).cpu().numpy())
+        # attn_sparsities_all.append(accelerator.gather(attn_sparsities).cpu().numpy())
+        # attn_sparsities_layer_all.append(accelerator.gather(attn_sparsities_layer).cpu().numpy())
         num_valid_ans_all.append(accelerator.gather(num_valid_ans).cpu().numpy())
 
     print("gathering finished")
@@ -735,9 +829,9 @@ def run_eval_with_constraints(
 
     model_res_all = np.concatenate(model_res_all)
     ref_all = np.concatenate(ref_all)
-    attn_sparsities_all = np.concatenate(attn_sparsities_all)
-    attn_sparsities_layer_all = np.concatenate(attn_sparsities_layer_all)
-    attn_sparsities_layer_all = attn_sparsities_layer_all.reshape(NUM_LAYERS, -1)
+    # attn_sparsities_all = np.concatenate(attn_sparsities_all)
+    # attn_sparsities_layer_all = np.concatenate(attn_sparsities_layer_all)
+    # attn_sparsities_layer_all = attn_sparsities_layer_all.reshape(NUM_LAYERS, -1)
     num_valid_ans_all = np.concatenate(num_valid_ans_all)
 
     if accelerator.is_main_process:
@@ -746,10 +840,10 @@ def run_eval_with_constraints(
         avg_sparsity = np.mean(attn_sparsities_all)
         logger.info(f"avg sparsity: {avg_sparsity}")
 
-        print("layer sparsities shape: ", attn_sparsities_layer_all.shape)
-        avg_layer_spars = np.mean(attn_sparsities_layer_all, axis=-1)
-        for l in range(NUM_LAYERS):
-            logger.info(f"{avg_layer_spars[l]}")
+        # print("layer sparsities shape: ", attn_sparsities_layer_all.shape)
+        # avg_layer_spars = np.mean(attn_sparsities_layer_all, axis=-1)
+        # for l in range(NUM_LAYERS):
+        #     logger.info(f"{avg_layer_spars[l]}")
 
         res_em = metric_all_acc.compute(predictions=model_res_all, references=ref_all)
         logger.info(f"acc for all: {res_em}")
@@ -936,8 +1030,11 @@ def main():
     num_examples = 100    # Load the tokenizer. All OPT models with different sizes share the same tokenizer
     if "llama" in MODEL_NAME:
         tokenizer = LlamaTokenizer.from_pretrained(TOKENIZER_NAME)
+    elif "opt" in MODEL_NAME:
+        tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
     else:
         tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
+
     tokenizer.add_bos_token = False
 
     # finetuning
@@ -945,7 +1042,8 @@ def main():
     # finetune(train_data, None, tokenizer)
 
     # eval
-    test_data = load_and_prepare_stance_det(tokenizer, "abortion",  batch_size=1, num_examples=num_examples)
+    test_data = load_and_prepare_hotpotqa(tokenizer, split="validation", batch_size=1, num_examples=num_examples)
+    # test_data = load_and_prepare_stance_det(tokenizer, "abortion",  batch_size=1, num_examples=num_examples)
     # test_data = load_and_prepare_boolq(tokenizer, batch_size=1, pad_on_right=False, num_examples=num_examples)
     # test_data = load_and_prepare_rte(tokenizer, batch_size=1, pad_on_right=False, num_examples=num_examples, split="validation")
     # test_data = load_and_prepare_winogrande(tokenizer, batch_size=1, pad_on_right=True, num_examples=num_examples, split="validation")
@@ -955,7 +1053,7 @@ def main():
     run_eval_with_constraints(
         test_data, 
         tokenizer, 
-        eval_method=infer_by_logits_stance_det, 
+        eval_method=infer_directly_hotpot_qa, 
         yes_ids=yes_ids, no_ids=no_ids, 
         is_forcing_words=False,
         # load_path = "/chronos_data/tji/.huggingface_cache/transformers/llama-7b-hf-sparsegpt-bfp",
