@@ -11,6 +11,7 @@ from typing import List, Union
 from math import ceil, floor, sqrt
 import random
 import multiprocessing
+from functools import reduce
 from analyze_tcblock_vs_matsize import closest_factors_to_target
 
 TCCORE_COL_SIZE = 3
@@ -44,6 +45,9 @@ def factor_int(n: int):
 # hw_array_shape = (22, 12)
 
 def get_mat_sparsity(dat):
+    '''
+    compute the sparsity of a mat
+    '''
     with torch.no_grad():
         if type(dat) == torch.Tensor:
             return (1. - torch.count_nonzero(dat) / torch.numel(dat))
@@ -51,6 +55,9 @@ def get_mat_sparsity(dat):
             return (1. - np.count_nonzero(dat) / dat.size)
 
 def get_mat_rspars_diversity(dat):
+    '''
+    compute the diversity of the row sparsity
+    '''
     with torch.no_grad():
         if type(dat) == torch.Tensor:
             dat_nzero = torch.count_nonzero(dat, dim=-1)
@@ -63,6 +70,10 @@ def get_mat_rspars_diversity(dat):
         return div
 
 def prepare_att_dat(data_path, seq_len_path, seq_len_range, sparsity=0.0, samples=-1):
+    '''
+    load attnetion from pt file. if seq len path is provided, 
+    it can also filters the attention within a range
+    '''
     bfp_att_probes = []
     if seq_len_path is not None and seq_len_range is not None:
         seq_len = torch.load(seq_len_path).cpu().detach().numpy()
@@ -82,6 +93,9 @@ def prepare_att_dat(data_path, seq_len_path, seq_len_range, sparsity=0.0, sample
     return bfp_att_probes
 
 def prepare_wei_dat(data_path):
+    '''
+    load weights from data path
+    '''
     w = torch.load(data_path).cpu().detach().numpy()
     print("load weight with shape ", w.shape)
     return w
@@ -288,6 +302,10 @@ def compute_stacked_matmul_performance(mats_lists, chain_len, hw_array_shape, la
 
 
 def find_min_lat_mats(mats_list, chain_len):
+    '''
+    given a list of the mats and the chain length, sweep across the 
+    mats and return the best hardware shape for all the mats in the list
+    '''
     mats_list_wrapped = [mats_list]
     
     def create_hw_array_shapes(chain_len, num_tcores = 3960.0):
@@ -319,6 +337,25 @@ def plot_perf_sparsity(data_path, output_path, chain_len_list, hw_array_shape_li
                             seq_len_path = None, seq_len_range = None, \
                             attached_to_fig_name="", mixed_short_chain_len = 0.0, short_to_long_ratio = 0.0, \
                             plot_latency_by_insts = False, blocked_pruning=False):
+    """plot latency speed up changing as sparsity changes.
+
+    Args:
+        data_path (_type_): data path to the attention
+        output_path (_type_): path to the figure
+        chain_len_list (_type_): list of the chain length
+        hw_array_shape_list (_type_): list of the hardware type
+        freq_list (_type_): list of the frequencies. (combined with chain len and 
+        hw array shape, each group of the combination will form a type of hardware config
+        and will form a legend)
+        sort_row_sparsity (_type_): whether to sort the rows by sparsity
+        sparse_block_size (_type_): minimum block size to skip the zeros. e.g., 1 means zeros
+        inside each 3x1 block won't be skipped.
+        seq_len_path (_type_, optional): provide a seq len path to apply seq len filtering. Deafults to None 
+        seq_len_range (_type_, optional): provide a seq len range to select . Defaults to None.
+        mixed_short_chain_len (float, optional): short chain len for heterogeneous arch. Defaults to 0.0.
+        short_to_long_ratio (float, optional): #short chain rows/#long chain rows. Defaults to 0.0.
+        blocked_pruning (bool, optional): whether to apply block pruning. Defaults to False.
+    """
     res_df_list, sparselat_list, ideallat_list, baselat_list = [], [], [], []
     sorted_fig_path = "_sorted" if sort_row_sparsity else "_unsorted"
 
@@ -382,6 +419,13 @@ def plot_perf_sparsity(data_path, output_path, chain_len_list, hw_array_shape_li
     return sparselat_list, ideallat_list, baselat_list
 
 def short_chain_len_profiling(data_path_list, seq_len_list, seq_len_range):
+    """compute quantiles of the row density to help determine the short chain length
+
+    Args:
+        data_path_list (str): data path of the attention
+        seq_len_list (list): seq len file for sequence length filtering
+        seq_len_range (tuple): seq len range for seq len filtering
+    """    
     res_dat = []
     for data_path, seq_len_path in zip(data_path_list, seq_len_list):
         bfp_data = prepare_att_dat(data_path, seq_len_path, seq_len_range)
@@ -401,6 +445,9 @@ def short_chain_len_profiling(data_path_list, seq_len_list, seq_len_range):
     return ceil(np.quantile(res_dat, 0.75) / float(TCCORE_SIZE))
 
 def plot_perf_sparsity_simple_arglist (data_path, seq_len_path, freq=500, s2l_ratio=0.3, fixed_chain_len = True, short_chain_len=2):
+    """
+    plot_perf_sparsity wrapper for multiprocessing 
+    """    
     if fixed_chain_len:
         chain_len_list = [short_chain_len, 14, 32]
         hw_array_shape_list = [factor_int(floor(3960.0/(i+2.0))) for i in chain_len_list]
@@ -427,6 +474,8 @@ def plot_perf_sparsity_simple_arglist (data_path, seq_len_path, freq=500, s2l_ra
                                 short_to_long_ratio=s2l_ratio, blocked_pruning=False)
 
 def compute_selfatt_layer_perf(data_path, seq_len, chain_len, hw_array_shape, sort_row_sparsity, layer_idx=0):
+    """(deprecated) compute the latency of the entire self attention layer
+    """    
     bfp_att_path = data_path + "act/bfp_attprobs/"
     weights_path = data_path + "weights/"
     att = torch.load(bfp_att_path + f"{layer_idx}-0.pt").cpu().detach().numpy()
@@ -494,6 +543,8 @@ def compute_selfatt_layer_perf(data_path, seq_len, chain_len, hw_array_shape, so
     return res_df
 
 def plot_selfatt_sparsity(data_path, output_path, chain_len_list, hw_array_shape_list, layer_idx, sort_row_sparsity=False):
+    """latency vs sparsity of the entire self attention layer
+    """    
     res_df_list = []
     sorted_fig_path = "_sorted" if sort_row_sparsity else "_unsorted"
     
@@ -528,6 +579,8 @@ def plot_selfatt_sparsity(data_path, output_path, chain_len_list, hw_array_shape
     # plt.clf()
 
 def single_case_analyzing(mat, out_size: tuple, hw_array_shape = None, chain_len = None, fig_name_post = ""):
+    """draw heatmap and compute latency for different pruning methods for a single matrix
+    """    
 
     def create_heatmap(dat, fig_name, latency):
         fig, ax = plt.subplots()
@@ -661,7 +714,7 @@ def single_case_analyzing(mat, out_size: tuple, hw_array_shape = None, chain_len
 
 def plot_lat_vs_sparsity(file_path, seq_len_path, seq_len_range):
     '''
-    illustrate latency under different sparsity
+    illustrate latency under different sparsity for a particular mat
     '''
     bfp_att_probes = prepare_att_dat(file_path, seq_len_path, seq_len_range)
     res = {"base": [], "column": [], "blocked": []}
@@ -689,6 +742,8 @@ def plot_lat_vs_sparsity(file_path, seq_len_path, seq_len_range):
 
 
 def analyze_sparsity_blocking(file_path, seq_len_path):
+    """compute and compare the sparsity of blocking/original sparsity
+    """     
     bfp_att_probes = prepare_att_dat(file_path, seq_len_path, (0, 1024))
 
     all_ideal_spar, all_blocked_spar = [], []
@@ -837,6 +892,29 @@ def print_compress_ratio():
     sparsities = np.arange(0.0, 1.0, 0.1)
     rat = [compute_csr_comp_ratio(mat_shape, sp, block=True) for sp in sparsities]
     print(rat)
+
+def distance_of_dense_vals_per_row(mat: np.array, row_size: tuple[int, int]):
+    """compute the distance that can cover the dense values best
+    """    
+    assert row_size[0] >= 3, "blocking size must leq to 3 for the 3 hardware columns"
+    dense_mask = mat > 0.0
+    zeros_padded = dense_mask.shape[0] % 3
+    if zeros_padded > 0:
+        dense_mask = np.pad(dense_mask, (0, 3 - zeros_padded), "constant", constant_values=0)
+    # then block them into 3xtc core size and select the max length to compute delay
+    dense_mask = \
+        np.split(dense_mask, np.arange(3, mat.shape[0], 3), axis=0)
+    merged_dense_mask = []
+    for m in dense_mask:
+        merged_dense_mask.append(
+            reduce(lambda x,y: np.logical_or(x, y), m.tolist())
+        )
+    merged_dense_mask = np.stack(merged_dense_mask)
+    first_dense_col_idx = np.argmax(merged_dense_mask, axis=-1)
+    neighboring_dist = np.cumsum(merged_dense_mask, axis=-1)
+    last_dense_col_idx = np.argmax(neighboring_dist, axis=-1)
+    dist = last_dense_col_idx - first_dense_col_idx
+    return dist
 
 def main():
     data_path = "/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/"
