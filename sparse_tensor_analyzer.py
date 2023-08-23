@@ -4,6 +4,7 @@ import numpy as np
 import hw_modeling
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.cbook as cbook
 import skimage.measure
 from tqdm import tqdm
 from scipy.spatial.distance import hamming
@@ -104,19 +105,25 @@ def compute_matmul_performance(data, chain_len, out_w, hw_array_shape, \
                                 sort_row_sparsity, using_single_column, sparse_block_size, freq=500, \
                                 sparsity=0.0, seq_len_path=None, seq_len_range=None, mixed_chain_length=None, \
                                 short_to_long_ratio=0.0, blocked_pruning=False, 
-                                perf_eva_list = ["base", "ideal", "sparse"]):
+                                perf_eva_list = ["base", "ideal", "ideal sparse", "sparse baseline"]):
     '''compute latency, throughput and sparsity of a given sparse/dense matrix operation'''
     if type(data) is str:
         bfp_att_probes = prepare_att_dat(data, seq_len_path, seq_len_range, sparsity)
     else:
         bfp_att_probes = data
 
-    res = {"latency":[] ,"sparsity": [], "s2l ratio": [], "tp": []}
+    pdtable_res = {"latency":[] ,"sparsity": [], "s2l ratio": [], "tp": []}
+    ret = {k: None for k in perf_eva_list}
 
-    total_sparse_lat, total_base_lat, total_min_sparse_lat = 0, 0, 0
-    total_base_util, total_sparse_util = 0.0, 0.0
+    total_sparse_lat, total_base_lat, total_min_sparse_lat, total_sparse_baseline_lat= 0., 0., 0., 0.
+    total_base_util, total_sparse_util, total_min_sparse_util, total_sparse_baseline_util = [], [], [], []
+    total_base_flops, total_sparse_flops, total_min_sparse_flops, total_sparse_baseline_flops = [], [], [], []
+
+    total_ops = 0
     num_insts = len(bfp_att_probes)
     for exps in bfp_att_probes:
+        # compute total ops for flops computation
+        total_ops += exps.shape[0] * exps.shape[1] * 2 * out_w
         # use a dense mat to calculate dens mat base lat
         if "base" in perf_eva_list:
             fake_dense_data = np.ones(exps.shape)
@@ -128,9 +135,9 @@ def compute_matmul_performance(data, chain_len, out_w, hw_array_shape, \
                                                         sort_row_sparsity, False, \
                                                         using_single_column=False, sparse_block_size=sparse_block_size)
             total_base_lat += base_lat
-            total_base_util += base_util
+            total_base_util += [base_util]
         else:
-            base_flops, base_lat = None, None
+            base_flops, base_lat = -1, -1
 
         if "ideal" in perf_eva_list:
             # evaluate ideal sparse model ignoring the fragmentation
@@ -141,10 +148,11 @@ def compute_matmul_performance(data, chain_len, out_w, hw_array_shape, \
             min_sparse_flops, min_sparse_lat, min_sparse_util = sparse_model.tensor_fpga21_mat_sparse_flops(exps, \
                                                         sort_row_sparsity, True, False, sparse_block_size, True)
             total_min_sparse_lat += min_sparse_lat
+            total_min_sparse_util += [min_sparse_util]
         else:
-            min_sparse_flops, min_sparse_lat = None, None
+            min_sparse_flops, min_sparse_lat = -1, -1
 
-        if "sparse" in perf_eva_list:
+        if "ideal sparse" in perf_eva_list:
             # evaluate sparse model
             if mixed_chain_length is None:            
                 sparse_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
@@ -165,28 +173,68 @@ def compute_matmul_performance(data, chain_len, out_w, hw_array_shape, \
                                                             using_single_column, sparse_block_size, False, short_to_long_ratio, \
                                                             blocked_pruning=blocked_pruning)
             total_sparse_lat += sparse_lat
-            total_sparse_util += sparse_util
+            total_sparse_util += [sparse_util]
         else:
-            sparse_flops, sparse_lat = None, None
+            sparse_flops, sparse_lat = -1, -1
+
+        if "sparse baseline" in perf_eva_list:
+            sparse_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
+                            exp_dat=exps, freq=freq, num_tcs=3960, tcc_array_shape=hw_array_shape, \
+                            tcc_chainlen=chain_len)
+            sparse_model.set_tccore_size(TCCORE_SIZE)
+            sparse_baseline_flops, sparse_baseline_lat, sparse_baseline_util = \
+                sparse_model.tensor_baseline_sparse_flops(exps, sparse_block_size=sparse_block_size, return_time_lat=True, is_partioning_bsel=True)
+            total_sparse_baseline_lat += sparse_baseline_lat
+            total_sparse_baseline_util += [sparse_baseline_util]
+        else:
+            sparse_baseline_flops, sparse_baseline_lat = -1, -1
                                                     
         curr_sparsity = 1. - np.count_nonzero(exps) / exps.size
-        res["sparsity"].append(curr_sparsity)
-        res["tp"].append(sparse_flops)
-        res["latency"].append(sparse_lat)    
-        res["s2l ratio"].append(curr_sparsity * 1000 / sparse_lat)
+        pdtable_res["sparsity"].append(curr_sparsity)
+        pdtable_res["tp"].append(sparse_flops)
+        pdtable_res["latency"].append(sparse_lat)    
+        pdtable_res["s2l ratio"].append(curr_sparsity * 1000 / sparse_lat)
                 
-    print(f"base util mean: {np.mean(total_base_util)}, sparse_util_mean: {np.mean(total_sparse_util)}")
-    res_df = pd.DataFrame(res, columns=res.keys())
+    res_df = pd.DataFrame(pdtable_res, columns=pdtable_res.keys())
     res_df.sort_values(by=["sparsity"], inplace=True)
-    return res_df, total_sparse_lat, total_min_sparse_lat, total_base_lat
+    
+    # collect return vals:
+    if "base" in perf_eva_list:
+        ret["base"] = (total_base_lat, total_ops / total_base_lat / 1e12, total_base_util)
+    if "ideal" in perf_eva_list:
+        ret["ideal"] = (total_min_sparse_lat, total_ops / total_min_sparse_lat / 1e12, total_min_sparse_util)
+    if "ideal sparse" in perf_eva_list:
+        ret["ideal sparse"] = (total_sparse_lat, total_ops / total_sparse_lat / 1e12 , total_sparse_util)
+    if "sparse baseline" in perf_eva_list:
+        ret["sparse baseline"] = (total_sparse_baseline_lat, total_ops / total_sparse_baseline_lat / 1e12, total_sparse_baseline_util)
+    
+    return res_df, ret
 
-def compute_stacked_matmul_performance(mats_lists, chain_len, hw_array_shape, layer_idx=0, plot_figure=False):
+def compute_stacked_matmul_performance(
+        mats_lists, 
+        chain_len, 
+        hw_array_shape, 
+        layer_idx=0, 
+        lat_compute_type=["sparse"], 
+        plot_figure=False):
     '''compute and plot performance of multiple mats in the transformers'''
+
     mat_labels = [k["label"] for k in list(mats_lists[0].values())[0]]
     mat_names = list(mats_lists[0].keys())
 
-    def compute_single_inst(mats_list, chain_len, hw_array_shape, layer_idx):
-        perf_list = {i: {k: 0. for k in mat_labels} for i in mat_names}
+    def compute_single_inst(mats_list: list, 
+                            chain_len: int, 
+                            hw_array_shape: tuple, 
+                            layer_idx: int, 
+                            compute_type: list[str]):
+        '''
+        compute latency of single list
+        '''
+        accepted_ctype = ["base", "ideal", "ideal sparse", "sparse baseline"]
+        is_ctype_correct = all(t in accepted_ctype for t in compute_type)
+        assert is_ctype_correct, "Incorrect compute type!"
+
+        perf_list = {i: {k: {t: (0.0, []) for t in compute_type} for k in mat_labels} for i in mat_names}
         print("init perf list: ", perf_list)
 
         for model_name in mat_names:
@@ -226,7 +274,7 @@ def compute_stacked_matmul_performance(mats_lists, chain_len, hw_array_shape, la
                 print(f"mat name: {model_name} {m['label']}, repeat {m['repeat']} times, loading: {is_loading_from_file}")
                 print(f"mat shape: {mat_data.shape}")
 
-                _, total_sparse_lat, _, total_base_lat = \
+                _, res_table = \
                     compute_matmul_performance(mat_data, 
                                             chain_len, 
                                             m["size"][-1], 
@@ -238,24 +286,34 @@ def compute_stacked_matmul_performance(mats_lists, chain_len, hw_array_shape, la
                                             seq_len_path=None, seq_len_range=None, 
                                             mixed_chain_length=None, short_to_long_ratio=0.0, 
                                             blocked_pruning=False, 
-                                            perf_eva_list = ["sparse"])
-                perf_list[model_name][m["label"]] += total_sparse_lat * m["repeat"]
+                                            perf_eva_list = compute_type)
+                for t in compute_type:
+                    #TODO: why accumulating along compute type?
+                    perf_list[model_name][m["label"]][t] = \
+                        (res_table[t][0] * m["repeat"], res_table[t][1])
 
         return perf_list
      
     all_inst_perf_list = []
     
     for mats_list in tqdm(mats_lists):
-        curr_perf_list = compute_single_inst(mats_list, chain_len, hw_array_shape, layer_idx)
+        curr_perf_list = compute_single_inst(mats_list, chain_len, hw_array_shape, layer_idx, lat_compute_type)
         all_inst_perf_list.append(curr_perf_list)
 
     # perf_list structure: [{"model name" : {"mat op name": lat}}]
     # compute average lat:
-    avg_perf_list = {i: {k: 0. for k in mat_labels} for i in mat_names}
+    avg_perf_list = {i: {k: {t: (0.0, 0.0) for t in lat_compute_type} for k in mat_labels} for i in mat_names}
     for n in mat_names:
         for l in mat_labels:
-            avg_perf_list[n][l] = np.mean([i[n][l] for i in all_inst_perf_list])
+            for t in lat_compute_type:
+                avg_perf_list[n][l][t] = \
+                        (np.mean([i[n][l][t][0] for i in all_inst_perf_list]), \
+                        np.mean([i[n][l][t][1] for i in all_inst_perf_list]))
 
+    # temporarily store the results to a file
+    import json
+    with open(f"res_fig/new_baseline/row_part/src_data_layer_{layer_idx}.json", "w") as fp:
+        json.dump(avg_perf_list, fp)
 
     if plot_figure:
         fig, ax = plt.subplots(1, 1, figsize=(6, 4))
@@ -264,7 +322,7 @@ def compute_stacked_matmul_performance(mats_lists, chain_len, hw_array_shape, la
         matplotlib.rcParams.update({'ytick.labelsize': fsize})
         matplotlib.rcParams['lines.markersize'] = 3
         
-        bottom_vals = [0.0] * len(mat_names)
+        bottom_vals = [[0.0] * len(lat_compute_type)] * len(mat_names)
         color_table = {"q proj": "#fbbc04", 
                        "k proj": "#fbbc04",
                        "v proj": "#fbbc04",
@@ -272,31 +330,44 @@ def compute_stacked_matmul_performance(mats_lists, chain_len, hw_array_shape, la
                        "attxv": "#4285f4",
                        "att": "#ea4335",
                        }
-        for idx_l, l in enumerate(mat_labels):
-            curr_mat_lats = [avg_perf_list[n][l] for n in mat_names]
-            ax.bar(mat_names, curr_mat_lats, bottom=bottom_vals, 
-                    width=0.2, align="center", color=color_table[l], label=l)
-            for n in range(len(mat_names)):
-                bottom_vals[n] += curr_mat_lats[n]
+        
+        x_label = np.arange(len(mat_names))
+        for l in mat_labels:
+            is_even_compute_types = (len(lat_compute_type) % 2 == 0)
+            for idx_t, t in enumerate(lat_compute_type):
+                curr_type_mat_lat = [avg_perf_list[n][l][t][0] for n in mat_names]
+                curr_type_mat_flops = [avg_perf_list[n][l][t][1] for n in mat_names]
+                # curr_type_bottom_vals = [bottom_vals[t] for n in mat_names]
+                x_label_offset = (idx_t + 1 - ceil(len(lat_compute_type) / 2.)) * 0.1
+                if is_even_compute_types:
+                    x_label_offset -= 0.05
+                ax.bar(x_label + x_label_offset, curr_type_mat_lat, 
+                        bottom=[bottom_vals[n][idx_t] for n in range(len(mat_names))], 
+                        width=0.1, color=color_table[l], 
+                        label=l, alpha=1-idx_t*0.3, linewidth=1)
+                for n in range(len(mat_names)):
+                    bottom_vals[n][idx_t] += curr_type_mat_lat[n]
 
         # ax2 = ax.twinx()
         # ax2.bar(mat_names, [i[1] for i in dyna_core_perf_list.values()], 
         #         width=0.2, align="edge", color="C1")
         
         ax.set_ylabel('latency/sec')
-        ax.set_xlim(xmin=-0.4)
+        # ax.set_xlim(xmin=-0.4)
         # ax2.set_ylabel('latency/s')
         # ax[0].set_xlim(xmax=2*1e10)
         ax.set_ylim(ymin=0)
         # ax2.set_ylim(ymin=0)
         # ax2.set_ylim(ymax=0.012)
         # ax[0].set_ylim(ymax=100)
+        ax.set_xticks(x_label)
+        ax.set_xticklabels(mat_names)
         ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
         ax.set_xlabel('model')
         # ax.legend()
         fig.tight_layout()
-        fig.savefig(f"res_fig/opt1_3b_attnonly_latency_comparison_widehw_l{layer_idx}.pdf")
-        plt.cla()
+        fig.savefig(f"res_fig/new_baseline/new_baseline_llama7b_l{layer_idx}.pdf")
+        plt.clf()
 
     return avg_perf_list
 
@@ -893,28 +964,80 @@ def print_compress_ratio():
     rat = [compute_csr_comp_ratio(mat_shape, sp, block=True) for sp in sparsities]
     print(rat)
 
-def distance_of_dense_vals_per_row(mat: np.array, row_size: tuple[int, int]):
+def distance_of_dense_vals_per_row(mat: np.array, row_size: int, num_anchor_cols = 0):
     """compute the distance that can cover the dense values best
     """    
-    assert row_size[0] >= 3, "blocking size must leq to 3 for the 3 hardware columns"
+    assert row_size >= 0, "blocking size must leq to 3 for the 3 hardware columns"
     dense_mask = mat > 0.0
-    zeros_padded = dense_mask.shape[0] % 3
-    if zeros_padded > 0:
-        dense_mask = np.pad(dense_mask, (0, 3 - zeros_padded), "constant", constant_values=0)
-    # then block them into 3xtc core size and select the max length to compute delay
-    dense_mask = \
-        np.split(dense_mask, np.arange(3, mat.shape[0], 3), axis=0)
-    merged_dense_mask = []
-    for m in dense_mask:
-        merged_dense_mask.append(
-            reduce(lambda x,y: np.logical_or(x, y), m.tolist())
-        )
-    merged_dense_mask = np.stack(merged_dense_mask)
+    per_block_sparsity = None
+
+    if row_size > 1:
+        zeros_padded = dense_mask.shape[0] % row_size
+        if zeros_padded > 0:
+            dense_mask = np.pad(dense_mask, (0, row_size - zeros_padded), "constant", constant_values=0)
+        # if anchor cols > 0, exclude these anchor cols
+        if num_anchor_cols > 0:
+            dense_mask = dense_mask[num_anchor_cols:, :]
+        # then block them into 3xtc core size and select the max length to compute delay
+        dense_mask = \
+            np.split(dense_mask, np.arange(row_size, dense_mask.shape[0], row_size), axis=0)
+        merged_dense_mask = []
+        for m in dense_mask:
+            merged_dense_mask.append(
+                reduce(lambda x,y: np.logical_or(x, y), m.tolist())
+            )
+        merged_dense_mask = np.stack(merged_dense_mask)
+        per_block_sparsity = [get_mat_sparsity(m) for m in dense_mask]
+    else:
+        merged_dense_mask = dense_mask
+        per_block_sparsity = 1. - float(np.count_nonzero(merged_dense_mask, axis=-1)) / merged_dense_mask.shape[-1]
+
     first_dense_col_idx = np.argmax(merged_dense_mask, axis=-1)
     neighboring_dist = np.cumsum(merged_dense_mask, axis=-1)
     last_dense_col_idx = np.argmax(neighboring_dist, axis=-1)
     dist = last_dense_col_idx - first_dense_col_idx
-    return dist
+    return dist, per_block_sparsity
+
+def dense_val_dist_histogram(inst_paths: list[str], row_size: int, num_anchor_cols = 0):
+    dense_distances = []
+    row_sparsities = []
+    max_blocked_len = -1
+    for i in inst_paths:
+        attn = torch.load(i).numpy()
+        attn = attn.reshape(-1, attn.shape[-1], attn.shape[-1])
+        print(f"inst mat size: {attn.shape}")
+        distances = [distance_of_dense_vals_per_row(m, row_size, num_anchor_cols) for m in attn]
+        curr_block_len = distances[0][0].shape[-1]
+        print(f"dist size: {curr_block_len}")
+        dense_distances += [d[0] for d in distances]
+        row_sparsities += [d[1] for d in distances]
+        if curr_block_len > max_blocked_len:
+            max_blocked_len = curr_block_len
+
+    dists_stat = []
+    for col_idx in range(max_blocked_len):
+        curr_col_dist = []
+        for d in dense_distances:
+            try:
+                curr_col_dist.append(d[col_idx])
+            except IndexError: 
+                pass
+        
+        print(f"logged {len(curr_col_dist)}/{max_blocked_len} data for col {col_idx}")
+        dists_stat += cbook.boxplot_stats(curr_col_dist, whis=1.5)
+
+    fig, ax = plt.subplots()
+    ax.bxp(dists_stat, showfliers=False)
+    ax.set_xlabel("row block index")
+    ax.set_ylabel("attention span")
+    plt.ylim(ymin=0, ymax=450)
+    # plt.ylim(ymin=0, ymax=max_blocked_len*row_size)
+    fig.savefig("./res_fig/dense_dist/anchor_cols_40.png")
+    plt.clf()
+
+    print(cbook.boxplot_stats(np.concatenate(row_sparsities), whis=1.5))
+    
+    return dists_stat
 
 def main():
     data_path = "/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/"
@@ -923,9 +1046,15 @@ def main():
 
     # Evaulating sparse 
     # construct multiple instances of the llama inference
-    layer_idx = 0
-    insts_idx = list(range(1))
-    mats_list = []
+    layer_ids = np.arange(0, num_layers, 1)
+    insts_idx = list(range(100))
+
+    # explore the distance of the dense values
+    # attn_path_list = \
+    #     [f"/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/llama-7b-hf-attsample/attn_s{i}b0.pt" 
+    #      for i in insts_idx]
+    # dense_val_dist_histogram(attn_path_list, 30, 40)
+
 
     # seq_len = 8192
     # dmodel = 2048
@@ -941,88 +1070,98 @@ def main():
     # res = find_min_lat_mats(mats_opt, 14)
     # print(f"best res: {res}")
     # exit()
+    for layer_idx in layer_ids:
+        mats_list = []
+        for i in insts_idx:
+            param_path_7b = "/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/llama-7b-hf-sparsegpt-bfp12/"
+            attn_path_7b = f"/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/llama-7b-hf-attsample/attn_s{i}b0.pt"
+            attn_path_opt350m = f"/chronos_data/tji/opt_350m_sparse_attn/attn_s{i}b0.pt"
+            #figure out actual seq len
+            attn = torch.load(attn_path_7b)
+            seq_len = attn.size()[-1]
 
-    for i in insts_idx:
-        param_path_7b = "/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/llama-7b-hf-sparsegpt-bfp12/"
-        attn_path_7b = f"/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/llama-7b-hf-attsample/attn_s{i}b0.pt"
-        attn_path_opt350m = f"/chronos_data/tji/opt_350m_sparse_attn/attn_s{i}b0.pt"
-        #figure out actual seq len
-        attn = torch.load(attn_path_opt350m)
-        seq_len = attn.size()[-1]
+            print(f"loaded seq len: {seq_len}")
 
-        print(f"loaded seq len: {seq_len}")
+            mats_llama = {\
+                "compress blue&yellow":
+                    [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.6, "label": "attxv", "repeat": 32,
+                        "file": attn_path_7b}]+ \
+                    [{"size": [seq_len, 128, 128, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 32}] + \
+                    [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0.5, "label": "q proj", "repeat": 1, 
+                    "file": param_path_7b + f"model.layers.{layer_idx}.self_attn.q_proj.weight.pt"}]+ \
+                    [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0.5, "label": "k proj", "repeat": 1, 
+                    "file": param_path_7b + f"model.layers.{layer_idx}.self_attn.k_proj.weight.pt"}]+ \
+                    [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0.5, "label": "v proj", "repeat": 1, 
+                    "file": param_path_7b + f"model.layers.{layer_idx}.self_attn.v_proj.weight.pt"}]+ \
+                    [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0.5, "label": "o proj", "repeat": 1, 
+                    "file": param_path_7b + f"model.layers.{layer_idx}.self_attn.o_proj.weight.pt"}], 
+                "compress blue":
+                    [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.6, "label": "attxv", "repeat": 32,
+                        "file": attn_path_7b}] + \
+                    [{"size": [seq_len, 128, 128, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 32}] + \
+                    [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}] + \
+                    [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}] + \
+                    [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
+                    [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],  
+                "original":
+                    [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.0, "label": "attxv", "repeat": 32}] + \
+                    [{"size": [seq_len, 128, 128, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 32}] + \
+                    [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}] + \
+                    [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}] + \
+                    [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
+                    [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],
+                }
 
-        mats_llama = {\
-            "compress blue&yellow":
-                [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.6, "label": "attxv", "repeat": 32,
-                    "file": attn_path_7b}]+ \
-                [{"size": [seq_len, 128, 128, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 32}] + \
-                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0.5, "label": "q proj", "repeat": 1, 
-                "file": param_path_7b + f"model.layers.{layer_idx}.self_attn.q_proj.weight.pt"}]+ \
-                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0.5, "label": "k proj", "repeat": 1, 
-                "file": param_path_7b + f"model.layers.{layer_idx}.self_attn.k_proj.weight.pt"}]+ \
-                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0.5, "label": "v proj", "repeat": 1, 
-                "file": param_path_7b + f"model.layers.{layer_idx}.self_attn.v_proj.weight.pt"}]+ \
-                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0.5, "label": "o proj", "repeat": 1, 
-                "file": param_path_7b + f"model.layers.{layer_idx}.self_attn.o_proj.weight.pt"}], 
-            "compress blue":
-                [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.6, "label": "attxv", "repeat": 32,
-                    "file": attn_path_7b}] + \
-                [{"size": [seq_len, 64, 64, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 32}] + \
-                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}] + \
-                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label  ": "k proj", "repeat": 1}] + \
-                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
-                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],  
-            "original":
-                [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.0, "label": "attxv", "repeat": 32}] + \
-                [{"size": [seq_len, 128, 128, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 32}] + \
-                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}] + \
-                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}] + \
-                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
-                [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],
-            }
+            mats_llama_attnv_only = {\
+                "compress blue":
+                    [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.6, "label": "attxv", "repeat": 32,
+                        "file": attn_path_7b}],
+                }
 
-        mats_opt350m = {\
-            "compress blue":
-                [{"size": [seq_len, seq_len, seq_len, 64], "row_sparsity": 0.6, "label": "attxv", "repeat": 16,
-                    "file": attn_path_opt350m}] + \
-                [{"size": [seq_len, 64, 64, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 16}] + \
-                [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}] + \
-                [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}] + \
-                [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
-                [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],  
-            "original":
-                [{"size": [seq_len, seq_len, seq_len, 64], "row_sparsity": 0.0, "label": "attxv", "repeat": 16}] + \
-                [{"size": [seq_len, 64, 64, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 16}] + \
-                [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}] + \
-                [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}] + \
-                [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
-                [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],
-            }
+            mats_opt350m = {\
+                "compress blue":
+                    [{"size": [seq_len, seq_len, seq_len, 64], "row_sparsity": 0.6, "label": "attxv", "repeat": 16,
+                        "file": attn_path_opt350m}] + \
+                    [{"size": [seq_len, 64, 64, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 16}] + \
+                    [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}] + \
+                    [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}] + \
+                    [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
+                    [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],  
+                "original":
+                    [{"size": [seq_len, seq_len, seq_len, 64], "row_sparsity": 0.0, "label": "attxv", "repeat": 16}] + \
+                    [{"size": [seq_len, 64, 64, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 16}] + \
+                    [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}] + \
+                    [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}] + \
+                    [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
+                    [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],
+                }
+            
+            dmodel = 12288
+            seq_len = dmodel * 4
+            mats_opt6_7b = {\
+                "compress blue":
+                    [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.9, "label": "attxv", "repeat": 96}] + \
+                    [{"size": [seq_len, 128, 128, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 96}] + \
+                    [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}] + \
+                    [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}] + \
+                    [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
+                    [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],  
+                "original":
+                    [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.0, "label": "attxv", "repeat": 96}] + \
+                    [{"size": [seq_len, 128, 128, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 96}] + \
+                    [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}] + \
+                    [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}] + \
+                    [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
+                    [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],
+                }
         
-        dmodel = 12288
-        seq_len = dmodel * 4
-        mats_opt6_7b = {\
-            "compress blue":
-                [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.9, "label": "attxv", "repeat": 96}] + \
-                [{"size": [seq_len, 128, 128, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 96}] + \
-                [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}] + \
-                [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}] + \
-                [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
-                [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],  
-            "original":
-                [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.0, "label": "attxv", "repeat": 96}] + \
-                [{"size": [seq_len, 128, 128, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 96}] + \
-                [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}] + \
-                [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}] + \
-                [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
-                [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],
-            }
-     
-        mats_list.append(mats_opt6_7b)
+            mats_list.append(mats_llama_attnv_only)
 
-    compute_stacked_matmul_performance(mats_list, 14, (2, 123), layer_idx, plot_figure=True)
-    exit() 
+        compute_stacked_matmul_performance(mats_list, 14, (2, 123), 
+                                        layer_idx, 
+                                        lat_compute_type=["ideal sparse", "sparse baseline"], 
+                                        plot_figure=False)
+    exit()
 
     # print_compress_ratio()
     # exploring blocked sparsity in bert parameter based on Jason's movement pruning
