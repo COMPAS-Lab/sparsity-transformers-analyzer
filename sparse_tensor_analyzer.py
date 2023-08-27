@@ -967,7 +967,7 @@ def print_compress_ratio():
 def distance_of_dense_vals_per_row(mat: np.array, row_size: int, num_anchor_cols = 0):
     """compute the distance that can cover the dense values best
     """    
-    assert row_size >= 0, "blocking size must leq to 3 for the 3 hardware columns"
+    assert row_size >= 0, "blocking size must > 0"
     dense_mask = mat > 0.0
     per_block_sparsity = None
 
@@ -990,7 +990,8 @@ def distance_of_dense_vals_per_row(mat: np.array, row_size: int, num_anchor_cols
         per_block_sparsity = [get_mat_sparsity(m) for m in dense_mask]
     else:
         merged_dense_mask = dense_mask
-        per_block_sparsity = 1. - float(np.count_nonzero(merged_dense_mask, axis=-1)) / merged_dense_mask.shape[-1]
+        dense_vals = np.count_nonzero(merged_dense_mask, axis=-1).astype(np.float)
+        per_block_sparsity = 1. - dense_vals / merged_dense_mask.shape[-1]
 
     first_dense_col_idx = np.argmax(merged_dense_mask, axis=-1)
     neighboring_dist = np.cumsum(merged_dense_mask, axis=-1)
