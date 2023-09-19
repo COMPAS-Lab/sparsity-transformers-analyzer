@@ -366,7 +366,7 @@ def compute_stacked_matmul_performance(
         ax.set_xlabel('model')
         # ax.legend()
         fig.tight_layout()
-        fig.savefig(f"res_fig/new_baseline/new_baseline_llama7b_l{layer_idx}.pdf")
+        fig.savefig(f"res_fig/new_baseline/new_baseline_llama7b_l{layer_idx}_fakelongseq.pdf")
         plt.clf()
 
     return avg_perf_list
@@ -1048,7 +1048,7 @@ def main():
     # Evaulating sparse 
     # construct multiple instances of the llama inference
     layer_ids = np.arange(0, num_layers, 1)
-    insts_idx = list(range(100))
+    insts_idx = list(range(2))
 
     # explore the distance of the dense values
     # attn_path_list = \
@@ -1076,9 +1076,10 @@ def main():
         for i in insts_idx:
             param_path_7b = "/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/llama-7b-hf-sparsegpt-bfp12/"
             attn_path_7b = f"/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/llama-7b-hf-attsample/attn_s{i}b0.pt"
+            attn_path_flongseq = f"/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/seqlen_2048_interp_llama7bhf/attn_s{i}b0.pt"
             attn_path_opt350m = f"/chronos_data/tji/opt_350m_sparse_attn/attn_s{i}b0.pt"
             #figure out actual seq len
-            attn = torch.load(attn_path_7b)
+            attn = torch.load(attn_path_flongseq)
             seq_len = attn.size()[-1]
 
             print(f"loaded seq len: {seq_len}")
@@ -1116,7 +1117,7 @@ def main():
             mats_llama_attnv_only = {\
                 "compress blue":
                     [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.6, "label": "attxv", "repeat": 32,
-                        "file": attn_path_7b}],
+                        "file": attn_path_flongseq}],
                 }
 
             mats_opt350m = {\

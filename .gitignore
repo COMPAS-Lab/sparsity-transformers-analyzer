@@ -14,10 +14,10 @@
 *.tar.bz2
 
 # ignore result figs and tables
-*fig_res/
+*res_fig/
 *.csv
 *.txt
-
+*.log
 # ignore params
 dropped_attention_params
 
