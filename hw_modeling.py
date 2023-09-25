@@ -30,8 +30,6 @@ def lcm(a: float, b: float):
 def dspToAlu(dsp, dtype: str):
     return dsp / 2.0 if dtype == 'float32' else dsp
 
-
-
 class MatMulDimErr(Exception):
     pass
 
