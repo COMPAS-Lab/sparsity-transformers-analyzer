@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import random
+from tqdm import tqdm
 from scipy import optimize
 from math import ceil
 from sparse_tensor_analyzer import distance_of_dense_vals_per_row
@@ -76,6 +77,7 @@ def gen_spmat_by_sparsity(ref_mat: np.array,
     print(f"ori: {ori_spar:.3f}, new: {new_spar:.3f}")
     return res_mat
 
+
 def explore_row_features(mats: list, inst_idx: int):
     row_spar_list, row_dist_list, row_first_dval_list = [], [], []
 
@@ -121,6 +123,8 @@ def explore_row_features(mats: list, inst_idx: int):
 def multiport_congestion_analysis(attn, 
                         attn_flatten_size: tuple, 
                         num_ports: int, 
+                        num_tc_access: int,
+                        cached_cols: tuple[int, int], 
                         is_plot_figure = False):
     '''
     check the total number of congestions in a given flattened attention array
@@ -128,10 +132,14 @@ def multiport_congestion_analysis(attn,
     def analyze_multiport_balance(mat):
         assert(mat.ndim == 2), "incorrect mat size"
 
-        def get_loaded_access(rows: list, mem_segsize: int, replicated_range: tuple):
+        def get_loaded_access(rows: list, replicated_range: tuple):
+            # init results
             loaded_access = [[] for p in range(num_ports)]
             ori_loaded_access = [[] for p in range(num_ports)]
+            # segmented mem sections based on the number of SPRAMs 
+            mem_segsize = ceil(rows[0].shape[0] / num_ports)
             mem_segment_idx = np.array([p * mem_segsize for p in range(num_ports)])
+
             r_access_list = [np.where(r > 0.0)[0].tolist() for r in rows]
             while sum([len(rlist) for rlist in r_access_list]) > 0:
                 curr_loaded_access = [[] for p in range(num_ports)]
@@ -146,31 +154,38 @@ def multiport_congestion_analysis(attn,
                 # check replicated mem access in the section 0
                 sec0_uncacheable_access = np.sum(np.array(curr_loaded_access[0]) >= replicated_range[1])
                 if sec0_uncacheable_access > 0:
-                    uncacheable_access_idx = len(curr_loaded_access[0]) - sec0_uncacheable_access
-                    curr_loaded_access[0] = curr_loaded_access[0][uncacheable_access_idx:]
+                    all_access_np = np.array(curr_loaded_access[0])
+                    uncacheable_access_idx = np.where(all_access_np >= replicated_range[1])
+                    curr_loaded_access[0] = all_access_np[uncacheable_access_idx].tolist()
                     if len(curr_ori_loaded_access[0]) > len(curr_loaded_access[0]):
-                        curr_loaded_access[0] = [-1] + curr_loaded_access[0]
-                else:
+                        curr_loaded_access[0] = [-1] + all_access_np[uncacheable_access_idx].tolist()
+                elif curr_loaded_access[0]:
                     curr_loaded_access[0] = [-1]
                 
+                lensum = 0
+                for a in curr_loaded_access:
+                    lensum += len(a)
+
+                if lensum == 0:
+                    print("void loaded access!")
                 # merge current res to all loaded_access
-                for r in range(len(rows)):
-                    loaded_access[r] += curr_loaded_access[r]
-                    ori_loaded_access[r] += curr_ori_loaded_access[r]
+                for p in range(num_ports):
+                    loaded_access[p] += curr_loaded_access[p]
+                    ori_loaded_access[p] += curr_ori_loaded_access[p]
 
             return loaded_access, ori_loaded_access
 
-        if mat.shape[0] % num_ports != 0:
-            mat = np.pad(mat, ((0, mat.shape[0] % num_ports), (0, 0)),
+        if mat.shape[0] % num_tc_access != 0:
+            mat = np.pad(mat, ((0, mat.shape[0] % num_tc_access), (0, 0)),
                         "constant", constant_values=0)
         
-        mem_segsize = mat.shape[0] // num_ports
+        tc_access_grpsize = mat.shape[0] // num_tc_access
         total_loaded_access = [[] for p in range(num_ports)]
         total_ori_loaded_access = [[] for p in range(num_ports)]
-        for i in range(mem_segsize):
+        for i in range(tc_access_grpsize):
             # method 2: interleaving
-            row_access_list = [mat[j * mem_segsize + i] for j in range(num_ports)]
-            loaded_access, ori_loaded_access = get_loaded_access(row_access_list, mem_segsize, (0, 5))
+            row_access_list = [mat[j * tc_access_grpsize + i] for j in range(num_tc_access)]
+            loaded_access, ori_loaded_access = get_loaded_access(row_access_list, cached_cols)
             for p in range(num_ports):
                 total_loaded_access[p] += loaded_access[p]
                 total_ori_loaded_access[p] += ori_loaded_access[p]
@@ -180,7 +195,7 @@ def multiport_congestion_analysis(attn,
     flatten_attn = np.resize(attn, attn_flatten_size)
     all_loaded_ratio = []
     num_all_actual_cycles, num_all_ideal_cycles = [], []
-    for a in flatten_attn:
+    for a in tqdm(flatten_attn, unit=" mat"):
         mat_loaded_access, mat_ori_loaded_access = analyze_multiport_balance(a)
         num_ideal_cycles = float(sum([len(r) for r in mat_ori_loaded_access])) / num_ports
         num_actual_cycles = max([len(r) for r in mat_loaded_access])
@@ -201,13 +216,14 @@ def multiport_congestion_analysis(attn,
         plt.xlim(xmin=0)
         plt.ylim(ymin=0)
         plt.legend()
-        plt.savefig(f"./res_fig/temp/congestion_{num_ports}p_with_cache0to5.png")
+        plt.savefig(f"./res_fig/temp/congestion_{num_ports}p_{num_tc_access}tc" + \
+                    f"_with_cache{cached_cols[0]}to{cached_cols[1]}.png")
         plt.close()
 
     return sum(num_all_actual_cycles), sum(num_all_ideal_cycles)
 
 
-def multiway_congestion_source_analysis(
+def multiway_congestion_dist_analysis(
         attn, 
         attn_flatten_size: tuple, 
         num_ports: int,
@@ -271,7 +287,11 @@ def multiway_congestion_source_analysis(
     return
 
 def mem_acc_cycle_diff_numports(num_ports: tuple[int, int, int], 
+                                num_tc_access: int,
                                 ref_att_path_list: list[str]):
+    '''
+    plot access cycle changes as the number of SPRAM changes
+    '''
     avg_access = []
     for curr_num_ports in np.arange(*num_ports):
         all_access_cycles_list, all_ideal_cycles_list = [], []
@@ -279,18 +299,18 @@ def mem_acc_cycle_diff_numports(num_ports: tuple[int, int, int],
             src_attn = torch.load(inst).numpy()
             res = multiport_congestion_analysis(src_attn, 
                                     (-1, src_attn.shape[-2], src_attn.shape[-1]), 
-                                    num_ports=curr_num_ports,
-                                    is_plot_figure=True)
+                                    num_ports=curr_num_ports, num_tc_access=num_tc_access,
+                                    cached_cols=(0, 5), is_plot_figure=True)
             all_access_cycles_list += [res[0]]
             all_ideal_cycles_list += [res[1]]
         avg_access += [(np.mean(all_access_cycles_list), np.mean(all_ideal_cycles_list))]
 
 
     plt.figure()
-    plt.plot(np.arange(num_ports[0], num_ports[1], 2), 
+    plt.plot(np.arange(*num_ports), 
              [a[0] for a in avg_access], 
              marker="s", color="b", label="actual RAM read")
-    plt.plot(np.arange(num_ports[0], num_ports[1], 2), 
+    plt.plot(np.arange(*num_ports), 
              [a[1] for a in avg_access], 
              marker="s", color="r", label="ideal RAM read") 
     plt.xlabel("#SPRAM")
@@ -301,13 +321,51 @@ def mem_acc_cycle_diff_numports(num_ports: tuple[int, int, int],
     plt.savefig(f"./res_fig/temp/mem_acc_vs_numports.png")
     plt.close()
 
+
+def mem_acc_cycle_diff_cached_cols(num_cached_cols: tuple[int, int, int], 
+                                   num_ports: int, num_tc_access: int,
+                                   ref_att_path_list: list[str]):
+    '''
+    plot access cycle changes as the number of cached columns in the mat B
+    changes
+    '''
+    avg_access = []
+    for curr_cached_cols in np.arange(*num_cached_cols):
+        all_access_cycles_list, all_ideal_cycles_list = [], []
+        for inst in ref_att_path_list:
+            src_attn = torch.load(inst).numpy()
+            res = multiport_congestion_analysis(src_attn, 
+                                    (-1, src_attn.shape[-2], src_attn.shape[-1]), 
+                                    num_ports=num_ports, num_tc_access=num_tc_access,
+                                    cached_cols=(0, curr_cached_cols), is_plot_figure=True)
+            all_access_cycles_list += [res[0]]
+            all_ideal_cycles_list += [res[1]]
+        avg_access += [(np.mean(all_access_cycles_list), np.mean(all_ideal_cycles_list))]
+
+    plt.figure()
+    plt.plot(np.arange(*num_cached_cols), 
+             [a[0] for a in avg_access], 
+             marker="s", color="b", label="actual RAM read")
+    plt.plot(np.arange(*num_cached_cols), 
+             [a[1] for a in avg_access], 
+             marker="s", color="r", label="ideal RAM read") 
+    plt.xlabel("cached cols (0 to x)")
+    plt.ylabel("#cycles to read RAM")
+    plt.xlim(xmin=0)
+    plt.ylim(ymin=0)
+    plt.legend()
+    plt.savefig(f"./res_fig/temp/mem_acc_vs_cached_cols.png")
+    plt.close()
+
+
 if __name__ == "__main__":
     target_len = 2048
-    selected_idx = random.sample(list(range(100)), 50)
+    selected_idx = random.sample(list(range(100)), 10)
     ref_attn_list = [f"/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/" + \
                     f"llama-7b-hf-attsample/attn_s{i}b0.pt" for i in selected_idx]
     
-    mem_acc_cycle_diff_numports((2, 24, 2), ref_attn_list)
+    # mem_acc_cycle_diff_numports((2, 24, 2), 123, ref_attn_list)
+    mem_acc_cycle_diff_cached_cols((20, 100, 10), 20, 123, ref_attn_list)
     exit()
 
     for i in range(1):
