@@ -11,7 +11,8 @@ def multiport_congestion_analysis(attn,
                         attn_flatten_size: tuple, 
                         num_ports: int, 
                         num_tc_access: int,
-                        cached_cols: tuple[int, int], 
+                        num_replication: int,
+                        cached_range_in_col: tuple[int, int], 
                         is_plot_figure = False):
     '''
     check the total number of congestions in a given flattened attention array
@@ -44,14 +45,18 @@ def multiport_congestion_analysis(attn,
                     if replicated_range[1] > mem_segment_idx[sec_idx]:
                         # first filter out uncached ones
                         sec_uncacheable_access = np.sum(np.array(curr_loaded_access[sec_idx]) > replicated_range[1])
+                        sec_cacheable_access = float(len(curr_loaded_access[sec_idx]) - sec_uncacheable_access)
+                        cacheable_access_iter = ceil(sec_cacheable_access / num_replication)
                         if sec_uncacheable_access > 0:
                             all_access_np = np.array(curr_loaded_access[sec_idx])
                             uncacheable_access_idx = np.where(all_access_np >= replicated_range[1])
                             curr_loaded_access[sec_idx] = all_access_np[uncacheable_access_idx].tolist()
                             if len(curr_ori_loaded_access[sec_idx]) > len(curr_loaded_access[sec_idx]):
-                                curr_loaded_access[sec_idx] = [-1] + all_access_np[uncacheable_access_idx].tolist()
+                                # deal with the situation that there are cached contents being accessed
+                                curr_loaded_access[sec_idx] = [-1] * cacheable_access_iter + all_access_np[uncacheable_access_idx].tolist()
                         elif curr_loaded_access[sec_idx]:
-                            curr_loaded_access[sec_idx] = [-1]
+                            # deal with the situation that only cached contents are accessed
+                            curr_loaded_access[sec_idx] = [-1] * cacheable_access_iter
                     else:
                         break
 
@@ -77,7 +82,7 @@ def multiport_congestion_analysis(attn,
         for i in range(tc_access_grpsize):
             # method 2: interleaving
             row_access_list = [mat[j * tc_access_grpsize + i] for j in range(num_tc_access)]
-            loaded_access, ori_loaded_access = get_loaded_access(row_access_list, cached_cols)
+            loaded_access, ori_loaded_access = get_loaded_access(row_access_list, cached_range_in_col)
             for p in range(num_ports):
                 total_loaded_access[p] += loaded_access[p]
                 total_ori_loaded_access[p] += ori_loaded_access[p]
@@ -113,7 +118,7 @@ def multiport_congestion_analysis(attn,
         plt.ylim(ymin=0)
         plt.legend()
         plt.savefig(f"./res_fig/temp/congestion_{num_ports}p_{num_tc_access}tc" + \
-                    f"_with_cache{cached_cols[0]}to{cached_cols[1]}.png")
+                    f"_with_cache{cached_range_in_col[0]}to{cached_range_in_col[1]}.png")
         plt.close()
 
     return sum(num_all_actual_cycles), sum(num_all_ideal_cycles)
@@ -221,8 +226,8 @@ def mem_acc_cycle_diff_numports(num_ports: tuple[int, int, int],
             all_seq_len.append(src_attn.shape[-1])
             res = multiport_congestion_analysis(src_attn, 
                                     (-1, src_attn.shape[-2], src_attn.shape[-1]), 
-                                    num_ports=curr_num_ports, num_tc_access=num_tc_access,
-                                    cached_cols=(0, 5), is_plot_figure=True)
+                                    num_ports=curr_num_ports, num_tc_access=num_tc_access, num_replication=10, 
+                                    cached_range_in_col=(0, 5), is_plot_figure=True)
             all_access_cycles_list += [res[0]]
             all_ideal_cycles_list += [res[1]]
         avg_access += [(np.mean(all_access_cycles_list), np.mean(all_ideal_cycles_list))]
@@ -269,8 +274,8 @@ def mem_acc_cycle_diff_cached_cols(num_cached_cols: tuple[int, int, int],
             all_seq_len.append(src_attn.shape[-1])
             res = multiport_congestion_analysis(src_attn, 
                                     (-1, src_attn.shape[-2], src_attn.shape[-1]), 
-                                    num_ports=num_ports, num_tc_access=num_tc_access,
-                                    cached_cols=(0, curr_cached_cols), is_plot_figure=True)
+                                    num_ports=num_ports, num_tc_access=num_tc_access, num_replication=num_tc_access,
+                                    cached_range_in_col=(0, curr_cached_cols), is_plot_figure=True)
             all_access_cycles_list += [res[0]]
             all_ideal_cycles_list += [res[1]]
         avg_access += [(np.mean(all_access_cycles_list), np.mean(all_ideal_cycles_list))]
@@ -291,12 +296,61 @@ def mem_acc_cycle_diff_cached_cols(num_cached_cols: tuple[int, int, int],
              marker="s", color="r", label="w/o replication") 
     plt.hlines(dense_parallel_matb_access, num_cached_cols[0], num_cached_cols[1], 
                colors="black", linestyles="dashed", label="dense parallel read")
-    plt.xlabel("cached cols (0 to x)")
+    plt.xlabel("replicated range in each col (0->x)")
     plt.ylabel("#cycles to read RAM")
     plt.xlim(xmin=0)
     plt.ylim(ymin=0)
     plt.legend()
     plt.savefig(f"./res_fig/temp/mem_acc_vs_cached_cols.png")
+    plt.close()
+
+
+def mem_acc_cycle_diff_rep_times(num_rep_times: tuple[int, int, int], 
+                                   num_ports: int, num_tc_access: int,
+                                   cached_range: int,
+                                   ref_att_path_list: list[str]):
+    '''
+    plot access cycle changes as the number of cached columns in the mat B
+    changes
+    '''
+    avg_access = []
+    avg_seq_len = 0.0
+    for curr_rep_time in np.arange(*num_rep_times):
+        all_access_cycles_list, all_ideal_cycles_list = [], []
+        all_seq_len = []
+        for inst in ref_att_path_list:
+            src_attn = torch.load(inst).numpy()
+            all_seq_len.append(src_attn.shape[-1])
+            res = multiport_congestion_analysis(src_attn, 
+                                    (-1, src_attn.shape[-2], src_attn.shape[-1]), 
+                                    num_ports=num_ports, num_tc_access=num_tc_access, num_replication=curr_rep_time,
+                                    cached_range_in_col=(0, cached_range), is_plot_figure=True)
+            all_access_cycles_list += [res[0]]
+            all_ideal_cycles_list += [res[1]]
+        avg_access += [(np.mean(all_access_cycles_list), np.mean(all_ideal_cycles_list))]
+        avg_seq_len = np.mean(all_seq_len)
+
+    # calculate reference dense mat mul reading
+    # MARK: hard-coded number of mat B cols to be 128
+    # num_loada_iters = seq_len / (20 * chain_len)
+    num_loada_iters = avg_seq_len / (20 * 14)
+    dense_parallel_matb_access = 128/2 * num_loada_iters * 32 * 32
+
+    plt.figure()
+    plt.plot(np.arange(*num_rep_times), 
+             [a[0] for a in avg_access], 
+             marker="s", color="b", label="w/ replication")
+    plt.plot(np.arange(*num_rep_times), 
+             [a[1] for a in avg_access], 
+             marker="s", color="r", label="w/o replication") 
+    plt.hlines(dense_parallel_matb_access, num_rep_times[0], num_rep_times[1], 
+               colors="black", linestyles="dashed", label="dense parallel read")
+    plt.xlabel("#replication")
+    plt.ylabel("#cycles to read RAM")
+    plt.xlim(xmin=0)
+    plt.ylim(ymin=0)
+    plt.legend()
+    plt.savefig(f"./res_fig/temp/mem_acc_vs_rep_times.png")
     plt.close()
 
 
@@ -317,10 +371,11 @@ def analyze_rep_cols_vs_m20k(rep_time, col_range):
 
 if __name__ == "__main__":
     target_len = 2048
-    selected_idx = random.sample(list(range(100)), 5)
+    selected_idx = random.sample(list(range(100)), 50)
     ref_attn_list = [f"/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/" + \
                     f"llama-7b-hf-attsample/attn_s{i}b0.pt" for i in selected_idx]
     
-    # mem_acc_cycle_diff_numports((2, 24, 2), 123, ref_attn_list)
-    # mem_acc_cycle_diff_cached_cols((1, 100, 5), 20, 123, ref_attn_list)
+    mem_acc_cycle_diff_numports((2, 24, 2), 123, ref_attn_list)
+    mem_acc_cycle_diff_cached_cols((1, 100, 5), 20, 123, ref_attn_list)
+    mem_acc_cycle_diff_rep_times((1, 124, 1), 20, 123, 30, ref_attn_list)
     analyze_rep_cols_vs_m20k(123, np.arange(5, 100, 5))
