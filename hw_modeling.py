@@ -1,12 +1,13 @@
-from math import ceil, floor, exp, log2, gcd, sqrt, pow
-from os import chdir
+from math import ceil, floor, log2, gcd, lcm, pow
 import numpy as np
 import matplotlib.pyplot as plt
+from mem_matb_select_modeling import get_matB_access_by_matA_iter
 from scipy.spatial.distance import hamming
 import random
 import sys, logging
 import skimage.measure
 import logging
+import sympy as sp
 
 formatter = logging.Formatter('%(name)s - %(levelname)s - %(message)s')
 hw_modeling_logger = logging.getLogger("hw_modeling")
@@ -525,46 +526,27 @@ class StratixDpuModel(DpuModel):
                     res = []
                     h_dist = lambda x, y: hamming(x, y) * len(x)
 
-                    if self.TCCORE_COL_SIZE == 3:
-                        while dense_mask.shape[0] > 3:
-                            to_compare = dense_mask[0]
-                            dense_mask = np.delete(dense_mask, 0, axis=0)
-                            res.append(sparse_mat[0])
-                            sparse_mat = np.delete(sparse_mat, 0, axis=0)
+                    while dense_mask.shape[0] > 3:
+                        to_compare = dense_mask[0]
+                        dense_mask = np.delete(dense_mask, 0, axis=0)
+                        res.append(sparse_mat[0])
+                        sparse_mat = np.delete(sparse_mat, 0, axis=0)
 
-                            min_hdist = [len(to_compare), len(to_compare)]
-                            min_idx = [0, 0]
-                            for idx, r in enumerate(dense_mask):
-                                c_hdist = h_dist(to_compare, r)
-                                if c_hdist < min_hdist[0]:
-                                    min_hdist = [c_hdist, min_hdist[0]]
-                                    min_idx = [idx, min_idx[0]]
-                                elif c_hdist < min_hdist[1]:
-                                    min_hdist[1] = c_hdist
-                                    min_idx[1] = idx
-                            
-                            res.append(sparse_mat[min_idx[0]])
-                            res.append(sparse_mat[min_idx[1]])
-                            sparse_mat = np.delete(sparse_mat, min_idx, axis=0)
-                            dense_mask = np.delete(dense_mask, min_idx, axis=0)
-                    if self.TCCORE_COL_SIZE == 2:
-                        while dense_mask.shape[0] > 2:
-                            to_compare = dense_mask[0]
-                            dense_mask = np.delete(dense_mask, 0, axis=0)
-                            res.append(sparse_mat[0])
-                            sparse_mat = np.delete(sparse_mat, 0, axis=0)
-
-                            min_hdist = len(to_compare)
-                            min_idx = 0
-                            for idx, r in enumerate(dense_mask):
-                                c_hdist = h_dist(to_compare, r)
-                                if c_hdist < min_hdist:
-                                    min_hdist = c_hdist
-                                    min_idx = idx
-                            
-                            res.append(sparse_mat[min_idx])
-                            sparse_mat = np.delete(sparse_mat, min_idx, axis=0)
-                            dense_mask = np.delete(dense_mask, min_idx, axis=0)
+                        min_hdist = [len(to_compare), len(to_compare)]
+                        min_idx = [0, 0]
+                        for idx, r in enumerate(dense_mask):
+                            c_hdist = h_dist(to_compare, r)
+                            if c_hdist < min_hdist[0]:
+                                min_hdist = [c_hdist, min_hdist[0]]
+                                min_idx = [idx, min_idx[0]]
+                            elif c_hdist < min_hdist[1]:
+                                min_hdist[1] = c_hdist
+                                min_idx[1] = idx
+                        
+                        res.append(sparse_mat[min_idx[0]])
+                        res.append(sparse_mat[min_idx[1]])
+                        sparse_mat = np.delete(sparse_mat, min_idx, axis=0)
+                        dense_mask = np.delete(dense_mask, min_idx, axis=0)
 
                     for r in sparse_mat: res.append(r)
                     sparse_mat = np.array(res)
@@ -806,6 +788,8 @@ class StratixDpuModel(DpuModel):
 
             # add compute latency of the last iter:
             total_lat += [mat_b_cols_used_to_hide_a_loading]
+            # last accumulator's latency
+            total_lat += [4 + effective_loading_lat * 2 + 2]
             return sum(total_lat), sum(real_elems_in_a)
 
         # using all three columns, the matrix is blocked into 3xtc core size blocks.
@@ -852,7 +836,137 @@ class StratixDpuModel(DpuModel):
         hw_modeling_logger.info(f"total util: {grp_util:.3f}")
         return flops, lat_ret, grp_util
     
+    def tensor_rorp_sparse_flops(self, 
+                                    sparse_mat, ideal=False, 
+                                    sparse_block_size = 10.0,
+                                    return_time_lat = True,
+                                    is_partioning_bsel = False):
+        '''
+        compute latency and throughput of the stratix nx model considering 
+        sparse mat row reordering and heavily-accessed mat B elements replication.
+        The parameters for the replication are hardcoded based on the analysis in 
+        mem_matb_select_modeling.py
+        '''
+        round = lambda x: x if ideal else ceil(x)
+        get_padded_size = lambda x, fac: ceil(float(x)/fac) * fac
+        hw_modeling_logger.info("=== modeling SpMM by {0} ===".format(sys._getframe(0).f_code.co_name))
+        hw_modeling_logger.info(f"tc array: {self.NUM_TCC_ROWS} x {self.NUM_TCC_COLS}")
 
+        def compute_lat_by_elem_grps(pruned_mat_a, effective_loading_lat):
+            if len(pruned_mat_a) == 0:
+                return 0.0
+            # assuming mat A loading must fill all the buffers in TC
+            # so the loading lat totally depends on effective loading lat
+            single_a_loading_lat = (effective_loading_lat + 1) * 3.0 
+            mat_b_cols_used_to_hide_a_loading = round(self.b_w / self.NUM_TCC_ROWS)
+            # first pad the rows to be divisible by TC core columns (3 rows per TC core)
+            zeros_padded = len(pruned_mat_a) % self.NUM_TCC_COLS
+            if zeros_padded > 0:
+                pruned_mat_a += [np.zeros((3, 1), dtype=float)] * (self.NUM_TCC_COLS - zeros_padded)
+            # split pruned mat a into many iterations
+            num_a_row_iters = int(round(len(pruned_mat_a) / self.NUM_TCC_COLS))
+            a_row_iters = []
+            for i in range(num_a_row_iters):
+                # interleaving the row access
+                a_rows_per_iter = [pruned_mat_a[j * num_a_row_iters + i] for j in range(self.NUM_TCC_COLS)]
+                a_rows_per_iter_compress3rows = [np.sum(a, axis=0) for a in a_rows_per_iter]
+                a_row_iters.append(a_rows_per_iter_compress3rows)
+
+            total_lat = []
+            # define constant part of the b selecting latency
+            # 2 cycle of buffer reading
+            # 1 cycle of pushing queue
+            # 1 cycle of cache loading
+            # 1 cycle of cache reading
+            CONST_B_SEL_LAT = 2 + 1 + 1 + 1
+            # real number of elems in A being computed, useful for utils computation
+            real_elems_in_a = []
+            # figure out actual time of each group loading
+            for row_iter_idx, a_rows_per_iter in enumerate(a_row_iters):
+                a_loading_iters, b_selecting_lats = [], 0.
+                grp_bsel_access, _ = get_matB_access_by_matA_iter(a_rows_per_iter, (0, 90), 20, 15)
+                b_selecting_lats = np.amax([len(access) for access in grp_bsel_access])
+                for a_grps in a_rows_per_iter:
+                    # source of imbalance from A row sparsity diversity
+                    # select the most dense row as the latency to load
+                    # for each iteration
+                    a_loading_iters += [round(float(a_grps.shape[-1]) / (effective_loading_lat * self.TCCORE_SIZE))]
+
+                curr_total_selecting_lats = b_selecting_lats + CONST_B_SEL_LAT
+                curr_a_loading_lats = single_a_loading_lat * max(a_loading_iters)
+                real_elems_in_a += [max(a_loading_iters) * effective_loading_lat * self.TCCORE_SIZE * self.TCCORE_COL_SIZE * self.NUM_TCC_COLS]
+
+                if row_iter_idx == 0:
+                    # initial interval only considers b selecting and a loading
+                    major_lat_cand = [curr_a_loading_lats, 
+                                        curr_total_selecting_lats]
+                    major_lat_type = np.argmax(major_lat_cand)
+                    lat_type_code = {0: "A Loading", 1: "B Selection"}
+                    hw_modeling_logger.info(f"iter {row_iter_idx} takes over by lat {lat_type_code[major_lat_type]}")
+                    for i in range(2):
+                        hw_modeling_logger.info(f"{lat_type_code[i]}: {major_lat_cand[i]}")
+                else:
+                    major_lat_cand = [curr_a_loading_lats, 
+                                        mat_b_cols_used_to_hide_a_loading, 
+                                        curr_total_selecting_lats]
+                    major_lat_type = np.argmax(major_lat_cand)
+                    lat_type_code = {0: "A Loading", 1: "Computation", 2: "B Selection"}
+                    hw_modeling_logger.info(f"iter {row_iter_idx} takes over by lat {lat_type_code[major_lat_type]}")
+                    for i in range(3):
+                        hw_modeling_logger.info(f"{lat_type_code[i]}: {major_lat_cand[i]}")
+            
+                total_lat += [major_lat_cand[major_lat_type]]
+
+            # add compute latency of the last iter:
+            total_lat += [mat_b_cols_used_to_hide_a_loading]
+            hw_modeling_logger.info(f"lat per iter: {total_lat}")
+            # last accumulator's latency
+            total_lat += [4 + effective_loading_lat * 2 + 2]
+            return sum(total_lat), sum(real_elems_in_a)
+
+        # using all three columns, the matrix is blocked into 3xtc core size blocks.
+        # find the max latency of each block which uses most of the time.
+        # first pad the rows to be divisible by 3 (3 rows per TC core)
+        zeros_padded = sparse_mat.shape[0] % self.TCCORE_COL_SIZE
+        if zeros_padded > 0:
+            sparse_mat = np.pad(sparse_mat, (0, self.TCCORE_COL_SIZE - zeros_padded), "constant", constant_values=0)
+        # then block them into 3xtc core size and select the max length to compute delay
+        mat_in_row_grps = \
+            np.split(sparse_mat, np.arange(self.TCCORE_COL_SIZE, sparse_mat.shape[0], self.TCCORE_COL_SIZE), axis=0)
+
+        pruned_mat_a = []
+        for row_grp in mat_in_row_grps:
+            compressed_row_grp = []
+            row_blocks = np.split(row_grp, np.arange(sparse_block_size, row_grp.shape[1], sparse_block_size), axis=-1)
+            for block in row_blocks:
+                if np.sum(block) != 0:
+                    compressed_row_grp.append(block)
+
+            if len(compressed_row_grp) > 0:
+                compressed_row_grp = np.concatenate(compressed_row_grp, axis=-1)
+                # record values for each non-zero 3-row grp
+                pruned_mat_a += [compressed_row_grp]
+
+        # split matA rows into groups, each one can be consumed by all the tc columns
+        effective_loading_lat = 0.0
+        total_lat = 0.0
+        grp_util = 0.0
+        if type(self.CHAIN_LEN) is int:
+            # if the chain length is uniform
+            effective_loading_lat = self.CHAIN_LEN
+            total_lat, real_num_elems = compute_lat_by_elem_grps(pruned_mat_a, effective_loading_lat)
+            # compute total util
+            grp_util =  np.count_nonzero(sparse_mat) / real_num_elems
+
+        # compute throughput
+        total_ops = self.a_h * self.a_w * 2 * self.b_w
+        time_latency = total_lat * 1./self.FREQ * 1e-6
+        flops = total_ops / time_latency / 1e12
+
+        lat_ret = time_latency if return_time_lat else total_lat
+        hw_modeling_logger.info(f"total util: {grp_util:.3f}")
+        return flops, lat_ret, grp_util
+    
     def ideal_tops(self):
         ops = (self.TCCORE_SIZE*2*self.TCCORE_COL_SIZE) * self.NUM_TCs
         latency = 1/self.FREQ * 1e-6

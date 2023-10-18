@@ -2,10 +2,68 @@ import torch
 import numpy as np
 import random
 from tqdm import tqdm
-from scipy import optimize
 from math import ceil, floor
-from sparse_tensor_analyzer import distance_of_dense_vals_per_row
 from matplotlib import pyplot as plt
+
+def get_matB_access_by_matA_iter(rows: list, 
+                                 replicated_range: tuple, 
+                                 num_ports: int,
+                                 num_replication: int):
+    '''
+    calculate latency of mat B selection based on each matA
+    iteration (represented by some rows from matA that exactly
+    constructs an A loading iteration)
+    '''
+    # init results
+    loaded_access = [[] for p in range(num_ports)]
+    ori_loaded_access = [[] for p in range(num_ports)]
+    # segmented mem sections based on the number of SPRAMs, each 
+    # SPRAM stores the access within [0, (p + 1) * mem_segsize-1] 
+    mem_segsize = ceil(rows[0].shape[0] / num_ports)
+    mem_segment_idx = np.array([p * mem_segsize for p in range(num_ports)])
+
+    r_access_list = [np.where(r > 0.0)[0].tolist() for r in rows]
+    while sum([len(rlist) for rlist in r_access_list]) > 0:
+        curr_loaded_access = [[] for p in range(num_ports)]
+        for r in range(len(rows)):
+            if r_access_list[r]:
+                mem_addr = np.argmax(mem_segment_idx > r_access_list[r][0]) - 1
+                curr_loaded_access[mem_addr] += [r_access_list[r][0]]
+                r_access_list[r].pop(0)
+
+        # maintain the original load here
+        curr_ori_loaded_access = curr_loaded_access[:]
+        # check replicated mem access in every section
+        for sec_idx in range(num_ports):
+            if replicated_range[1] > mem_segment_idx[sec_idx]:
+                # first filter out uncached ones
+                sec_uncacheable_access = np.sum(np.array(curr_loaded_access[sec_idx]) > replicated_range[1])
+                sec_cacheable_access = float(len(curr_loaded_access[sec_idx]) - sec_uncacheable_access)
+                cacheable_access_iter = ceil(sec_cacheable_access / num_replication)
+                if sec_uncacheable_access > 0:
+                    all_access_np = np.array(curr_loaded_access[sec_idx])
+                    uncacheable_access_idx = np.where(all_access_np >= replicated_range[1])
+                    curr_loaded_access[sec_idx] = all_access_np[uncacheable_access_idx].tolist()
+                    if len(curr_ori_loaded_access[sec_idx]) > len(curr_loaded_access[sec_idx]):
+                        # deal with the situation that there are cached contents being accessed
+                        curr_loaded_access[sec_idx] = [-1] * cacheable_access_iter + all_access_np[uncacheable_access_idx].tolist()
+                elif curr_loaded_access[sec_idx]:
+                    # deal with the situation that only cached contents are accessed
+                    curr_loaded_access[sec_idx] = [-1] * cacheable_access_iter
+            else:
+                break
+
+        # merge current res to all loaded_access
+        for p in range(num_ports):
+            loaded_access[p] += curr_loaded_access[p]
+            ori_loaded_access[p] += curr_ori_loaded_access[p]
+
+        ideal_cycles = float(sum([len(r) for r in ori_loaded_access])) / num_ports
+        actual_cycles = max([len(r) for r in loaded_access])
+        all_loaded_ratio = float(actual_cycles) / ideal_cycles
+
+    return loaded_access, ori_loaded_access
+
 
 def multiport_congestion_analysis(attn, 
                         attn_flatten_size: tuple, 
@@ -20,57 +78,6 @@ def multiport_congestion_analysis(attn,
     def analyze_multiport_balance(mat):
         assert(mat.ndim == 2), "incorrect mat size"
 
-        def get_loaded_access(rows: list, replicated_range: tuple):
-            # init results
-            loaded_access = [[] for p in range(num_ports)]
-            ori_loaded_access = [[] for p in range(num_ports)]
-            # segmented mem sections based on the number of SPRAMs, each 
-            # SPRAM stores the access within [0, (p + 1) * mem_segsize-1] 
-            mem_segsize = ceil(rows[0].shape[0] / num_ports)
-            mem_segment_idx = np.array([p * mem_segsize for p in range(num_ports)])
-
-            r_access_list = [np.where(r > 0.0)[0].tolist() for r in rows]
-            while sum([len(rlist) for rlist in r_access_list]) > 0:
-                curr_loaded_access = [[] for p in range(num_ports)]
-                for r in range(len(rows)):
-                    if r_access_list[r]:
-                        mem_addr = np.argmax(mem_segment_idx > r_access_list[r][0]) - 1
-                        curr_loaded_access[mem_addr] += [r_access_list[r][0]]
-                        r_access_list[r].pop(0)
-
-                # maintain the original load here
-                curr_ori_loaded_access = curr_loaded_access[:]
-                # check replicated mem access in every section
-                for sec_idx in range(num_ports):
-                    if replicated_range[1] > mem_segment_idx[sec_idx]:
-                        # first filter out uncached ones
-                        sec_uncacheable_access = np.sum(np.array(curr_loaded_access[sec_idx]) > replicated_range[1])
-                        sec_cacheable_access = float(len(curr_loaded_access[sec_idx]) - sec_uncacheable_access)
-                        cacheable_access_iter = ceil(sec_cacheable_access / num_replication)
-                        if sec_uncacheable_access > 0:
-                            all_access_np = np.array(curr_loaded_access[sec_idx])
-                            uncacheable_access_idx = np.where(all_access_np >= replicated_range[1])
-                            curr_loaded_access[sec_idx] = all_access_np[uncacheable_access_idx].tolist()
-                            if len(curr_ori_loaded_access[sec_idx]) > len(curr_loaded_access[sec_idx]):
-                                # deal with the situation that there are cached contents being accessed
-                                curr_loaded_access[sec_idx] = [-1] * cacheable_access_iter + all_access_np[uncacheable_access_idx].tolist()
-                        elif curr_loaded_access[sec_idx]:
-                            # deal with the situation that only cached contents are accessed
-                            curr_loaded_access[sec_idx] = [-1] * cacheable_access_iter
-                    else:
-                        break
-
-                # merge current res to all loaded_access
-                for p in range(num_ports):
-                    loaded_access[p] += curr_loaded_access[p]
-                    ori_loaded_access[p] += curr_ori_loaded_access[p]
-
-                ideal_cycles = float(sum([len(r) for r in ori_loaded_access])) / num_ports
-                actual_cycles = max([len(r) for r in loaded_access])
-                all_loaded_ratio = float(actual_cycles) / ideal_cycles
-
-            return loaded_access, ori_loaded_access
-
         if mat.shape[0] % num_tc_access != 0:
             num_padded_row_iters = ceil(mat.shape[0] / num_tc_access) * num_tc_access - mat.shape[0]
             mat = np.pad(mat, ((0, num_padded_row_iters), (0, 0)),
@@ -82,7 +89,10 @@ def multiport_congestion_analysis(attn,
         for i in range(tc_access_grpsize):
             # method 2: interleaving
             row_access_list = [mat[j * tc_access_grpsize + i] for j in range(num_tc_access)]
-            loaded_access, ori_loaded_access = get_loaded_access(row_access_list, cached_range_in_col)
+            loaded_access, ori_loaded_access = get_matB_access_by_matA_iter(row_access_list, 
+                                                                            cached_range_in_col,
+                                                                            num_ports, 
+                                                                            num_replication)
             for p in range(num_ports):
                 total_loaded_access[p] += loaded_access[p]
                 total_ori_loaded_access[p] += ori_loaded_access[p]

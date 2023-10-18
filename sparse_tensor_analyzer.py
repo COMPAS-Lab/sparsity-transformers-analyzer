@@ -8,10 +8,11 @@ import matplotlib.cbook as cbook
 import skimage.measure
 from tqdm import tqdm
 from scipy.spatial.distance import hamming
-from typing import List, Union
 from math import ceil, floor, sqrt
 import random
 import multiprocessing
+from dataclasses import dataclass, field
+from typing import Literal
 from functools import reduce
 from analyze_tcblock_vs_matsize import closest_factors_to_target
 
@@ -101,12 +102,45 @@ def prepare_wei_dat(data_path):
     print("load weight with shape ", w.shape)
     return w
 
+@dataclass
+class PerfData:
+    total_lat: float = 0.
+    total_util: list[float] = field(default_factory=list)
+    total_flops: list[float] = field(default_factory=list)
+
+    def add_data(self, data, dtype: Literal["util", "flops"]) -> None:
+        if dtype == "util":
+            self.total_util.append(data)
+        if dtype == "flops":
+            self.total_flops.append(data)
+        
+        return
+    
+    def avg_data(self, dtype: Literal["util", "flops"]) -> float:
+        if dtype == "util":
+            return np.mean(self.total_util)
+        if dtype == "flops":
+            return np.mean(self.total_flops)
+        
+        return 0.
+    
+    def set_flops(self, ops: float):
+        self.total_flops = ops / self.total_lat / 1e12
+        return 
+
 def compute_matmul_performance(data, chain_len, out_w, hw_array_shape, \
                                 sort_row_sparsity, using_single_column, sparse_block_size, freq=500, \
                                 sparsity=0.0, seq_len_path=None, seq_len_range=None, mixed_chain_length=None, \
                                 short_to_long_ratio=0.0, blocked_pruning=False, 
-                                perf_eva_list = ["base", "ideal", "ideal sparse", "sparse baseline"]):
-    '''compute latency, throughput and sparsity of a given sparse/dense matrix operation'''
+                                perf_eva_list = ["dense", "non-frag sparse", "ideal sparse", "sparse baseline", "sparse rorp"]):
+    '''
+    compute latency, throughput and sparsity of a given sparse/dense matrix operation
+    "dense": dense matmul
+    "non-frag sparse": SpMM without considering block sparsity irregulation and fragmentation 
+    "ideal sparse": SpMM with block sparsity regulation and fragmentation, but without
+                    considering matB selecting serialization
+    "sparse baseline": SpMM with matB selection serialization, without any optimization
+    '''
     if type(data) is str:
         bfp_att_probes = prepare_att_dat(data, seq_len_path, seq_len_range, sparsity)
     else:
@@ -115,40 +149,39 @@ def compute_matmul_performance(data, chain_len, out_w, hw_array_shape, \
     pdtable_res = {"latency":[] ,"sparsity": [], "s2l ratio": [], "tp": []}
     ret = {k: None for k in perf_eva_list}
 
-    total_sparse_lat, total_base_lat, total_min_sparse_lat, total_sparse_baseline_lat= 0., 0., 0., 0.
-    total_base_util, total_sparse_util, total_min_sparse_util, total_sparse_baseline_util = [], [], [], []
-    total_base_flops, total_sparse_flops, total_min_sparse_flops, total_sparse_baseline_flops = [], [], [], []
-
+    dense_res, ideal_sparse_res, min_sparse_res, sparse_baseline_res, sparse_rorp_res = \
+        PerfData(), PerfData(), PerfData(), PerfData(), PerfData()
+    
     total_ops = 0
     num_insts = len(bfp_att_probes)
     for exps in bfp_att_probes:
         # compute total ops for flops computation
         total_ops += exps.shape[0] * exps.shape[1] * 2 * out_w
         # use a dense mat to calculate dens mat base lat
-        if "base" in perf_eva_list:
+        if "dense" in perf_eva_list:
             fake_dense_data = np.ones(exps.shape)
-            base_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
+            dense_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
                                             exp_dat=fake_dense_data, freq=freq, num_tcs=3960, tcc_array_shape=hw_array_shape, \
                                             tcc_chainlen=chain_len)
-            base_model.set_tccore_size(TCCORE_SIZE)
-            base_flops, base_lat, base_util = base_model.tensor_fpga21_mat_sparse_flops(fake_dense_data, \
+            dense_model.set_tccore_size(TCCORE_SIZE)
+            dense_flops, dense_lat, dense_util = dense_model.tensor_fpga21_mat_sparse_flops(fake_dense_data, \
                                                         sort_row_sparsity, False, \
                                                         using_single_column=False, sparse_block_size=sparse_block_size)
-            total_base_lat += base_lat
-            total_base_util += [base_util]
+            dense_res.total_lat += dense_lat
+            dense_res.add_data(dense_util, "util")
         else:
-            base_flops, base_lat = -1, -1
+            dense_flops, dense_lat = -1, -1
 
-        if "ideal" in perf_eva_list:
-            # evaluate ideal sparse model ignoring the fragmentation
+        if "non-frag sparse" in perf_eva_list:
+            # evaluate sparse model ignoring the fragmentation
             sparse_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
                                             exp_dat=exps, freq=freq, num_tcs=3960, tcc_array_shape=hw_array_shape, \
                                             tcc_chainlen=chain_len)
             sparse_model.set_tccore_size(TCCORE_SIZE)
             min_sparse_flops, min_sparse_lat, min_sparse_util = sparse_model.tensor_fpga21_mat_sparse_flops(exps, \
                                                         sort_row_sparsity, True, False, sparse_block_size, True)
-            total_min_sparse_lat += min_sparse_lat
-            total_min_sparse_util += [min_sparse_util]
+            min_sparse_res.total_lat += min_sparse_lat
+            min_sparse_res.add_data(min_sparse_util, "util")
         else:
             min_sparse_flops, min_sparse_lat = -1, -1
 
@@ -172,8 +205,8 @@ def compute_matmul_performance(data, chain_len, out_w, hw_array_shape, \
                                                             sort_row_sparsity, False, \
                                                             using_single_column, sparse_block_size, False, short_to_long_ratio, \
                                                             blocked_pruning=blocked_pruning)
-            total_sparse_lat += sparse_lat
-            total_sparse_util += [sparse_util]
+            ideal_sparse_res.total_lat += sparse_lat
+            ideal_sparse_res.add_data(sparse_util, "util")
         else:
             sparse_flops, sparse_lat = -1, -1
 
@@ -184,10 +217,22 @@ def compute_matmul_performance(data, chain_len, out_w, hw_array_shape, \
             sparse_model.set_tccore_size(TCCORE_SIZE)
             sparse_baseline_flops, sparse_baseline_lat, sparse_baseline_util = \
                 sparse_model.tensor_baseline_sparse_flops(exps, sparse_block_size=sparse_block_size, return_time_lat=True, is_partioning_bsel=True)
-            total_sparse_baseline_lat += sparse_baseline_lat
-            total_sparse_baseline_util += [sparse_baseline_util]
+            sparse_baseline_res.total_lat += sparse_baseline_lat
+            sparse_baseline_res.add_data(sparse_baseline_util, "util")
         else:
             sparse_baseline_flops, sparse_baseline_lat = -1, -1
+
+        if "sparse rorp" in perf_eva_list:
+            sparse_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
+                            exp_dat=exps, freq=freq, num_tcs=3960, tcc_array_shape=hw_array_shape, \
+                            tcc_chainlen=chain_len)
+            sparse_model.set_tccore_size(TCCORE_SIZE)
+            sparse_rorp_flops, sparse_rorp_lat, sparse_rorp_util = \
+                sparse_model.tensor_rorp_sparse_flops(exps, sparse_block_size=sparse_block_size, return_time_lat=True)
+            sparse_rorp_res.total_lat += sparse_rorp_lat
+            sparse_rorp_res.add_data(sparse_rorp_util, "util")
+        else:
+            pass
                                                     
         curr_sparsity = 1. - np.count_nonzero(exps) / exps.size
         pdtable_res["sparsity"].append(curr_sparsity)
@@ -199,16 +244,23 @@ def compute_matmul_performance(data, chain_len, out_w, hw_array_shape, \
     res_df.sort_values(by=["sparsity"], inplace=True)
     
     # collect return vals:
-    if "base" in perf_eva_list:
-        ret["base"] = (total_base_lat, total_ops / total_base_lat / 1e12, total_base_util)
-    if "ideal" in perf_eva_list:
-        ret["ideal"] = (total_min_sparse_lat, total_ops / total_min_sparse_lat / 1e12, total_min_sparse_util)
+    if "dense" in perf_eva_list:
+        dense_res.set_flops(total_ops)
+        ret["dense"] = dense_res
+    if "non-frag sparse" in perf_eva_list:
+        min_sparse_res.set_flops(total_ops)
+        ret["non-frag sparse"] = min_sparse_res
     if "ideal sparse" in perf_eva_list:
-        ret["ideal sparse"] = (total_sparse_lat, total_ops / total_sparse_lat / 1e12 , total_sparse_util)
+        ideal_sparse_res.set_flops(total_ops)
+        ret["ideal sparse"] = ideal_sparse_res
     if "sparse baseline" in perf_eva_list:
-        ret["sparse baseline"] = (total_sparse_baseline_lat, total_ops / total_sparse_baseline_lat / 1e12, total_sparse_baseline_util)
+        sparse_baseline_res.set_flops(total_ops)
+        ret["sparse baseline"] = sparse_baseline_res
+    if "sparse rorp" in perf_eva_list:
+        sparse_rorp_res.set_flops(total_ops)
+        ret["sparse rorp"] = sparse_rorp_res
     
-    return res_df, ret
+    return ret
 
 def compute_stacked_matmul_performance(
         mats_lists, 
@@ -230,12 +282,11 @@ def compute_stacked_matmul_performance(
         '''
         compute latency of single list
         '''
-        accepted_ctype = ["base", "ideal", "ideal sparse", "sparse baseline"]
+        accepted_ctype = ["dense", "non-frag sparse", "ideal sparse", "sparse baseline", "sparse rorp"]
         is_ctype_correct = all(t in accepted_ctype for t in compute_type)
         assert is_ctype_correct, "Incorrect compute type!"
 
         perf_list = {i: {k: {t: (0.0, []) for t in compute_type} for k in mat_labels} for i in mat_names}
-        print("init perf list: ", perf_list)
 
         for model_name in mat_names:
             for m in mats_list[model_name]:
@@ -274,7 +325,7 @@ def compute_stacked_matmul_performance(
                 print(f"mat name: {model_name} {m['label']}, repeat {m['repeat']} times, loading: {is_loading_from_file}")
                 print(f"mat shape: {mat_data.shape}")
 
-                _, res_table = \
+                res_table = \
                     compute_matmul_performance(mat_data, 
                                             chain_len, 
                                             m["size"][-1], 
@@ -290,7 +341,7 @@ def compute_stacked_matmul_performance(
                 for t in compute_type:
                     #TODO: why accumulating along compute type?
                     perf_list[model_name][m["label"]][t] = \
-                        (res_table[t][0] * m["repeat"], res_table[t][1])
+                        (res_table[t].total_lat * m["repeat"], res_table[t].total_flops)
 
         return perf_list
      
@@ -436,7 +487,8 @@ def plot_perf_sparsity(data_path, output_path, chain_len_list, hw_array_shape_li
         else:
             mixed_chain_len = None
 
-        res_df, sparse_lat, ideal_lat, base_lat = compute_matmul_performance(data_path, chain_len, 768, \
+        #TODO: fix return type specification
+        res_df, res = compute_matmul_performance(data_path, chain_len, 768, \
                                                             hw_array_shape, sort_row_sparsity, \
                                                             using_single_column, sparse_block_size, freq, \
                                                             seq_len_path, seq_len_range, \
@@ -1048,7 +1100,7 @@ def main():
     # Evaulating sparse 
     # construct multiple instances of the llama inference
     layer_ids = np.arange(0, num_layers, 1)
-    insts_idx = list(range(2))
+    insts_idx = list(range(50))
 
     # explore the distance of the dense values
     # attn_path_list = \
@@ -1079,7 +1131,7 @@ def main():
             attn_path_flongseq = f"/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/seqlen_2048_interp_llama7bhf/attn_s{i}b0.pt"
             attn_path_opt350m = f"/chronos_data/tji/opt_350m_sparse_attn/attn_s{i}b0.pt"
             #figure out actual seq len
-            attn = torch.load(attn_path_flongseq)
+            attn = torch.load(attn_path_7b)
             seq_len = attn.size()[-1]
 
             print(f"loaded seq len: {seq_len}")
@@ -1117,7 +1169,7 @@ def main():
             mats_llama_attnv_only = {\
                 "compress blue":
                     [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.6, "label": "attxv", "repeat": 32,
-                        "file": attn_path_flongseq}],
+                        "file": attn_path_7b}],
                 }
 
             mats_opt350m = {\
@@ -1161,7 +1213,7 @@ def main():
 
         compute_stacked_matmul_performance(mats_list, 14, (2, 123), 
                                         layer_idx, 
-                                        lat_compute_type=["ideal sparse", "sparse baseline"], 
+                                        lat_compute_type=["ideal sparse", "sparse baseline", "sparse rorp"], 
                                         plot_figure=False)
     exit()
 
