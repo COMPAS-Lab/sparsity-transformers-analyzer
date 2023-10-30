@@ -363,7 +363,7 @@ def compute_stacked_matmul_performance(
 
     # temporarily store the results to a file
     import json
-    with open(f"res_fig/new_baseline/row_part/src_data_layer_{layer_idx}.json", "w") as fp:
+    with open(f"res_fig/temp/src_data_layer_{layer_idx}.json", "w") as fp:
         json.dump(avg_perf_list, fp)
 
     if plot_figure:
@@ -1095,12 +1095,12 @@ def dense_val_dist_histogram(inst_paths: list[str], row_size: int, num_anchor_co
 def main():
     data_path = "/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/"
     output_path = "./res_fig/"
-    num_layers = 32
+    num_layers = 28
 
     # Evaulating sparse 
     # construct multiple instances of the llama inference
     layer_ids = np.arange(0, num_layers, 1)
-    insts_idx = list(range(50))
+    insts_idx = list(range(8))
 
     # explore the distance of the dense values
     # attn_path_list = \
@@ -1130,8 +1130,9 @@ def main():
             attn_path_7b = f"/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/llama-7b-hf-attsample/attn_s{i}b0.pt"
             attn_path_flongseq = f"/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/seqlen_2048_interp_llama7bhf/attn_s{i}b0.pt"
             attn_path_opt350m = f"/chronos_data/tji/opt_350m_sparse_attn/attn_s{i}b0.pt"
+            attn_path_chatglm = f"/chronos_data/tji/.huggingface_cache/transformers/chatglm2-6b-32k-attn-bfp20-1e-3/attn_s{i}.pt"
             #figure out actual seq len
-            attn = torch.load(attn_path_7b)
+            attn = torch.load(attn_path_chatglm)
             seq_len = attn.size()[-1]
 
             print(f"loaded seq len: {seq_len}")
@@ -1172,6 +1173,12 @@ def main():
                         "file": attn_path_7b}],
                 }
 
+            mats_chatglm2_attnv_only = {\
+                "compress blue":
+                    [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.6, "label": "attxv", "repeat": 32,
+                        "file": attn_path_chatglm}],
+            }
+
             mats_opt350m = {\
                 "compress blue":
                     [{"size": [seq_len, seq_len, seq_len, 64], "row_sparsity": 0.6, "label": "attxv", "repeat": 16,
@@ -1209,7 +1216,7 @@ def main():
                     [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],
                 }
         
-            mats_list.append(mats_llama_attnv_only)
+            mats_list.append(mats_chatglm2_attnv_only)
 
         compute_stacked_matmul_performance(mats_list, 14, (2, 123), 
                                         layer_idx, 

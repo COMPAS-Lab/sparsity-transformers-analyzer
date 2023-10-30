@@ -103,7 +103,7 @@ def multiport_congestion_analysis(attn,
         
         return total_loaded_access, total_ori_loaded_access
         
-    flatten_attn = np.resize(attn, attn_flatten_size)
+    flatten_attn = np.reshape(attn, attn_flatten_size)
     all_loaded_ratio = []
     num_all_actual_cycles, num_all_ideal_cycles = [], []
     for a in tqdm(flatten_attn, unit=" mat"):
@@ -176,7 +176,7 @@ def multiway_congestion_dist_analysis(
 
         return total_loaded_access
         
-    flatten_attn = np.resize(attn, attn_flatten_size)
+    flatten_attn = np.reshape(attn, attn_flatten_size)
     all_loaded_access = [[] for p in range(num_ports)]
     for a in flatten_attn:
         mat_loaded_access = analyze_multiport_balance(a)
@@ -198,9 +198,18 @@ def multiway_congestion_dist_analysis(
     return
 
 
-def col_rep_2_m20k(rep_time, col_range, max_len_per_memseg, num_memseg, bcol_per_buffer, num_tc_cols):
+def col_rep_2_m20k(rep_time, 
+                   col_range, 
+                   max_len_per_memseg, 
+                   num_memseg, 
+                   bcol_per_buffer, 
+                   num_tc_cols,
+                   using_dp=True):
     ALL_M20K = 6847.0
     M20K_SIZE = 20480.0
+
+    def round_to_2(x): return ceil(float(x)/2.)
+
     base_single_buffer_size = max_len_per_memseg * 16.0 * bcol_per_buffer
 
     num_full_rep_memseg = floor(col_range / max_len_per_memseg)
@@ -209,13 +218,22 @@ def col_rep_2_m20k(rep_time, col_range, max_len_per_memseg, num_memseg, bcol_per
     num_replicated_memseg = ceil(float(col_range) / max_len_per_memseg)
     num_unreplicated_memseg = float(num_memseg - num_replicated_memseg)
     unreplicated_m20k = ceil(base_single_buffer_size / M20K_SIZE) * num_unreplicated_memseg
-    replicated_m20k = ceil(base_single_buffer_size / M20K_SIZE) * (rep_time + 1)  * num_full_rep_memseg + \
-                        ceil(base_single_buffer_size / M20K_SIZE) + \
-                        ceil((partial_rep_col_range * 16 * bcol_per_buffer) / M20K_SIZE) * rep_time
+    # compute the replicated m20k part in 2 steps
+    # 1. the part that's fully replicated, might be multiple banks
+    replicated_m20k = ceil(base_single_buffer_size / M20K_SIZE) * (rep_time + 1)  * num_full_rep_memseg
+    if using_dp:
+        replicated_m20k = round_to_2(replicated_m20k)
+    # 2. the part that's paritially replicated, could only happen to at most 1 bank
+    replicated_m20k_part = ceil(base_single_buffer_size / M20K_SIZE) + \
+        ceil((partial_rep_col_range * 16 * bcol_per_buffer) / M20K_SIZE) * rep_time
+    if using_dp:
+        replicated_m20k_part = round_to_2(replicated_m20k_part)
+    replicated_m20k += replicated_m20k_part
     
     print(f"#unreplicated and #replicated: {unreplicated_m20k} and {replicated_m20k}")
     print(f"base: {base_single_buffer_size/M20K_SIZE}")
     m20k_ratio = (unreplicated_m20k + replicated_m20k) * num_tc_cols / ALL_M20K
+    print(f"mem size: {m20k_ratio}")
 
     return m20k_ratio
 
@@ -236,8 +254,8 @@ def mem_acc_cycle_diff_numports(num_ports: tuple[int, int, int],
             all_seq_len.append(src_attn.shape[-1])
             res = multiport_congestion_analysis(src_attn, 
                                     (-1, src_attn.shape[-2], src_attn.shape[-1]), 
-                                    num_ports=curr_num_ports, num_tc_access=num_tc_access, num_replication=10, 
-                                    cached_range_in_col=(0, 5), is_plot_figure=True)
+                                    num_ports=curr_num_ports, num_tc_access=num_tc_access, num_replication=100, 
+                                    cached_range_in_col=(0, 100), is_plot_figure=False)
             all_access_cycles_list += [res[0]]
             all_ideal_cycles_list += [res[1]]
         avg_access += [(np.mean(all_access_cycles_list), np.mean(all_ideal_cycles_list))]
@@ -285,7 +303,7 @@ def mem_acc_cycle_diff_cached_cols(num_cached_cols: tuple[int, int, int],
             res = multiport_congestion_analysis(src_attn, 
                                     (-1, src_attn.shape[-2], src_attn.shape[-1]), 
                                     num_ports=num_ports, num_tc_access=num_tc_access, num_replication=num_tc_access,
-                                    cached_range_in_col=(0, curr_cached_cols), is_plot_figure=True)
+                                    cached_range_in_col=(0, curr_cached_cols), is_plot_figure=False)
             all_access_cycles_list += [res[0]]
             all_ideal_cycles_list += [res[1]]
         avg_access += [(np.mean(all_access_cycles_list), np.mean(all_ideal_cycles_list))]
@@ -334,7 +352,7 @@ def mem_acc_cycle_diff_rep_times(num_rep_times: tuple[int, int, int],
             res = multiport_congestion_analysis(src_attn, 
                                     (-1, src_attn.shape[-2], src_attn.shape[-1]), 
                                     num_ports=num_ports, num_tc_access=num_tc_access, num_replication=curr_rep_time,
-                                    cached_range_in_col=(0, cached_range), is_plot_figure=True)
+                                    cached_range_in_col=(0, cached_range), is_plot_figure=False)
             all_access_cycles_list += [res[0]]
             all_ideal_cycles_list += [res[1]]
         avg_access += [(np.mean(all_access_cycles_list), np.mean(all_ideal_cycles_list))]
@@ -365,9 +383,13 @@ def mem_acc_cycle_diff_rep_times(num_rep_times: tuple[int, int, int],
 
 
 def analyze_rep_cols_vs_m20k(rep_time, col_range):
-    max_len = 500
+    max_len = 32768
     num_memseg = 20
-    res = [col_rep_2_m20k(rep_time, c, max_len / num_memseg, num_memseg, 64, 2) for c in col_range]
+    res = [col_rep_2_m20k(rep_time, 
+                          c, 
+                          max_len / num_memseg, 
+                          num_memseg, 64, 2, 
+                          using_dp=True) for c in col_range]
 
     plt.figure()
     plt.plot(col_range, res, marker="s", color="b")
@@ -376,16 +398,18 @@ def analyze_rep_cols_vs_m20k(rep_time, col_range):
     plt.xlim(xmin=0)
     plt.ylim(ymin=0)
     # plt.legend()
-    plt.savefig(f"./res_fig/temp/cols_vs_m20k.png")
+    plt.savefig(f"./res_fig/temp/cols_vs_m20k_dp.png")
     plt.close()
 
 if __name__ == "__main__":
     target_len = 2048
     selected_idx = random.sample(list(range(100)), 50)
+    selected_idx = [0, 3]
     ref_attn_list = [f"/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/" + \
                     f"llama-7b-hf-attsample/attn_s{i}b0.pt" for i in selected_idx]
-    
-    mem_acc_cycle_diff_numports((2, 24, 2), 123, ref_attn_list)
-    mem_acc_cycle_diff_cached_cols((1, 100, 5), 20, 123, ref_attn_list)
-    mem_acc_cycle_diff_rep_times((1, 124, 1), 20, 123, 30, ref_attn_list)
-    analyze_rep_cols_vs_m20k(123, np.arange(5, 100, 5))
+    ref_attn_list = [f"/chronos_data/tji/.huggingface_cache/transformers/" + \
+                     f"chatglm2-6b-32k-attn-bfp20-1e-3/attn_s{i}.pt" for i in selected_idx]
+    # mem_acc_cycle_diff_numports((2, 24, 2), 123, ref_attn_list)
+    # mem_acc_cycle_diff_cached_cols((1, 2000, 100), 20, 123, ref_attn_list)
+    # mem_acc_cycle_diff_rep_times((1, 60, 10), 20, 123, 1500, ref_attn_list)
+    analyze_rep_cols_vs_m20k(20, np.arange(100, 2000, 100))
