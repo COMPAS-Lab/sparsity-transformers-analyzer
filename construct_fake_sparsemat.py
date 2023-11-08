@@ -4,7 +4,7 @@ import random
 from tqdm import tqdm
 from scipy import optimize
 from math import ceil, floor
-from sparse_tensor_analyzer import distance_of_dense_vals_per_row
+from sparse_tensor_analyzer import distance_of_dense_vals_per_row, dense_val_idx_histogram, plot_stacked_heatmap_inst
 from matplotlib import pyplot as plt
 
 def gen_spmat_by_sparsity(ref_mat: np.array, 
@@ -80,8 +80,9 @@ def gen_spmat_by_sparsity(ref_mat: np.array,
 
 def explore_row_features(mats: list, inst_idx: int):
     row_spar_list, row_dist_list, row_first_dval_list = [], [], []
-
+    mats = mats[:4,:4,:,:]
     for ref_mat_l in mats:
+        print(f"mat shape: {ref_mat_l.shape}")
         for ref_mat_h in ref_mat_l:
             row_spar = np.count_nonzero(ref_mat_h, axis=-1)
             row_dist, _ = distance_of_dense_vals_per_row(ref_mat_h, row_size=1)
@@ -121,6 +122,13 @@ def explore_row_features(mats: list, inst_idx: int):
 
 
 if __name__ == "__main__":
+    inst_idx = 4
+    attn_path_chatglm = f"/chronos_data/tji/.huggingface_cache/transformers/chatglm2-6b-32k-attn-bfp20-1e-3/attn_s{inst_idx}.pt"
+    # src_attn = torch.load(attn_path_chatglm).numpy()
+    # explore_row_features(src_attn, inst_idx=inst_idx)
+    # dense_val_idx_histogram([attn_path_chatglm], 50)
+    plot_stacked_heatmap_inst(attn_path_chatglm, 50)
+    exit()
     target_len = 2048
 
     for i in range(1):

@@ -11,6 +11,7 @@ from scipy.spatial.distance import hamming
 from math import ceil, floor, sqrt
 import random
 import multiprocessing
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Literal
 from functools import reduce
@@ -102,6 +103,45 @@ def prepare_wei_dat(data_path):
     print("load weight with shape ", w.shape)
     return w
 
+def get_tccore_config_by_row(tccore_col: float, core_tc_util=990.0, mat_b_col=128.0):
+    '''
+    return the tccore config with a given tccore row and util
+    return tuple(row, chain len)
+    '''
+    # 1. define range of the rows
+    def possible_max_row():
+        min_loading_lat = 3 * (0 + 1.)
+        max_row = mat_b_col / min_loading_lat
+        return max_row
+    
+    # 2. according to the row, define possible chain_len
+    def possible_chainlen(row):
+        max_chainlen = floor(mat_b_col / row / 3.0 - 1.0)
+        if max_chainlen > 1:
+            return range(1, max_chainlen)
+        else:
+            return None
+
+    # 3. sweep across possible rows and chain_len, find the max sta util config
+    def get_sta_util(r, clen):
+        return (clen + 2.0) * r * tccore_col / core_tc_util
+    
+    max_sta_util, curr_sta_util= 0., 0.
+    curr_res = None
+    for r in range(1, ceil(possible_max_row())):
+        clen_range = possible_chainlen(r)
+        if clen_range is not None:
+            for clen in clen_range:
+                curr_sta_util = get_sta_util(clen, r)
+                if curr_sta_util < 1.0 and curr_sta_util > max_sta_util:
+                    max_sta_util = curr_sta_util
+                    curr_res = (r, clen)
+
+    if max_sta_util == 0.0 and curr_sta_util == 0.0:
+        return None
+    else:
+        return curr_res
+    
 @dataclass
 class PerfData:
     total_lat: float = 0.
@@ -268,7 +308,8 @@ def compute_stacked_matmul_performance(
         hw_array_shape, 
         layer_idx=0, 
         lat_compute_type=["sparse"], 
-        plot_figure=False):
+        plot_figure=False,
+        res_json_path="res_fig"):
     '''compute and plot performance of multiple mats in the transformers'''
 
     mat_labels = [k["label"] for k in list(mats_lists[0].values())[0]]
@@ -363,7 +404,7 @@ def compute_stacked_matmul_performance(
 
     # temporarily store the results to a file
     import json
-    with open(f"res_fig/temp/src_data_layer_{layer_idx}.json", "w") as fp:
+    with open(f"{res_json_path}/src_data_layer_{layer_idx}.json", "w") as fp:
         json.dump(avg_perf_list, fp)
 
     if plot_figure:
@@ -1042,7 +1083,7 @@ def distance_of_dense_vals_per_row(mat: np.array, row_size: int, num_anchor_cols
         per_block_sparsity = [get_mat_sparsity(m) for m in dense_mask]
     else:
         merged_dense_mask = dense_mask
-        dense_vals = np.count_nonzero(merged_dense_mask, axis=-1).astype(np.float)
+        dense_vals = np.count_nonzero(merged_dense_mask, axis=-1).astype(float)
         per_block_sparsity = 1. - dense_vals / merged_dense_mask.shape[-1]
 
     first_dense_col_idx = np.argmax(merged_dense_mask, axis=-1)
@@ -1050,6 +1091,27 @@ def distance_of_dense_vals_per_row(mat: np.array, row_size: int, num_anchor_cols
     last_dense_col_idx = np.argmax(neighboring_dist, axis=-1)
     dist = last_dense_col_idx - first_dense_col_idx
     return dist, per_block_sparsity
+
+def dense_val_idx_histogram(inst_paths: list[str], n_mat_samples = -1):
+    dense_col_idx_list = []
+    for i in inst_paths:
+        attn = torch.load(i).numpy()
+        attn = attn.reshape(-1, attn.shape[-1], attn.shape[-1])
+        print(f"inst mat size: {attn.shape}")
+        if n_mat_samples > 0:
+            sampled_idx = random.sample(list(range(attn.shape[0])), n_mat_samples)
+            attn = attn[sampled_idx,:,:]
+        
+        dense_val_col_idx = np.where(attn > 0.0)[-1]
+        dense_col_idx_list += list(dense_val_col_idx)
+
+    fig, ax = plt.subplots()
+    ax.hist(dense_col_idx_list, 30)
+    ax.set_xlabel("dense val index")
+    ax.set_ylabel("count")
+    plt.ylim(ymin=0)
+    fig.savefig("./res_fig/denseval_col_dist.png")
+    plt.clf()
 
 def dense_val_dist_histogram(inst_paths: list[str], row_size: int, num_anchor_cols = 0):
     dense_distances = []
@@ -1092,6 +1154,29 @@ def dense_val_dist_histogram(inst_paths: list[str], row_size: int, num_anchor_co
     
     return dists_stat
 
+def plot_stacked_heatmap_inst(inst_path: str, n_mat_sample = -1):
+    dat = torch.load(inst_path).numpy()
+    seq_len = dat.shape[-1]
+    dat = np.reshape(dat, [-1, seq_len, seq_len])
+    if n_mat_sample > 0:
+        selected_dat = random.sample(list(dat), n_mat_sample)
+    else:
+        selected_dat = list(dat)
+
+    dval_idces = [np.where(m > 0.0) for m in selected_dat]
+    
+    fig, ax = plt.subplots()    
+    ax.invert_yaxis()
+    ax.set_ylim(ymin=seq_len, ymax=0)
+    ax.set_xlim(xmin=0, xmax=seq_len)
+    ax.tick_params(top=True, bottom=False)
+    for dval_idx in dval_idces:
+        ax.plot(dval_idx[1], dval_idx[0], marker=".", markersize=2, alpha=0.005, color="red")
+
+    fig.savefig("./res_fig/temp/denseval_heatmap.png")
+    fig.clf()
+
+
 def main():
     data_path = "/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/"
     output_path = "./res_fig/"
@@ -1099,8 +1184,8 @@ def main():
 
     # Evaulating sparse 
     # construct multiple instances of the llama inference
-    layer_ids = np.arange(0, num_layers, 1)
-    insts_idx = list(range(8))
+    layer_ids = np.arange(1, num_layers, 1)
+    insts_idx = [3, 5]
 
     # explore the distance of the dense values
     # attn_path_list = \
@@ -1218,10 +1303,27 @@ def main():
         
             mats_list.append(mats_chatglm2_attnv_only)
 
-        compute_stacked_matmul_performance(mats_list, 14, (2, 123), 
-                                        layer_idx, 
-                                        lat_compute_type=["ideal sparse", "sparse baseline", "sparse rorp"], 
-                                        plot_figure=False)
+        possible_col_list = [5, 10, 15, 20, 25]
+        for c in possible_col_list:
+            config = get_tccore_config_by_row(c, 800)
+            if config is not None:
+                r, clen = config[0], config[1]
+                print(f"selecting config {r}, {c}, {clen}")
+                rpath = f"res_fig/ssubcore_experi_samecolnbanks/config_{r}_{c}_{clen}"
+                Path(rpath).mkdir(parents=True, exist_ok=True)
+                compute_stacked_matmul_performance(mats_list, clen, (r, c), 
+                                                layer_idx, 
+                                                lat_compute_type=["ideal sparse", "sparse baseline", "sparse rorp"], 
+                                                plot_figure=False,
+                                                res_json_path=rpath)
+                
+        # rpath = f"res_fig/temp"
+        # Path(rpath).mkdir(parents=True, exist_ok=True)
+        # compute_stacked_matmul_performance(mats_list, 14, (2, 123), 
+        #                                 layer_idx, 
+        #                                 lat_compute_type=["ideal sparse", "sparse baseline", "sparse rorp"], 
+        #                                 plot_figure=False,
+        #                                 res_json_path=rpath)
     exit()
 
     # print_compress_ratio()

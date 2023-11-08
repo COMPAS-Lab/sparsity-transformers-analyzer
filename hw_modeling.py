@@ -884,7 +884,8 @@ class StratixDpuModel(DpuModel):
             # figure out actual time of each group loading
             for row_iter_idx, a_rows_per_iter in enumerate(a_row_iters):
                 a_loading_iters, b_selecting_lats = [], 0.
-                grp_bsel_access, _ = get_matB_access_by_matA_iter(a_rows_per_iter, (0, 750), 20, 15)
+                # grp_bsel_access, _ = get_matB_access_by_matA_iter(a_rows_per_iter, (0, 750), 20, 15)
+                grp_bsel_access, _ = get_matB_access_by_matA_iter(a_rows_per_iter, (0, 750), self.NUM_TCC_COLS, self.NUM_TCC_COLS)
                 b_selecting_lats = np.amax([len(access) for access in grp_bsel_access])
                 for a_grps in a_rows_per_iter:
                     # source of imbalance from A row sparsity diversity

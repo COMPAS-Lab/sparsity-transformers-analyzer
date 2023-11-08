@@ -13,6 +13,10 @@ def get_matB_access_by_matA_iter(rows: list,
     calculate latency of mat B selection based on each matA
     iteration (represented by some rows from matA that exactly
     constructs an A loading iteration)
+    rows: mat A rows being loaded, same to the number of hardware cols
+    replicated_range: range of elements in each mat b col vector being replicated
+    num_ports: number of banks of the mat b buffer
+    num_replication: num of copies of the replication
     '''
     # init results
     loaded_access = [[] for p in range(num_ports)]
@@ -34,6 +38,10 @@ def get_matB_access_by_matA_iter(rows: list,
         # maintain the original load here
         curr_ori_loaded_access = curr_loaded_access[:]
         # check replicated mem access in every section
+        outport_quota = num_ports
+        curr_occupied_outports = 0
+        # assuming the num_ports equals to the number of tc cols
+        assert num_ports == len(rows), "invalid bank config! Violating #bank == #tc cols"
         for sec_idx in range(num_ports):
             if replicated_range[1] > mem_segment_idx[sec_idx]:
                 # first filter out uncached ones
@@ -46,7 +54,8 @@ def get_matB_access_by_matA_iter(rows: list,
                     curr_loaded_access[sec_idx] = all_access_np[uncacheable_access_idx].tolist()
                     if len(curr_ori_loaded_access[sec_idx]) > len(curr_loaded_access[sec_idx]):
                         # deal with the situation that there are cached contents being accessed
-                        curr_loaded_access[sec_idx] = [-1] * cacheable_access_iter + all_access_np[uncacheable_access_idx].tolist()
+                        curr_loaded_access[sec_idx] = [-1] * cacheable_access_iter + \
+                                                        all_access_np[uncacheable_access_idx].tolist()
                 elif curr_loaded_access[sec_idx]:
                     # deal with the situation that only cached contents are accessed
                     curr_loaded_access[sec_idx] = [-1] * cacheable_access_iter
@@ -401,6 +410,7 @@ def analyze_rep_cols_vs_m20k(rep_time, col_range):
     plt.savefig(f"./res_fig/temp/cols_vs_m20k_dp.png")
     plt.close()
 
+
 if __name__ == "__main__":
     target_len = 2048
     selected_idx = random.sample(list(range(100)), 50)
@@ -412,4 +422,9 @@ if __name__ == "__main__":
     # mem_acc_cycle_diff_numports((2, 24, 2), 123, ref_attn_list)
     # mem_acc_cycle_diff_cached_cols((1, 2000, 100), 20, 123, ref_attn_list)
     # mem_acc_cycle_diff_rep_times((1, 60, 10), 20, 123, 1500, ref_attn_list)
-    analyze_rep_cols_vs_m20k(20, np.arange(100, 2000, 100))
+    # analyze_rep_cols_vs_m20k(20, np.arange(100, 2000, 100))
+
+    for i in range(1, 25):
+        res = get_tccore_config_by_row(i, core_tc_util=800.0)
+        if res is not None:
+            print(f"col: {i}, row: {res[0]}, clen: {res[1]}")
