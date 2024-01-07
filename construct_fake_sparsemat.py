@@ -6,6 +6,8 @@ from scipy import optimize
 from math import ceil, floor
 from sparse_tensor_analyzer import distance_of_dense_vals_per_row, dense_val_idx_histogram, plot_stacked_heatmap_inst
 from matplotlib import pyplot as plt
+from os import listdir
+from os.path import isfile
 
 def gen_spmat_by_sparsity(ref_mat: np.array, 
                           target_seqlen: int, 
@@ -123,11 +125,19 @@ def explore_row_features(mats: list, inst_idx: int):
 
 if __name__ == "__main__":
     inst_idx = 4
-    attn_path_chatglm = f"/chronos_data/tji/.huggingface_cache/transformers/chatglm2-6b-32k-attn-bfp20-1e-3/attn_s{inst_idx}.pt"
+    base_attn_path = f"/chronos_data/tji/.huggingface_cache/transformers/chatglm2-6b-32k-attn-bfp20-1e-3-sta/"
+    # list all insts
+    inst_list = [f.split(".")[0] \
+                 for f in listdir(base_attn_path) \
+                    if isfile(base_attn_path + f) and f[0] == "i" and f.endswith(".pt")]
+    
+    inst_list = random.sample(inst_list, 1)
     # src_attn = torch.load(attn_path_chatglm).numpy()
     # explore_row_features(src_attn, inst_idx=inst_idx)
     # dense_val_idx_histogram([attn_path_chatglm], 50)
-    plot_stacked_heatmap_inst(attn_path_chatglm, 50)
+    plot_stacked_heatmap_inst([base_attn_path + p + ".pt" for p in inst_list], \
+                              [base_attn_path + p + ".json" for p in inst_list], \
+                              f"./res_fig/temp/{inst_list[0]}")
     exit()
     target_len = 2048
 

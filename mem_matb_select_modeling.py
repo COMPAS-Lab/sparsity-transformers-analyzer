@@ -4,6 +4,10 @@ import random
 from tqdm import tqdm
 from math import ceil, floor
 from matplotlib import pyplot as plt
+from itertools import product
+
+ALL_M20K = 6847.0
+M20K_SIZE = 20480.0
 
 def get_matB_access_by_matA_iter(rows: list, 
                                  replicated_range: tuple, 
@@ -391,7 +395,7 @@ def mem_acc_cycle_diff_rep_times(num_rep_times: tuple[int, int, int],
     plt.close()
 
 
-def analyze_rep_cols_vs_m20k(rep_time, col_range):
+def analyze_rep_cols_vs_m20k(rep_time: int, col_range: list[int]):
     max_len = 32768
     num_memseg = 20
     res = [col_rep_2_m20k(rep_time, 
@@ -411,6 +415,71 @@ def analyze_rep_cols_vs_m20k(rep_time, col_range):
     plt.close()
 
 
+def analyze_localmem_size(seq_len: int, num_cached_bvec: int):
+    # define the triangle region that's static
+    sta_sel_region = {"bot_l": seq_len * 0.2, "top": seq_len * 0.6}
+    sta_sel_region = {k: ceil(v) for k, v in sta_sel_region.items()}
+    sta_sel_region["bot_r"] = sta_sel_region["top"] + sta_sel_region["bot_l"]
+    cached_max_elems_per_vector = sta_sel_region["bot_l"] + seq_len - sta_sel_region["bot_r"]
+    mem_size = float(cached_max_elems_per_vector * num_cached_bvec * 16) / M20K_SIZE
+    mem_size /= ALL_M20K
+    return mem_size
+
+
+def analyze_localmem_bandwidth(
+        attn_path: str, 
+        num_tcchain_cols: int, 
+        num_cached_bvec: int, 
+        n_mat_samples = -1):
+    # load attention
+    dat = torch.load(attn_path).numpy()
+    seq_len = dat.shape[-1]
+    dat = np.reshape(dat, [-1, seq_len, seq_len])
+    if n_mat_samples > 0:
+        selected_dat = random.sample(list(dat), n_mat_samples)
+    else:
+        selected_dat = list(dat)
+
+    # define the region with static sparse pattern
+    sta_sel_region = {"bot_l": seq_len * 0.2, "top": seq_len * 0.6}
+    sta_sel_region = {k: ceil(v) for k, v in sta_sel_region.items()}
+    sta_sel_region["bot_r"] = sta_sel_region["top"] + sta_sel_region["bot_l"]
+    
+    # assuming the first tc core, get the interleaved Arows being loaded
+    tc_access_grpsize = ceil(float(seq_len) / float(num_tcchain_cols))
+    def construct_rowgrp():
+        row_idx_in_same_grp = np.arange(0, tc_access_grpsize, num_tcchain_cols)
+        for i, j in product(row_idx_in_same_grp, list(range(num_tcchain_cols))):
+            yield j * tc_access_grpsize + i
+    
+    row_grp_idx = list(construct_rowgrp())        
+    def get_dyna_sel_region_from_mat():
+        sta_sel_region = {"bot_l": seq_len * 0.2, "top": seq_len * 0.6}
+        sta_sel_region = {k: ceil(v) for k, v in sta_sel_region.items()}
+        sta_sel_region["bot_r"] = sta_sel_region["top"] + sta_sel_region["bot_l"]
+
+        num_denseval_lst = []
+        for ridx in row_grp_idx:
+            seg_1 = (0, max(ridx+1, sta_sel_region["bot_l"]))
+            seg_2 = (ridx + 1 - (seq_len - sta_sel_region["bot_r"]), ridx + 1)
+            curr_row = mat[ridx,:]
+            curr_denseval = curr_row[seg_1[0]:seg_1[1]]
+            if seg_2[0] > -1:
+                curr_denseval = np.append(curr_denseval, curr_row[seg_2[0]:seg_2[1]])
+            curr_num_denseval = np.count_nonzero(curr_denseval)
+            num_denseval_lst.append(curr_num_denseval)
+
+        return num_denseval_lst
+    
+    tp_lst = []
+    for mat in selected_dat:
+        lat_in_cycle = get_dyna_sel_region_from_mat()
+        num_bits_selected = np.sum(lat_in_cycle) * 16 * num_cached_bvec
+        curr_tp = float(num_bits_selected) / lat_in_cycle
+        tp_lst.append(curr_tp)
+
+    return tp_lst
+
 if __name__ == "__main__":
     target_len = 2048
     selected_idx = random.sample(list(range(100)), 50)
@@ -424,7 +493,5 @@ if __name__ == "__main__":
     # mem_acc_cycle_diff_rep_times((1, 60, 10), 20, 123, 1500, ref_attn_list)
     # analyze_rep_cols_vs_m20k(20, np.arange(100, 2000, 100))
 
-    for i in range(1, 25):
-        res = get_tccore_config_by_row(i, core_tc_util=800.0)
-        if res is not None:
-            print(f"col: {i}, row: {res[0]}, clen: {res[1]}")
+    mem_size = analyze_localmem_size(4096, 64)
+    print(mem_size)

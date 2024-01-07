@@ -13,7 +13,9 @@ import random
 import multiprocessing
 from pathlib import Path
 from dataclasses import dataclass, field
+from itertools import product
 from typing import Literal
+import json
 from functools import reduce
 from analyze_tcblock_vs_matsize import closest_factors_to_target
 
@@ -1154,27 +1156,72 @@ def dense_val_dist_histogram(inst_paths: list[str], row_size: int, num_anchor_co
     
     return dists_stat
 
-def plot_stacked_heatmap_inst(inst_path: str, n_mat_sample = -1):
-    dat = torch.load(inst_path).numpy()
-    seq_len = dat.shape[-1]
-    dat = np.reshape(dat, [-1, seq_len, seq_len])
-    if n_mat_sample > 0:
-        selected_dat = random.sample(list(dat), n_mat_sample)
-    else:
-        selected_dat = list(dat)
+def plot_stacked_heatmap_inst(inst_paths, prompt_info_paths, fig_path = None):
+    longest_seqlen = 0
+    for ipath in tqdm(inst_paths, unit="loads"):
+        dat = torch.load(ipath).numpy()
+        curr_seqlen = dat.shape[-1]
+        longest_seqlen = curr_seqlen if curr_seqlen > longest_seqlen else longest_seqlen
+        del dat
 
-    dval_idces = [np.where(m > 0.0) for m in selected_dat]
-    
-    fig, ax = plt.subplots()    
-    ax.invert_yaxis()
-    ax.set_ylim(ymin=seq_len, ymax=0)
-    ax.set_xlim(xmin=0, xmax=seq_len)
-    ax.tick_params(top=True, bottom=False)
-    for dval_idx in dval_idces:
-        ax.plot(dval_idx[1], dval_idx[0], marker=".", markersize=2, alpha=0.005, color="red")
+    for l_idx in tqdm(list(range(28)), unit="figs"):
+        fig, ax = plt.subplots(4, 8, figsize=(20, 10), dpi=200)
+        fig.tight_layout()
+        # set matplotlib params
+        for ax_id0, ax_id1 in product(range(4), range(8)):
+            ax[ax_id0][ax_id1].invert_yaxis()
+            ax[ax_id0][ax_id1].set_ylim(ymin=longest_seqlen, ymax=0)
+            ax[ax_id0][ax_id1].set_xlim(xmin=0, xmax=longest_seqlen)
+            ax[ax_id0][ax_id1].tick_params(top=True, bottom=False)
+            ax[ax_id0][ax_id1].set_box_aspect(1)
 
-    fig.savefig("./res_fig/temp/denseval_heatmap.png")
-    fig.clf()
+        for ipath, pipath in zip(inst_paths, prompt_info_paths):
+            dat = torch.load(ipath)[l_idx, :, :, :].numpy()
+            print(dat.shape)
+            for h_idx in range(32):
+                dval_idces = np.where(dat[h_idx] == True)
+                spar = 1. - np.count_nonzero(dat[h_idx]) / float(dat[h_idx].size)
+                with open(pipath) as f:
+                    pinfo = json.load(f)
+                print(pinfo["inst1"], pinfo["inst2"])
+                diff_r = pinfo["diff_mean"]
+                ax[h_idx//8][h_idx%8].set_title(f"spar: {spar:.3f}, diff: {diff_r:.3f}", fontsize=10)
+                ax[h_idx//8][h_idx%8].plot(dval_idces[1], dval_idces[0], marker=".", markersize=2, alpha=0.01, color="red")
+
+                ax[h_idx//8][h_idx%8].axvspan(pinfo["inst1"][0], pinfo["inst1"][1], alpha=0.8, facecolor='blue')
+                ax[h_idx//8][h_idx%8].axvspan(pinfo["inst2"][0], pinfo["inst2"][1], alpha=0.8, facecolor='green')
+            del dat
+        
+        if fig_path is None:
+            fig_path = f"./res_fig/temp"
+        
+        Path(fig_path).mkdir(parents=True, exist_ok=True)
+        fig.savefig(fig_path + f"/denseval_heatmap_l{l_idx}.png")
+        fig.clf()
+
+        # 15, 53
+        shead_lst = [(0, 27), (5, 17), (13, 13), (22, 8), (2, 9)]
+        for h in shead_lst:
+            dat = torch.load(inst_paths[0])[h[0], h[1], :, :].numpy()
+            fig, ax = plt.subplots(1, 1, figsize=(10, 10), dpi=300)
+            dval_idces = np.where(dat == True)
+            ax.invert_yaxis()
+            ax.set_ylim(ymin=longest_seqlen, ymax=0)
+            ax.set_xlim(xmin=0, xmax=longest_seqlen)
+            ax.tick_params(top=True, bottom=False)
+            ax.set_box_aspect(1)
+            spar = 1. - np.count_nonzero(dat) / float(dat.size)
+            ax.set_title(f"density: {spar:.4f}", fontsize=10)
+            ax.plot(dval_idces[1], dval_idces[0], marker=".", markersize=2, alpha=0.01, color="red")
+            with open(prompt_info_paths[0]) as f:
+                pinfo = json.load(f)
+            print(pinfo["inst1"], pinfo["inst2"])
+            ax.axvspan(pinfo["inst1"][0], pinfo["inst1"][1], alpha=0.8, facecolor='blue')
+            ax.axvspan(pinfo["inst2"][0], pinfo["inst2"][1], alpha=0.8, facecolor='green')
+
+            Path(fig_path).mkdir(parents=True, exist_ok=True)
+            fig.savefig(fig_path + f"/l{h[0]}h{h[1]}.png")
+            fig.clf()
 
 
 def main():
