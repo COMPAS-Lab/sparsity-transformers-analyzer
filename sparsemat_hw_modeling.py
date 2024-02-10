@@ -18,6 +18,8 @@ from typing import Literal
 import json
 from functools import reduce
 from analyze_tcblock_vs_matsize import closest_factors_to_target
+from os import listdir
+from os.path import isfile
 
 TCCORE_COL_SIZE = 3
 TCCORE_SIZE = 20
@@ -173,8 +175,13 @@ class PerfData:
 def compute_matmul_performance(data, chain_len, out_w, hw_array_shape, \
                                 sort_row_sparsity, using_single_column, sparse_block_size, freq=500, \
                                 sparsity=0.0, seq_len_path=None, seq_len_range=None, mixed_chain_length=None, \
-                                short_to_long_ratio=0.0, blocked_pruning=False, 
-                                perf_eva_list = ["dense", "non-frag sparse", "ideal sparse", "sparse baseline", "sparse rorp"]):
+                                short_to_long_ratio=0.0, adv_block_prune=False, 
+                                perf_eva_list = ["dense", 
+                                                 "non-frag sparse", 
+                                                 "ideal sparse", 
+                                                 "sparse baseline", 
+                                                 "blocked prune sparse",  
+                                                 "sparse rorp"]):
     '''
     compute latency, throughput and sparsity of a given sparse/dense matrix operation
     "dense": dense matmul
@@ -191,8 +198,8 @@ def compute_matmul_performance(data, chain_len, out_w, hw_array_shape, \
     pdtable_res = {"latency":[] ,"sparsity": [], "s2l ratio": [], "tp": []}
     ret = {k: None for k in perf_eva_list}
 
-    dense_res, ideal_sparse_res, min_sparse_res, sparse_baseline_res, sparse_rorp_res = \
-        PerfData(), PerfData(), PerfData(), PerfData(), PerfData()
+    dense_res, ideal_sparse_res, min_sparse_res, sparse_baseline_res, sparse_bprune_res, sparse_rorp_res = \
+        PerfData(), PerfData(), PerfData(), PerfData(), PerfData(), PerfData()
     
     total_ops = 0
     num_insts = len(bfp_att_probes)
@@ -234,10 +241,14 @@ def compute_matmul_performance(data, chain_len, out_w, hw_array_shape, \
                                 exp_dat=exps, freq=freq, num_tcs=3960, tcc_array_shape=hw_array_shape, \
                                 tcc_chainlen=chain_len)
                 sparse_model.set_tccore_size(TCCORE_SIZE)
-                sparse_flops, sparse_lat, sparse_util = sparse_model.tensor_fpga21_mat_sparse_flops(exps, \
-                                                            sort_row_sparsity, False, \
-                                                            using_single_column, sparse_block_size, \
-                                                            blocked_pruning=blocked_pruning)
+                sparse_flops, sparse_lat, sparse_util = \
+                    sparse_model.tensor_fpga21_mat_sparse_flops(sparse_mat=exps,
+                                                            sort_rows_by_sparsity=sort_row_sparsity,
+                                                            ideal=False, 
+                                                            using_single_column=using_single_column, 
+                                                            using_block_prune=False,
+                                                            sparse_block_size=1, 
+                                                            adv_block_prune=False)
             else:
                 sparse_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
                                                 exp_dat=exps, freq=freq, num_tcs=3960, tcc_array_shape=hw_array_shape, \
@@ -246,11 +257,41 @@ def compute_matmul_performance(data, chain_len, out_w, hw_array_shape, \
                 sparse_flops, sparse_lat, sparse_util = sparse_model.tensor_fpga21_mat_sparse_flops(exps, \
                                                             sort_row_sparsity, False, \
                                                             using_single_column, sparse_block_size, False, short_to_long_ratio, \
-                                                            blocked_pruning=blocked_pruning)
+                                                            adv_block_prune=adv_block_prune)
             ideal_sparse_res.total_lat += sparse_lat
             ideal_sparse_res.add_data(sparse_util, "util")
         else:
             sparse_flops, sparse_lat = -1, -1
+
+        if "blocked prune sparse" in perf_eva_list:
+            # evaluate sparse model
+            if mixed_chain_length is None:            
+                sparse_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
+                                exp_dat=exps, freq=freq, num_tcs=3960, tcc_array_shape=hw_array_shape, \
+                                tcc_chainlen=chain_len)
+                sparse_model.set_tccore_size(TCCORE_SIZE)
+                sparse_bp_flops, sparse_bp_lat, sparse_bp_util = \
+                    sparse_model.tensor_fpga21_mat_sparse_flops(sparse_mat=exps, \
+                                                            sort_rows_by_sparsity=sort_row_sparsity,
+                                                            ideal=False, 
+                                                            using_single_column=using_single_column, 
+                                                            sparse_block_size=sparse_block_size, 
+                                                            using_block_prune=True,
+                                                            adv_block_prune=adv_block_prune)
+            else:
+                sparse_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
+                                                exp_dat=exps, freq=freq, num_tcs=3960, tcc_array_shape=hw_array_shape, \
+                                                tcc_chainlen=mixed_chain_length)
+                sparse_model.set_tccore_size(TCCORE_SIZE)
+                sparse_bp_flops, sparse_bp_lat, sparse_bp_util = \
+                    sparse_model.tensor_fpga21_mat_sparse_flops(exps, \
+                                                            sort_row_sparsity, False, \
+                                                            using_single_column, sparse_block_size, False, short_to_long_ratio, \
+                                                            adv_block_prune=adv_block_prune)
+            sparse_bprune_res.total_lat += sparse_bp_lat
+            sparse_bprune_res.add_data(sparse_bp_util, "util")
+        else:
+            sparse_bp_flops, sparse_bp_lat = -1, -1
 
         if "sparse baseline" in perf_eva_list:
             sparse_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
@@ -295,6 +336,9 @@ def compute_matmul_performance(data, chain_len, out_w, hw_array_shape, \
     if "ideal sparse" in perf_eva_list:
         ideal_sparse_res.set_flops(total_ops)
         ret["ideal sparse"] = ideal_sparse_res
+    if "blocked prune sparse" in perf_eva_list:
+        sparse_bprune_res.set_flops(total_ops)
+        ret["blocked prune sparse"] = sparse_bprune_res
     if "sparse baseline" in perf_eva_list:
         sparse_baseline_res.set_flops(total_ops)
         ret["sparse baseline"] = sparse_baseline_res
@@ -325,7 +369,7 @@ def compute_stacked_matmul_performance(
         '''
         compute latency of single list
         '''
-        accepted_ctype = ["dense", "non-frag sparse", "ideal sparse", "sparse baseline", "sparse rorp"]
+        accepted_ctype = ["dense", "non-frag sparse", "ideal sparse", "sparse baseline", "blocked prune sparse", "sparse rorp"]
         is_ctype_correct = all(t in accepted_ctype for t in compute_type)
         assert is_ctype_correct, "Incorrect compute type!"
 
@@ -375,11 +419,11 @@ def compute_stacked_matmul_performance(
                                             hw_array_shape, 
                                             sort_row_sparsity=False, 
                                             using_single_column=False,  
-                                            sparse_block_size=1, 
+                                            sparse_block_size=20, 
                                             freq=300, \
                                             seq_len_path=None, seq_len_range=None, 
                                             mixed_chain_length=None, short_to_long_ratio=0.0, 
-                                            blocked_pruning=False, 
+                                            adv_block_prune=False, 
                                             perf_eva_list = compute_type)
                 for t in compute_type:
                     #TODO: why accumulating along compute type?
@@ -807,7 +851,7 @@ def single_case_analyzing(mat, out_size: tuple, hw_array_shape = None, chain_len
     sparse_flops, sparse_lat = sparse_model.tensor_fpga21_mat_sparse_flops(mat, \
                                                     sort_row_sparsity, False, \
                                                     using_single_column=False, sparse_block_size=1, \
-                                                    blocked_pruning=False)
+                                                    adv_block_prune=False)
 
     # create mat map for column pruning
     compressed_mat_map = []
@@ -849,7 +893,7 @@ def single_case_analyzing(mat, out_size: tuple, hw_array_shape = None, chain_len
     mixed_sparse_flops, mixed_sparse_lat = sparse_model.tensor_fpga21_mat_sparse_flops(mat, \
                                                 sort_row_sparsity, False, \
                                                 using_single_column=False, sparse_block_size=TCCORE_SIZE, \
-                                                blocked_pruning=True)
+                                                adv_block_prune=True)
     # create mat map for blocked pruning
     blocked_mat_map = []
     # then block them into 3xtc core size and select the max length to compute delay
@@ -1156,7 +1200,7 @@ def dense_val_dist_histogram(inst_paths: list[str], row_size: int, num_anchor_co
     
     return dists_stat
 
-def plot_stacked_heatmap_inst(inst_paths, prompt_info_paths, fig_path = None):
+def plot_stacked_heatmap_inst(inst_paths, prompt_info_paths, fig_path = None, plot_headsample = False):
     longest_seqlen = 0
     for ipath in tqdm(inst_paths, unit="loads"):
         dat = torch.load(ipath).numpy()
@@ -1184,8 +1228,11 @@ def plot_stacked_heatmap_inst(inst_paths, prompt_info_paths, fig_path = None):
                 with open(pipath) as f:
                     pinfo = json.load(f)
                 print(pinfo["inst1"], pinfo["inst2"])
-                diff_r = pinfo["diff_mean"]
-                ax[h_idx//8][h_idx%8].set_title(f"spar: {spar:.3f}, diff: {diff_r:.3f}", fontsize=10)
+                diff_r = pinfo.get("diff_mean", None)
+                if diff_r:
+                    ax[h_idx//8][h_idx%8].set_title(f"spar: {spar:.3f}, diff: {diff_r:.3f}", fontsize=10)
+                else:
+                    ax[h_idx//8][h_idx%8].set_title(f"spar: {spar:.3f}", fontsize=10)
                 ax[h_idx//8][h_idx%8].plot(dval_idces[1], dval_idces[0], marker=".", markersize=2, alpha=0.01, color="red")
 
                 ax[h_idx//8][h_idx%8].axvspan(pinfo["inst1"][0], pinfo["inst1"][1], alpha=0.8, facecolor='blue')
@@ -1200,28 +1247,62 @@ def plot_stacked_heatmap_inst(inst_paths, prompt_info_paths, fig_path = None):
         fig.clf()
 
         # 15, 53
-        shead_lst = [(0, 27), (5, 17), (13, 13), (22, 8), (2, 9)]
-        for h in shead_lst:
-            dat = torch.load(inst_paths[0])[h[0], h[1], :, :].numpy()
-            fig, ax = plt.subplots(1, 1, figsize=(10, 10), dpi=300)
-            dval_idces = np.where(dat == True)
-            ax.invert_yaxis()
-            ax.set_ylim(ymin=longest_seqlen, ymax=0)
-            ax.set_xlim(xmin=0, xmax=longest_seqlen)
-            ax.tick_params(top=True, bottom=False)
-            ax.set_box_aspect(1)
-            spar = 1. - np.count_nonzero(dat) / float(dat.size)
-            ax.set_title(f"density: {spar:.4f}", fontsize=10)
-            ax.plot(dval_idces[1], dval_idces[0], marker=".", markersize=2, alpha=0.01, color="red")
-            with open(prompt_info_paths[0]) as f:
-                pinfo = json.load(f)
-            print(pinfo["inst1"], pinfo["inst2"])
-            ax.axvspan(pinfo["inst1"][0], pinfo["inst1"][1], alpha=0.8, facecolor='blue')
-            ax.axvspan(pinfo["inst2"][0], pinfo["inst2"][1], alpha=0.8, facecolor='green')
+        if plot_headsample:
+            shead_lst = [(0, 27), (5, 17), (13, 13), (22, 8), (2, 9)]
+            for h in shead_lst:
+                dat = torch.load(inst_paths[0])[h[0], h[1], :, :].numpy()
+                fig, ax = plt.subplots(1, 1, figsize=(10, 10), dpi=300)
+                dval_idces = np.where(dat == True)
+                ax.invert_yaxis()
+                ax.set_ylim(ymin=longest_seqlen, ymax=0)
+                ax.set_xlim(xmin=0, xmax=longest_seqlen)
+                ax.tick_params(top=True, bottom=False)
+                ax.set_box_aspect(1)
+                spar = 1. - np.count_nonzero(dat) / float(dat.size)
+                ax.set_title(f"density: {spar:.4f}", fontsize=10)
+                ax.plot(dval_idces[1], dval_idces[0], marker=".", markersize=2, alpha=0.01, color="red")
+                with open(prompt_info_paths[0]) as f:
+                    pinfo = json.load(f)
+                print(pinfo["inst1"], pinfo["inst2"])
+                ax.axvspan(pinfo["inst1"][0], pinfo["inst1"][1], alpha=0.8, facecolor='blue')
+                ax.axvspan(pinfo["inst2"][0], pinfo["inst2"][1], alpha=0.8, facecolor='green')
 
-            Path(fig_path).mkdir(parents=True, exist_ok=True)
-            fig.savefig(fig_path + f"/l{h[0]}h{h[1]}.png")
-            fig.clf()
+                Path(fig_path).mkdir(parents=True, exist_ok=True)
+                fig.savefig(fig_path + f"/l{h[0]}h{h[1]}.png")
+                fig.clf()
+
+
+def block_prune_analysis(inst_paths: list[str], block_shape: tuple[str]):
+    def apply_block_prune(dat):
+        aligned_shape = (dat.shape[-1] % block_shape[0], dat.shape[-1] % block_shape[1])
+        filled_shape = (block_shape[0] - aligned_shape[0], block_shape[1] - aligned_shape[1])
+        aligned_dat = np.pad(dat, 
+                             ((0, filled_shape[0]), (0, filled_shape[1])), 
+                             mode="constant", 
+                             constant_values=((0, 0), (0, 0)))
+        
+        slice_list = []
+        for i, j in product(np.arange(0, aligned_dat.shape[0], block_shape[0]), np.arange(0, aligned_dat.shape[1], block_shape[1])):
+            slice_list.append(np.s_[i:i+block_shape[0], j:j+block_shape[1]])
+
+        for s in slice_list:
+            if np.sum(aligned_dat[s]) > 0.0:
+                aligned_dat[s] = np.ones(block_shape, dtype=bool)
+
+        return aligned_dat
+
+    all_spars = {}
+    for ipath in tqdm(inst_paths, unit="loads"):
+        dat = torch.load(ipath).numpy()
+        for l_idx, l in enumerate(dat):
+            for h_idx, h in enumerate(l):
+                bpruned_h = apply_block_prune(h)
+                h_spar = get_mat_sparsity(bpruned_h)
+                curr_spar = all_spars.get(f"l{l_idx}h{h_idx}", [])
+                all_spars[f"l{l_idx}h{h_idx}"] = curr_spar + [h_spar]
+        del(dat)
+
+    return all_spars
 
 
 def main():
@@ -1231,7 +1312,7 @@ def main():
 
     # Evaulating sparse 
     # construct multiple instances of the llama inference
-    layer_ids = np.arange(1, num_layers, 1)
+    layer_ids = np.arange(0, num_layers, 1)
     insts_idx = [3, 5]
 
     # explore the distance of the dense values
@@ -1240,6 +1321,11 @@ def main():
     #      for i in insts_idx]
     # dense_val_dist_histogram(attn_path_list, 30, 40)
 
+    base_attn_path = f"/chronos_data/tji/.huggingface_cache/transformers/chatglm2-6b-32k-attn-bfp20-1e-3-hotpotqa-bprune/"
+    # list all insts
+    inst_list = [f.split(".")[0] \
+                 for f in listdir(base_attn_path) \
+                    if isfile(base_attn_path + f) and f[0] == "i" and f.endswith(".pt")]
 
     # seq_len = 8192
     # dmodel = 2048
@@ -1257,14 +1343,16 @@ def main():
     # exit()
     for layer_idx in layer_ids:
         mats_list = []
-        for i in insts_idx:
+        for i in inst_list:
             param_path_7b = "/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/llama-7b-hf-sparsegpt-bfp12/"
             attn_path_7b = f"/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/llama-7b-hf-attsample/attn_s{i}b0.pt"
-            attn_path_flongseq = f"/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/seqlen_2048_interp_llama7bhf/attn_s{i}b0.pt"
+            attn_path_flongseq = \
+                f"/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/seqlen_2048_interp_llama7bhf/attn_s{i}b0.pt"
             attn_path_opt350m = f"/chronos_data/tji/opt_350m_sparse_attn/attn_s{i}b0.pt"
-            attn_path_chatglm = f"/chronos_data/tji/.huggingface_cache/transformers/chatglm2-6b-32k-attn-bfp20-1e-3/attn_s{i}.pt"
+            # attn_path_chatglm = f"/chronos_data/tji/.huggingface_cache/transformers/chatglm2-6b-32k-attn-bfp20-1e-3/attn_s{i}.pt"
+            attn_path_chatglm = base_attn_path + i + ".pt"
             #figure out actual seq len
-            attn = torch.load(attn_path_chatglm)
+            attn = torch.load(base_attn_path + i + ".pt")
             seq_len = attn.size()[-1]
 
             print(f"loaded seq len: {seq_len}")
@@ -1350,27 +1438,28 @@ def main():
         
             mats_list.append(mats_chatglm2_attnv_only)
 
-        possible_col_list = [5, 10, 15, 20, 25]
-        for c in possible_col_list:
-            config = get_tccore_config_by_row(c, 800)
-            if config is not None:
-                r, clen = config[0], config[1]
-                print(f"selecting config {r}, {c}, {clen}")
-                rpath = f"res_fig/ssubcore_experi_samecolnbanks/config_{r}_{c}_{clen}"
-                Path(rpath).mkdir(parents=True, exist_ok=True)
-                compute_stacked_matmul_performance(mats_list, clen, (r, c), 
-                                                layer_idx, 
-                                                lat_compute_type=["ideal sparse", "sparse baseline", "sparse rorp"], 
-                                                plot_figure=False,
-                                                res_json_path=rpath)
+        # possible_col_list = [5, 10, 15, 20, 25]
+        # for c in possible_col_list:
+        #     config = get_tccore_config_by_row(c, 800)
+        #     if config is not None:
+        #         r, clen = config[0], config[1]
+        #         print(f"selecting config {r}, {c}, {clen}")
+        #         rpath = f"res_fig/ssubcore_experi_samecolnbanks/config_{r}_{c}_{clen}"
+        #         Path(rpath).mkdir(parents=True, exist_ok=True)
+        #         compute_stacked_matmul_performance(mats_list, clen, (r, c), 
+        #                                         layer_idx, 
+        #                                         lat_compute_type=["ideal sparse", "sparse baseline", "blocked prune sparse"], 
+        #                                         plot_figure=False,
+        #                                         res_json_path=rpath)
                 
-        # rpath = f"res_fig/temp"
-        # Path(rpath).mkdir(parents=True, exist_ok=True)
-        # compute_stacked_matmul_performance(mats_list, 14, (2, 123), 
-        #                                 layer_idx, 
-        #                                 lat_compute_type=["ideal sparse", "sparse baseline", "sparse rorp"], 
-        #                                 plot_figure=False,
-        #                                 res_json_path=rpath)
+        rpath = f"res_fig/block_prune/hotpotqa_bprune"
+        Path(rpath).mkdir(parents=True, exist_ok=True)
+        compute_stacked_matmul_performance(mats_list, 10, (4, 20), 
+                                        layer_idx, 
+                                        # lat_compute_type=["dense", "ideal sparse", "sparse baseline", "blocked prune sparse"], 
+                                        lat_compute_type=["blocked prune sparse"], 
+                                        plot_figure=False,
+                                        res_json_path=rpath)
     exit()
 
     # print_compress_ratio()

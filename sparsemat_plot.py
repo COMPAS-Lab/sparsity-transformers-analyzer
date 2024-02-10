@@ -4,10 +4,11 @@ import random
 from tqdm import tqdm
 from scipy import optimize
 from math import ceil, floor
-from sparse_tensor_analyzer import distance_of_dense_vals_per_row, dense_val_idx_histogram, plot_stacked_heatmap_inst
+from sparsemat_hw_modeling import distance_of_dense_vals_per_row, dense_val_idx_histogram, plot_stacked_heatmap_inst, block_prune_analysis
 from matplotlib import pyplot as plt
 from os import listdir
 from os.path import isfile
+import json
 
 def gen_spmat_by_sparsity(ref_mat: np.array, 
                           target_seqlen: int, 
@@ -125,19 +126,40 @@ def explore_row_features(mats: list, inst_idx: int):
 
 if __name__ == "__main__":
     inst_idx = 4
-    base_attn_path = f"/chronos_data/tji/.huggingface_cache/transformers/chatglm2-6b-32k-attn-bfp20-1e-3-sta/"
+    base_attn_path = f"/chronos_data/tji/.huggingface_cache/transformers/chatglm2-6b-32k-attn-bfp20-1e-3-hotpotqa-bprune-scaled/"
     # list all insts
     inst_list = [f.split(".")[0] \
                  for f in listdir(base_attn_path) \
                     if isfile(base_attn_path + f) and f[0] == "i" and f.endswith(".pt")]
     
-    inst_list = random.sample(inst_list, 1)
+    # inst_list = random.sample(inst_list, 1)
+    # inst_list = inst_list[:5]
     # src_attn = torch.load(attn_path_chatglm).numpy()
     # explore_row_features(src_attn, inst_idx=inst_idx)
     # dense_val_idx_histogram([attn_path_chatglm], 50)
-    plot_stacked_heatmap_inst([base_attn_path + p + ".pt" for p in inst_list], \
-                              [base_attn_path + p + ".json" for p in inst_list], \
-                              f"./res_fig/temp/{inst_list[0]}")
+    # for i in inst_list:
+    #     plot_stacked_heatmap_inst([base_attn_path + i + ".pt"], \
+    #                                 [base_attn_path + i + ".json"], \
+    #                                 f"./res_fig/temp/hotpotqa/{i}")
+
+    res = block_prune_analysis([base_attn_path + p + ".pt" for p in inst_list], (3, 20))
+    # import jsonw
+    with open("./res_fig/block_prune/hotpotqa_bprune/bpruning_hotpotqa_bthres_3p0.json", "w+") as f:
+        json.dump(res, f)
+
+    elem_spars = []
+    for i in [base_attn_path + p + ".json" for p in inst_list]:
+        with open(i) as fp:
+            res = json.load(fp)
+            elem_spars.append(res["spar_mean"])
+
+    all_bsparse = None
+    with open("./res_fig/block_prune/hotpotqa_bprune/bpruning_hotpotqa_bthres_3p0.json") as fp:
+        res = json.load(fp)
+        all_bsparse = list(res.values())
+
+    print(f"element-wise sparsity: {np.mean(elem_spars)}")
+    print(f"block sparsity: {np.mean(all_bsparse)}")
     exit()
     target_len = 2048
 

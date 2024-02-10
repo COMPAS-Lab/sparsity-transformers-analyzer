@@ -12,11 +12,11 @@ from transformers import (
 )
 import torch
 
-from sparse_tensor_analyzer import get_mat_sparsity
+from sparsemat_hw_modeling import get_mat_sparsity
 from transformer_visualization import plot_heatmap
 
 from analyze_tcblock_vs_matsize import closest_factors_to_target
-from sparse_tensor_analyzer import single_case_analyzing
+from sparsemat_hw_modeling import single_case_analyzing
 
 MODEL_NAME = "decapoda-research/llama-7b-hf"
 # MODEL_NAME = "facebook/opt-13b"
