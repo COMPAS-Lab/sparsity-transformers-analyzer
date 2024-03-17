@@ -1,14 +1,14 @@
-import torch
 import numpy as np
 import random
-from tqdm import tqdm
+import torch
 from scipy import optimize
-from math import ceil, floor
-from sparsemat_hw_modeling import distance_of_dense_vals_per_row, dense_val_idx_histogram, plot_stacked_heatmap_inst, block_prune_analysis
+from sparsemat_hw_modeling import (
+    distance_of_dense_vals_per_row, 
+    compare_topk_focus_inst)
+import matplotlib
 from matplotlib import pyplot as plt
-from os import listdir
-from os.path import isfile
-import json
+import os, json, util
+from tqdm import tqdm
 
 def gen_spmat_by_sparsity(ref_mat: np.array, 
                           target_seqlen: int, 
@@ -124,16 +124,91 @@ def explore_row_features(mats: list, inst_idx: int):
     plt.clf()
 
 
+def plot_hw_perf(json_path_lists: list[str], label_list: list[str], res_path: str):
+    dat_delay = {c:[] for c in json_path_lists}
+    dat_tp = {c:[] for c in json_path_lists}
+    for json_path in json_path_lists:
+        num_layers = 24
+        for l in range(num_layers):
+            with open(os.path.join(json_path, f"src_data_layer_{l}.json"), "r") as fp:
+                lat_dat = json.load(fp)
+                dat_delay[json_path].append(lat_dat["compress blue"]["attxv"]["blocked prune sparse"][0])
+                dat_tp[json_path].append(lat_dat["compress blue"]["attxv"]["blocked prune sparse"][1])
+
+    # plot latency vs layers
+    fig, ax = plt.subplots(1, 1, figsize=(9, 4))
+    fsize = 9
+    matplotlib.rcParams.update({'xtick.labelsize': fsize})
+    matplotlib.rcParams.update({'ytick.labelsize': fsize})
+    matplotlib.rcParams['lines.markersize'] = 3
+
+    x_labels = np.arange(1, num_layers+1, 1)
+    for i, p in enumerate(json_path_lists):
+        #compute bar idx
+        if len(json_path_lists) % 2 == 0:
+            x_pos = x_labels + (i - len(json_path_lists) / 2) * 0.2 + 0.1
+        else:
+            x_pos = x_labels + (i - len(json_path_lists - 1) / 2) * 0.2
+
+        ax.bar(x_pos, dat_delay[p], 
+                width=0.2, color=f"C{i}", linewidth=1, label=label_list[i])
+
+    ax.set_ylabel('latency (sec)')
+    ax.set_ylim(ymin=0)
+    ax.set_xticks(x_labels)
+    ax.set_xticklabels(x_labels)
+    ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
+    ax.set_xlabel('layer')
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(res_path + "/res_delay.pdf")
+    fig.clf()
+
+
+    fig, ax = plt.subplots(1, 1, figsize=(9, 4))
+    fsize = 9
+    matplotlib.rcParams.update({'xtick.labelsize': fsize})
+    matplotlib.rcParams.update({'ytick.labelsize': fsize})
+    matplotlib.rcParams['lines.markersize'] = 3
+
+    x_labels = np.arange(1, num_layers+1, 1)
+    for i, p in enumerate(json_path_lists):
+        #compute bar idx
+        if len(json_path_lists) % 2 == 0:
+            x_pos = x_labels + (i - len(json_path_lists) / 2) * 0.2 + 0.1
+        else:
+            x_pos = x_labels + (i - len(json_path_lists - 1) / 2) * 0.2
+
+        ax.bar(x_pos, dat_tp[p], 
+                width=0.2, color=f"C{i}", linewidth=1, label=label_list[i])
+
+    ax.set_ylabel('throughput (TOPs)')
+    ax.set_ylim(ymin=0)
+    ax.set_xticks(x_labels)
+    ax.set_xticklabels(x_labels)
+    ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
+    ax.set_xlabel('layer')
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(res_path + "/res_tp.pdf")
+    fig.clf()
+
+
 if __name__ == "__main__":
-    inst_idx = 4
-    base_attn_path = f"/chronos_data/tji/.huggingface_cache/transformers/chatglm2-6b-32k-attn-bfp20-1e-3-hotpotqa-bprune-scaled/"
+    # plot_dat_list = [
+    #     "./res_fig/block_prune/bprune_sweep_chainlen/10",
+    #     "./res_fig/block_prune/hotpotqa_bprune_retain_replicated",
+    # ]
+    # label_list = ["reduce rep", "keep rep"]
+    # plot_hw_perf(plot_dat_list, label_list, "./res_fig/block_prune/hotpotqa_bprune_retain_replicated")
+    # exit()
+
+    # inst_idx = 4
+    base_attn_path = f"/chronos_data/tji/.huggingface_cache/transformers/chatglm2-6b-32k-attn-bfp20-hotpotqa-bprune-topkmax/"
     # list all insts
-    inst_list = [f.split(".")[0] \
-                 for f in listdir(base_attn_path) \
-                    if isfile(base_attn_path + f) and f[0] == "i" and f.endswith(".pt")]
-    
-    # inst_list = random.sample(inst_list, 1)
-    # inst_list = inst_list[:5]
+    inst_list = util.get_pts_under_dir(base_attn_path)
+    inst_list = inst_list[0:2]
+    # attn_path_chatglm = inst_list[0] + ".pt"
     # src_attn = torch.load(attn_path_chatglm).numpy()
     # explore_row_features(src_attn, inst_idx=inst_idx)
     # dense_val_idx_histogram([attn_path_chatglm], 50)
@@ -142,9 +217,30 @@ if __name__ == "__main__":
     #                                 [base_attn_path + i + ".json"], \
     #                                 f"./res_fig/temp/hotpotqa/{i}")
 
-    res = block_prune_analysis([base_attn_path + p + ".pt" for p in inst_list], (3, 20))
+    # res = block_prune_analysis([base_attn_path + p + ".pt" for p in inst_list], (3, 20), 28, 32)
+
+    topksum_path = f"/chronos_data/tji/.huggingface_cache/transformers/chatglm2-6b-32k-attn-bfp20-hotpotqa-bprune-topksum/"
+    topkmax_path = f"/chronos_data/tji/.huggingface_cache/transformers/chatglm2-6b-32k-attn-bfp20-hotpotqa-bprune-topkmax/"
+    # map same seq length instances
+    topksum_pts = util.get_pts_under_dir(topksum_path)
+    topkmax_pts = util.get_pts_under_dir(topkmax_path)
+    mapped_same_insts = []
+    if len(topksum_pts) == len(topkmax_pts):
+        while topksum_pts:
+            tsum_size = os.stat(topksum_pts[0]).st_size
+            for curr_tmax_idx in range(len(topkmax_pts)):
+                tmax_size = os.stat(topkmax_pts[curr_tmax_idx]).st_size
+                if tsum_size == tmax_size:
+                    mapped_same_insts.append((topksum_pts[0], topkmax_pts[curr_tmax_idx]))
+                    del topksum_pts[0], topkmax_pts[curr_tmax_idx]
+                    break
+    
+    print(f"mapped insts: {mapped_same_insts}")
+    for same_inst_pair in tqdm(mapped_same_insts):
+        compare_topk_focus_inst(same_inst_pair[0], same_inst_pair[1], (3, 20))
+    exit()
     # import jsonw
-    with open("./res_fig/block_prune/hotpotqa_bprune/bpruning_hotpotqa_bthres_3p0.json", "w+") as f:
+    with open("./res_fig/block_prune/bprune_row_density_profile/bpruning_hotpotqa_bthres.json", "w") as f:
         json.dump(res, f)
 
     elem_spars = []
@@ -154,30 +250,10 @@ if __name__ == "__main__":
             elem_spars.append(res["spar_mean"])
 
     all_bsparse = None
-    with open("./res_fig/block_prune/hotpotqa_bprune/bpruning_hotpotqa_bthres_3p0.json") as fp:
+    with open("./res_fig/block_prune/bprune_row_density_profile/bpruning_hotpotqa_bthres.json") as fp:
         res = json.load(fp)
         all_bsparse = list(res.values())
 
     print(f"element-wise sparsity: {np.mean(elem_spars)}")
     print(f"block sparsity: {np.mean(all_bsparse)}")
-    exit()
-    target_len = 2048
-
-    for i in range(1):
-        ref_path = (f"/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/"
-                    f"llama-7b-hf-attsample/attn_s{i}b0.pt")
-        tar_path = (f"/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/"
-                    f"seqlen_{target_len}_interp_llama7bhf/attn_s{i}b0.pt")
-        src_attn = torch.load(ref_path).numpy()
-
-        explore_row_features(src_attn, inst_idx=i)
-        det_attn = np.zeros((src_attn.shape[0], src_attn.shape[1], target_len, target_len))
-        for layer in range(src_attn.shape[0]):
-            for head in range(src_attn.shape[1]):
-                temp_src = src_attn[layer][head]
-                temp_tar = gen_spmat_by_sparsity(temp_src, target_len, is_plot_figure=True)
-                det_attn[layer][head] = temp_tar
-
-        print(f"src shape: {src_attn.shape}, gen shape: {det_attn.shape}")
-        det_attn = torch.tensor(det_attn)
-        torch.save(det_attn, tar_path)
+    

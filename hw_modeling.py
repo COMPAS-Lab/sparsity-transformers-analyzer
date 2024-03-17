@@ -12,7 +12,7 @@ from itertools import chain
 
 formatter = logging.Formatter('%(name)s - %(levelname)s - %(message)s')
 hw_modeling_logger = logging.getLogger("hw_modeling")
-hw_modeling_logger.setLevel(logging.WARN)
+hw_modeling_logger.setLevel(logging.INFO)
 hw_modeling_logger_handler = logging.FileHandler(filename="hw_modeling.log", mode="w")
 hw_modeling_logger_handler.setFormatter(formatter)
 hw_modeling_logger.addHandler(hw_modeling_logger_handler)
@@ -611,7 +611,13 @@ class StratixDpuModel(DpuModel):
                     if (tccol_used_counter == self.NUM_TCC_COLS) or \
                         ((tccol_used_counter < self.NUM_TCC_COLS) and r_idx == (len(mat_in_row_grps) - 1)):
                         # find max loading iteration
-                        all_tccol_loads = np.unique(list(chain(*scheduled_tccol_loads)))
+                        max_schlen = max([len(i) for i in scheduled_tccol_loads])
+                        min_schlen = min([len(i) for i in scheduled_tccol_loads])
+                        hw_modeling_logger.info(f"mat b load imbalance: {min_schlen}/{max_schlen}")
+                        all_tccol_loads = np.unique(np.array(list(chain(*scheduled_tccol_loads))))
+                        # Here each indexed mat b reading is a block, so recover its original size 
+                        # by * tensor core chain len. Then replicate it used_tc_col times so it 
+                        # can be evenly distributed to every used column.
                         none_zeros += [len(all_tccol_loads) * self.TCCORE_SIZE] * tccol_used_counter
                         tccol_used_counter = 0
                         scheduled_tccol_loads = [[] for _ in range(self.NUM_TCC_COLS)]
@@ -732,7 +738,169 @@ class StratixDpuModel(DpuModel):
         lat_ret = time_latency if return_time_lat else total_ops
 
         return flops, lat_ret, grp_util
-    
+
+    def tensor_fpga21_mat_block_sparse_flops(self, 
+                                        sparse_mat, 
+                                        sort_rows_by_sparsity=False, 
+                                        ideal=False, 
+                                        using_single_column=False, 
+                                        sparse_block_size = 10.0, 
+                                        adv_block_prune=False, 
+                                        return_time_lat = True):
+        ''' 
+        compute flops and latency with a given number of cascaded chain and b cols
+        considering skipping the zeros in the mat A
+        sort_rows_by_sparsity: if sorting the rows to increase loading regularity
+        using_single_column: if using only 1/3 of the columns in the tc
+        sparse_block_size: size of the sparse block size to reduce the loading irregularity
+        '''
+        round = lambda x: x if ideal else ceil(x)
+        get_padded_size = lambda x, fac: ceil(float(x)/fac) * fac
+        hw_modeling_logger.info("=== modeling SpMM by {0} ===".format(sys._getframe().f_code.co_name))
+        hw_modeling_logger.info(f"tc array: {self.NUM_TCC_ROWS} x {self.NUM_TCC_COLS}")
+        hw_modeling_logger.info(f"""parameters: 
+                                is_row_sorting:{sort_rows_by_sparsity}, 
+                                using_single_col:{using_single_column},
+                                sparse_block_size:{sparse_block_size},
+                                adv_block_prune:{adv_block_prune}
+                                """)
+
+        # sort rows based on the sparsity if sorting is enabled
+        if sort_rows_by_sparsity:
+            sorted_sparse_mat = sparse_mat[(sparse_mat == 0.0).sum(axis=-1).argsort()]
+            sparse_mat = sorted_sparse_mat
+            if not using_single_column:
+                # skip if matrix is fully dense
+                if np.count_nonzero(sparse_mat) / sparse_mat.size < 1.:
+                    dense_mask = np.where(sparse_mat > 0.0, 1, 0)
+                    zeros_padded = dense_mask.shape[0] % self.TCCORE_COL_SIZE
+                    if zeros_padded > 0:
+                        dense_mask = np.pad(dense_mask, (0, self.TCCORE_COL_SIZE - zeros_padded), "constant", \
+                                                constant_values=0)
+                        sparse_mat = np.pad(sparse_mat, (0, self.TCCORE_COL_SIZE - zeros_padded), "constant", \
+                                                constant_values=0)
+                    res = []
+                    h_dist = lambda x, y: hamming(x, y) * len(x)
+
+                    while dense_mask.shape[0] > 3:
+                        to_compare = dense_mask[0]
+                        dense_mask = np.delete(dense_mask, 0, axis=0)
+                        res.append(sparse_mat[0])
+                        sparse_mat = np.delete(sparse_mat, 0, axis=0)
+
+                        min_hdist = [len(to_compare), len(to_compare)]
+                        min_idx = [0, 0]
+                        for idx, r in enumerate(dense_mask):
+                            c_hdist = h_dist(to_compare, r)
+                            if c_hdist < min_hdist[0]:
+                                min_hdist = [c_hdist, min_hdist[0]]
+                                min_idx = [idx, min_idx[0]]
+                            elif c_hdist < min_hdist[1]:
+                                min_hdist[1] = c_hdist
+                                min_idx[1] = idx
+                        
+                        res.append(sparse_mat[min_idx[0]])
+                        res.append(sparse_mat[min_idx[1]])
+                        sparse_mat = np.delete(sparse_mat, min_idx, axis=0)
+                        dense_mask = np.delete(dense_mask, min_idx, axis=0)
+
+                    for r in sparse_mat: res.append(r)
+                    sparse_mat = np.array(res)
+
+        # count none zeros per row, mimicing the padding zeros to every 3 rows
+        # we need to split it into chunks of bfp groups because only when a group that's entirely
+        # zero can be ignored
+        mat_b_rcycles_per_joint_a_block = []
+
+        # if using all three columns, the matrix is blocked into 3xtc core size blocks.
+        # find the max latency of each block which uses most of the time.
+        # first pad the rows to be divisible by 3
+        zeros_padded = sparse_mat.shape[0] % self.TCCORE_COL_SIZE
+        if zeros_padded > 0:
+            sparse_mat = np.pad(sparse_mat, (0, self.TCCORE_COL_SIZE - zeros_padded), "constant", constant_values=0)
+        # then block them into 3xtc core size and select the max length to compute delay
+        mat_in_row_grps = \
+            np.split(sparse_mat, np.arange(self.TCCORE_COL_SIZE, sparse_mat.shape[0], self.TCCORE_COL_SIZE), axis=0)
+
+        computed_col_idx = []
+        tccol_used_counter = 0
+        scheduled_tccol_loads = [[] for _ in range(self.NUM_TCC_COLS)]
+        for r_idx, row_grp in enumerate(mat_in_row_grps):
+            compressed_row_grp = []
+            row_blocks = np.split(row_grp, np.arange(sparse_block_size, row_grp.shape[1], sparse_block_size), axis=-1)
+            computed_col_idx = []
+            for col_idx, block in enumerate(row_blocks):
+                # support different pruning modes
+                if adv_block_prune:
+                    if np.mean(block) > 0.001:
+                        compressed_row_grp.append(block)
+                else:
+                    if np.sum(block) > 0:
+                        compressed_row_grp.append(block)
+                        computed_col_idx.append(col_idx)
+                        scheduled_tccol_loads[tccol_used_counter % self.NUM_TCC_COLS].append(col_idx)
+                    
+            tccol_used_counter += 1
+
+            if (tccol_used_counter == self.NUM_TCC_COLS) or \
+                ((tccol_used_counter < self.NUM_TCC_COLS) and r_idx == (len(mat_in_row_grps) - 1)):
+                # find max loading iteration
+                max_schlen = max([len(i) for i in scheduled_tccol_loads])
+                min_schlen = min([len(i) for i in scheduled_tccol_loads])
+                hw_modeling_logger.info(f"mat b load imbalance: {min_schlen}/{max_schlen}")
+                all_tccol_loads = np.unique(np.array(list(chain(*scheduled_tccol_loads))))
+                mat_b_rcycles_per_joint_a_block.append(all_tccol_loads.shape[0] // self.CHAIN_LEN)
+        # mat_b_rcycles_per_joint_a_block now saves how many iterations 
+        # per a block needs to get its associated mat b block for an entire tc row
+        
+        tc_inbuff_loading_lat = self.CHAIN_LEN
+        lat_list = [(tc_inbuff_loading_lat + 1) * 3]
+        total_latency = 0.0
+        mat_b_breq_merge_lat = 10
+        BARREL_SHIFTER_DELAY = log2Up(self.CHAIN_LEN) + 1
+        BRAM_RD_DELAY = 2
+        for a_load_idx, mat_b_rcycles in enumerate(mat_b_rcycles_per_joint_a_block):
+            mat_b_arrival_time = mat_b_rcycles * (self.b_w / self.NUM_TCC_ROWS - 1)
+            mat_b_arrival_time += mat_b_rcycles + mat_b_breq_merge_lat + BARREL_SHIFTER_DELAY + BRAM_RD_DELAY
+            mat_a_loading_time = tc_inbuff_loading_lat * 3
+            actual_compute_delay = max(mat_a_loading_time, mat_b_arrival_time)
+            hw_modeling_logger.info(f"loading lat vs computing: {mat_a_loading_time}, {mat_b_arrival_time}")
+            lat_list.append(actual_compute_delay)
+ 
+            # compute the latency block by block
+            hw_modeling_logger.info(f"#iters: {len(lat_list)}")
+            hw_modeling_logger.info(f"all lats: {lat_list}")
+            hw_modeling_logger.info(f"lat sum: {np.sum(np.array(lat_list))}")
+
+            total_latency = np.sum(np.array(lat_list))
+            # last accumulator's latency
+            total_latency += 4 + effective_loading_lat * 2 + 2
+
+        # split matA rows into groups, each one can be consumed by all the tc columns
+        mat_a_array_iter_grps = []
+        effective_loading_lat = 0.0
+        lat_list = 0.0
+        grp_util = 0.0
+        mat_in_row_grps = np.array(mat_in_row_grps)
+        mat_a_iter_grps_origin = \
+            np.array_split(mat_in_row_grps, ceil(mat_in_row_grps.shape[0] / self.NUM_TCC_COLS))
+        effective_loading_lat = self.CHAIN_LEN
+        # compute total util
+        actual_total_elem_size = 0.0
+        for b_max, b_ori in zip(mat_a_array_iter_grps, mat_a_iter_grps_origin):
+            padded_row_size = get_padded_size(np.max(b_max), self.CHAIN_LEN * self.TCCORE_SIZE)
+            actual_total_elem_size += padded_row_size * self.NUM_TCC_COLS * 3
+        grp_util =  np.count_nonzero(sparse_mat) / actual_total_elem_size
+        hw_modeling_logger.info(f"util: {grp_util}")
+
+        # compute throughput
+        total_ops = self.a_h * self.a_w * 2 * self.b_w
+        time_latency = total_latency * 1./self.FREQ * 1e-6
+        flops = total_ops / time_latency / 1e12
+
+        lat_ret = time_latency if return_time_lat else total_latency
+
+        return flops, lat_ret, grp_util
 
     def tensor_baseline_sparse_flops(self, 
                                     sparse_mat, ideal=False, 
