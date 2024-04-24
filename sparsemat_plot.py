@@ -4,7 +4,8 @@ import torch
 from scipy import optimize
 from sparsemat_hw_modeling import (
     distance_of_dense_vals_per_row, 
-    compare_topk_focus_inst)
+    transfer_attn_to_bprune_dense_idx,
+    bprune_sweep_rrspan)
 import matplotlib
 from matplotlib import pyplot as plt
 import os, json, util
@@ -128,7 +129,7 @@ def plot_hw_perf(json_path_lists: list[str], label_list: list[str], res_path: st
     dat_delay = {c:[] for c in json_path_lists}
     dat_tp = {c:[] for c in json_path_lists}
     for json_path in json_path_lists:
-        num_layers = 24
+        num_layers = 28
         for l in range(num_layers):
             with open(os.path.join(json_path, f"src_data_layer_{l}.json"), "r") as fp:
                 lat_dat = json.load(fp)
@@ -136,8 +137,9 @@ def plot_hw_perf(json_path_lists: list[str], label_list: list[str], res_path: st
                 dat_tp[json_path].append(lat_dat["compress blue"]["attxv"]["blocked prune sparse"][1])
 
     # plot latency vs layers
-    fig, ax = plt.subplots(1, 1, figsize=(9, 4))
+    fig, ax = plt.subplots(1, 1, figsize=(12, 4))
     fsize = 9
+    bar_width = 0.15
     matplotlib.rcParams.update({'xtick.labelsize': fsize})
     matplotlib.rcParams.update({'ytick.labelsize': fsize})
     matplotlib.rcParams['lines.markersize'] = 3
@@ -146,26 +148,27 @@ def plot_hw_perf(json_path_lists: list[str], label_list: list[str], res_path: st
     for i, p in enumerate(json_path_lists):
         #compute bar idx
         if len(json_path_lists) % 2 == 0:
-            x_pos = x_labels + (i - len(json_path_lists) / 2) * 0.2 + 0.1
+            x_pos = x_labels + (i - len(json_path_lists) / 2) * bar_width + bar_width / 2.0
         else:
-            x_pos = x_labels + (i - len(json_path_lists - 1) / 2) * 0.2
+            x_pos = x_labels + (i - (len(json_path_lists) - 1) / 2.0) * bar_width
 
         ax.bar(x_pos, dat_delay[p], 
-                width=0.2, color=f"C{i}", linewidth=1, label=label_list[i])
+                width=bar_width, color=f"C{i}", linewidth=1, label=label_list[i])
 
     ax.set_ylabel('latency (sec)')
     ax.set_ylim(ymin=0)
+    ax.set_xlim(xmin=0)
     ax.set_xticks(x_labels)
     ax.set_xticklabels(x_labels)
     ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
     ax.set_xlabel('layer')
     ax.legend()
     fig.tight_layout()
-    fig.savefig(res_path + "/res_delay.pdf")
+    fig.savefig(res_path + "/res_delay_s.pdf")
     fig.clf()
 
 
-    fig, ax = plt.subplots(1, 1, figsize=(9, 4))
+    fig, ax = plt.subplots(1, 1, figsize=(12, 4))
     fsize = 9
     matplotlib.rcParams.update({'xtick.labelsize': fsize})
     matplotlib.rcParams.update({'ytick.labelsize': fsize})
@@ -175,14 +178,15 @@ def plot_hw_perf(json_path_lists: list[str], label_list: list[str], res_path: st
     for i, p in enumerate(json_path_lists):
         #compute bar idx
         if len(json_path_lists) % 2 == 0:
-            x_pos = x_labels + (i - len(json_path_lists) / 2) * 0.2 + 0.1
+            x_pos = x_labels + (i - len(json_path_lists) / 2) * bar_width + bar_width / 0.2
         else:
-            x_pos = x_labels + (i - len(json_path_lists - 1) / 2) * 0.2
+            x_pos = x_labels + (i - (len(json_path_lists) - 1) / 2.0) * bar_width
 
         ax.bar(x_pos, dat_tp[p], 
-                width=0.2, color=f"C{i}", linewidth=1, label=label_list[i])
+                width=bar_width, color=f"C{i}", linewidth=1, label=label_list[i])
 
     ax.set_ylabel('throughput (TOPs)')
+    ax.set_xlim(xmin=0)
     ax.set_ylim(ymin=0)
     ax.set_xticks(x_labels)
     ax.set_xticklabels(x_labels)
@@ -190,24 +194,50 @@ def plot_hw_perf(json_path_lists: list[str], label_list: list[str], res_path: st
     ax.set_xlabel('layer')
     ax.legend()
     fig.tight_layout()
-    fig.savefig(res_path + "/res_tp.pdf")
+    fig.savefig(res_path + "/res_tp_s.pdf")
     fig.clf()
 
 
+def plot_rrspan_sweep(dat_file, n_layers, n_heads):
+    '''
+    plot how redundancy removal span affects the number of blocks after pruning 
+    '''
+    with open(dat_file, "r") as f:
+        dat = f.readlines()
+    
+    res = {}
+    for h_raw in dat:
+        h_name = h_raw.split(":")[0]
+        h_dat = h_raw.split(":")[1].strip("[]\n").split(", ")
+        h_dat = [float(i) for i in h_dat]
+        res[h_name] = h_dat
+
+    fig, ax = plt.subplots(4, 7, figsize=(16, 10))
+    for l in range(n_layers):
+        for h in range(n_heads):
+            ax[l // 7][l % 7].plot([0,1,2,4,6,8,10], res[f"l{l}h{h}"], color=f"C{h}", marker='.')
+            ax[l // 7][l % 7].set_xlim(xmin=0)
+            ax[l // 7][l % 7].set_ylim(ymin=0, ymax=1.0)
+    
+    fig.tight_layout(rect=(0.03, 0.03, 1, 1))
+    fig.supxlabel("redundancy removal window")
+    fig.supylabel("#blocks remained/#blocks w/o removal")
+    fig.savefig("res_fig/block_prune/sweep_rrspan.pdf")
+
+
 if __name__ == "__main__":
-    # plot_dat_list = [
-    #     "./res_fig/block_prune/bprune_sweep_chainlen/10",
-    #     "./res_fig/block_prune/hotpotqa_bprune_retain_replicated",
-    # ]
-    # label_list = ["reduce rep", "keep rep"]
-    # plot_hw_perf(plot_dat_list, label_list, "./res_fig/block_prune/hotpotqa_bprune_retain_replicated")
-    # exit()
+    plot_dat_list = [
+        "./res_fig/block_prune/bprune_sweep_chainlen/10",
+        "./res_fig/block_prune/bprune_sweep_chainlen/14",
+    ]
+    label_list = ["10-small", "14-small"]
+    plot_hw_perf(plot_dat_list, label_list, "./res_fig/block_prune/bprune_sweep_chainlen")
+    exit()
 
     # inst_idx = 4
-    base_attn_path = f"/chronos_data/tji/.huggingface_cache/transformers/chatglm2-6b-32k-attn-bfp20-hotpotqa-bprune-topkmax/"
+    base_attn_path = f"/chronos_data/tji/.huggingface_cache/transformers/chatglm2-6b-32k-attn-bfp20-1e-3-hotpotqa-bprune-scaled/"
     # list all insts
-    inst_list = util.get_pts_under_dir(base_attn_path)
-    inst_list = inst_list[0:2]
+    inst_list = util.get_pts_under_dir(base_attn_path, "npy")
     # attn_path_chatglm = inst_list[0] + ".pt"
     # src_attn = torch.load(attn_path_chatglm).numpy()
     # explore_row_features(src_attn, inst_idx=inst_idx)
@@ -217,27 +247,11 @@ if __name__ == "__main__":
     #                                 [base_attn_path + i + ".json"], \
     #                                 f"./res_fig/temp/hotpotqa/{i}")
 
-    # res = block_prune_analysis([base_attn_path + p + ".pt" for p in inst_list], (3, 20), 28, 32)
-
-    topksum_path = f"/chronos_data/tji/.huggingface_cache/transformers/chatglm2-6b-32k-attn-bfp20-hotpotqa-bprune-topksum/"
-    topkmax_path = f"/chronos_data/tji/.huggingface_cache/transformers/chatglm2-6b-32k-attn-bfp20-hotpotqa-bprune-topkmax/"
-    # map same seq length instances
-    topksum_pts = util.get_pts_under_dir(topksum_path)
-    topkmax_pts = util.get_pts_under_dir(topkmax_path)
-    mapped_same_insts = []
-    if len(topksum_pts) == len(topkmax_pts):
-        while topksum_pts:
-            tsum_size = os.stat(topksum_pts[0]).st_size
-            for curr_tmax_idx in range(len(topkmax_pts)):
-                tmax_size = os.stat(topkmax_pts[curr_tmax_idx]).st_size
-                if tsum_size == tmax_size:
-                    mapped_same_insts.append((topksum_pts[0], topkmax_pts[curr_tmax_idx]))
-                    del topksum_pts[0], topkmax_pts[curr_tmax_idx]
-                    break
-    
-    print(f"mapped insts: {mapped_same_insts}")
-    for same_inst_pair in tqdm(mapped_same_insts):
-        compare_topk_focus_inst(same_inst_pair[0], same_inst_pair[1], (3, 20))
+    # res = block_prune_analysis(inst_list, (3, 20), 28, 32)
+    # for f in inst_list:
+    #     transfer_attn_to_bprune_dense_idx(f, (3, 20))
+    # bprune_sweep_rrspan(inst_list, [0,1,2,4,6,8,10], 20)
+    plot_rrspan_sweep("res_fig/block_prune/sweep_rrspan.txt", 28, 32)
     exit()
     # import jsonw
     with open("./res_fig/block_prune/bprune_row_density_profile/bpruning_hotpotqa_bthres.json", "w") as f:

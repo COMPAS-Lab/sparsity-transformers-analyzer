@@ -19,7 +19,7 @@ import json
 from functools import reduce
 from analyze_tcblock_vs_matsize import closest_factors_to_target
 from os import listdir
-from os.path import isfile
+from os.path import isfile, dirname, abspath
 
 TCCORE_COL_SIZE = 3
 TCCORE_SIZE = 20
@@ -1272,99 +1272,8 @@ def plot_stacked_heatmap_inst(inst_paths, prompt_info_paths, fig_path = None, pl
                 fig.clf()
 
 
-def block_prune_analysis(inst_paths: list[str], block_shape: tuple[str], n_layers, n_heads):
-    def apply_block_prune(dat):
-        aligned_shape = (dat.shape[-1] % block_shape[0], dat.shape[-1] % block_shape[1])
-        filled_shape = ((block_shape[0] - aligned_shape[0]) % block_shape[0],
-                        (block_shape[1] - aligned_shape[1]) % block_shape[1])
-        aligned_dat = np.pad(dat, 
-                             ((0, filled_shape[0]), (0, filled_shape[1])), 
-                             mode="constant", 
-                             constant_values=((0, 0), (0, 0)))
-        
-        slice_list = []
-        for i, j in product(np.arange(0, aligned_dat.shape[0], block_shape[0]), np.arange(0, aligned_dat.shape[1], block_shape[1])):
-            slice_list.append(np.s_[i:i+block_shape[0], j:j+block_shape[1]])
-
-        for s in slice_list:
-            if np.sum(aligned_dat[s]) > 0.0:
-                aligned_dat[s] = np.ones(block_shape, dtype=bool)
-
-        return aligned_dat
-
-    all_spars = {}
-    all_nblocks_row = [[None]*n_heads for _ in range(n_layers)] 
-    max_len = 0
-    inst_count_for_avg = np.zeros((1), dtype="float")
-    for i_idx, ipath in enumerate(tqdm(inst_paths, unit="loads")):
-        dat = torch.load(ipath).numpy()
-        padded_dat_shape = ceil(dat.shape[-1] / float(block_shape[0]))
-        if padded_dat_shape > max_len:
-            max_len = padded_dat_shape
-        if max_len > inst_count_for_avg.shape[-1]:
-            inst_count_for_avg = np.pad( \
-                inst_count_for_avg, 
-                (0, max_len - inst_count_for_avg.shape[-1]), 
-                "constant", constant_values=(0,))
-            inst_count_for_avg += np.ones((max_len), dtype=float)
-        else:
-            inst_count_for_avg += np.array([1.0] * max_len + \
-                                           [0.0] * (inst_count_for_avg.shape[-1]-max_len))
-        for l_idx, l in enumerate(dat):
-            for h_idx, h in enumerate(l):
-                bpruned_h = apply_block_prune(h)
-                h_spar = get_mat_sparsity(bpruned_h)
-                curr_spar = all_spars.get(f"l{l_idx}h{h_idx}", [])
-                all_spars[f"l{l_idx}h{h_idx}"] = curr_spar + [h_spar]
-                # compute number of blocks per row
-                nblocks_row = np.count_nonzero(bpruned_h, axis=-1)
-                nblocks_row = nblocks_row / 20.0
-                if all_nblocks_row[l_idx][h_idx] is None:
-                    all_nblocks_row[l_idx][h_idx] = nblocks_row
-                else:
-                    curr_row_shape = all_nblocks_row[l_idx][h_idx].shape[0]
-                    row_to_add_shape = nblocks_row.shape[0]
-                    if curr_row_shape != row_to_add_shape:
-                        target_row_shape = max(curr_row_shape, row_to_add_shape)
-                        if curr_row_shape < target_row_shape:
-                            all_nblocks_row[l_idx][h_idx] = np.pad(
-                                all_nblocks_row[l_idx][h_idx], 
-                                (0, target_row_shape - curr_row_shape), 
-                                "constant",
-                                constant_values=(0,)
-                            )
-                        if row_to_add_shape < target_row_shape:
-                            nblocks_row = np.pad(
-                                nblocks_row, 
-                                (0, target_row_shape - row_to_add_shape),
-                                "constant",
-                                constant_values=(0,)
-                            )
-
-                    all_nblocks_row[l_idx][h_idx] += nblocks_row
-
-                # compute average over multiple insts
-                if l_idx == n_layers-1 and h_idx == n_heads-1 and i_idx == len(inst_paths)-1:
-                    all_nblocks_row[l_idx][h_idx] = all_nblocks_row[l_idx][h_idx] / inst_count_for_avg
-        del(dat)
-    
-    fig, ax = plt.subplots(4, 8, figsize=(20, 10), dpi=200)
-    fig.tight_layout()
-    max_nblocks = np.amax(np.array(all_nblocks_row))
-    for l_idx, l in enumerate(all_nblocks_row):
-        for h_idx, h in enumerate(l):
-            ax[h_idx // 8][h_idx % 8].bar(range(h.shape[0]), h)
-            ax[h_idx // 8][h_idx % 8].set_ylim(ymin=0, ymax=max_nblocks)
-            ax[h_idx // 8][h_idx % 8].set_xlabel("row index")
-            ax[h_idx // 8][h_idx % 8].set_ylabel("avg. #blocks")
-        fig.savefig(f"./res_fig/block_prune/bprune_row_density_profile/average_topkmax/l{l_idx}.pdf")
-        fig.clf()
-
-    return all_spars
-
-def compare_topk_focus_inst(inst1, inst2, block_shape):
-    dat_1 = torch.load(inst1).numpy()
-    dat_2 = torch.load(inst2).numpy()
+def transfer_attn_to_bprune_dense_idx(inst, block_shape):
+    dat = torch.load(inst).numpy()
     
     def get_bprune_focused_idx(dat):
         aligned_shape = (dat.shape[-1] % block_shape[0], dat.shape[-1] % block_shape[1])
@@ -1383,20 +1292,61 @@ def compare_topk_focus_inst(inst1, inst2, block_shape):
 
         return focused_idx_list
 
-    dat1_seqlen = dat_1.shape[-1]
-    dat2_seqlen = dat_2.shape[-1]
-    assert(dat1_seqlen == dat2_seqlen)
+    dat_shape = (dat.shape[0], dat.shape[1])
+    res = np.full(dat_shape, None)
+    for l_idx in range(dat_shape[0]):
+        for h_idx in range(dat_shape[1]):
+            res[l_idx][h_idx] = get_bprune_focused_idx(dat[l_idx][h_idx])
 
-    with open(f"res_fig/block_prune/hotpotqa_focus_comparison/common_focus_{dat1_seqlen}.txt", "w") as f:
-        for l_idx, h_idx in product(range(dat_1.shape[0]), range(dat_1.shape[1])):
-            dat1_focus = get_bprune_focused_idx(dat_1[l_idx][h_idx])
-            dat2_focus = get_bprune_focused_idx(dat_2[l_idx][h_idx])
-            n_same_focus = 0
-            for d1f, d2f in product(dat1_focus, dat2_focus):
-                if d1f[0] == d2f[0] and d1f[1] == d2f[1]:
-                    n_same_focus += 1
-            
-            f.write(f"{n_same_focus}, {len(dat1_focus)}, {len(dat2_focus)}\n")
+    fname = inst.split("/")[-1].split(".")[0]
+    base_path = dirname(inst)
+    print(f"saving res to {base_path}/{fname}.npy...")
+    np.save(f"{base_path}/{fname}.npy", res)
+
+
+def bprune_sweep_rrspan(inst_list: list[str], span_list: list[int], row_grp_size: int):
+    block_ids = [np.load(i, allow_pickle=True) for i in inst_list]
+    for l_idx, h_idx in product(range(28), range(32)):
+        print(f"examine l{l_idx}h{h_idx}...")
+        rr_rate_vs_span = []
+        for curr_span in span_list:
+            rr_rate_per_inst = []
+            for i in tqdm(block_ids):
+                all_row_idx = np.unique([r[0] for r in i[l_idx][h_idx]])
+                split_ridx_list = [(i + 1) * row_grp_size for i in range(ceil(all_row_idx.shape[0] / row_grp_size))]
+                row_grps = np.split(all_row_idx, split_ridx_list[0:-1])
+                remained_block_counts = []
+                for r_grp in row_grps:
+                    curr_r_to_check = [[]] * row_grp_size
+                    for r_idx in r_grp:
+                        curr_r_to_check[r_idx % row_grp_size] = [idx[1] for idx in i[l_idx][h_idx] if idx[0] == r_idx]
+                    max_row_len = max([len(r) for r in curr_r_to_check])
+                    if curr_span == 0:
+                        total_blocks = np.sum([len(r) for r in curr_r_to_check])
+                        remained_block_counts += [total_blocks]
+                    else:
+                        for r in range(len(curr_r_to_check)):
+                            if len(curr_r_to_check[r]) < max_row_len:
+                                curr_r_to_check[r] += [-1] * (max_row_len - len(curr_r_to_check[r]))
+                        total_sort_iters = ceil(float(max_row_len) / float(curr_span))
+                        curr_sorted_queue = []
+                        for iter in range(total_sort_iters):
+                            curr_iter_sorting_inputs = [r[iter * curr_span : (iter+1) * curr_span] for r in curr_r_to_check]
+                            curr_iter_sorting_res = np.sort(np.unique(np.array(curr_iter_sorting_inputs).flatten()))
+                            if curr_iter_sorting_res[0] == -1:
+                                curr_iter_sorting_res = curr_iter_sorting_res[1:]
+                            curr_sorted_queue += curr_iter_sorting_res.tolist()
+
+                        remained_block_counts += [len(curr_sorted_queue)]
+
+                nblocks_before_rr = len(i[l_idx][h_idx])
+                nblocks_after_rr = np.sum(remained_block_counts)
+                rr_rate_per_inst.append(float(nblocks_after_rr)/nblocks_before_rr)
+
+            rr_rate_vs_span.append(np.mean(rr_rate_per_inst))
+
+        with open("res_fig/block_prune/sweep_rrspan.txt", "a+") as f:
+            f.write(f"l{l_idx}h{h_idx}:{rr_rate_vs_span}\n")
 
 
 def main():
@@ -1420,7 +1370,7 @@ def main():
     inst_list = [f.split(".")[0] \
                  for f in listdir(base_attn_path) \
                     if isfile(base_attn_path + f) and f[0] == "i" and f.endswith(".pt")]
-    inst_list = inst_list[0:1]
+    # inst_list = inst_list[0:1]
 
     # seq_len = 8192
     # dmodel = 2048
@@ -1547,12 +1497,13 @@ def main():
         #                                         plot_figure=False,
         #                                         res_json_path=rpath)
                 
-        rpath = f"res_fig/block_prune/hotpotqa_bprune_fixed"
+        rpath = f"res_fig/block_prune/bprune_sweep_chainlen/10"
         Path(rpath).mkdir(parents=True, exist_ok=True)
-        compute_stacked_matmul_performance(mats_list, 10, (4, 20), 
+        compute_stacked_matmul_performance(mats_list, 10, (2, 19), 
+        # compute_stacked_matmul_performance(mats_list, 14, (2, 14), 
                                         layer_idx, 
-                                        lat_compute_type=["dense", "ideal sparse", "sparse baseline", "blocked prune sparse"], 
-                                        # lat_compute_type=["blocked prune sparse"], 
+                                        # lat_compute_type=["dense", "ideal sparse", "sparse baseline", "blocked prune sparse"], 
+                                        lat_compute_type=["blocked prune sparse"], 
                                         plot_figure=False,
                                         res_json_path=rpath)
     exit()
