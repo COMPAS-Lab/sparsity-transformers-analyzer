@@ -5,7 +5,8 @@ from scipy import optimize
 from sparsemat_hw_modeling import (
     distance_of_dense_vals_per_row, 
     transfer_attn_to_bprune_dense_idx,
-    bprune_sweep_rrspan)
+    bprune_sweep_rrspan,
+    rr2spmm_latency_overlap_analysis)
 import matplotlib
 from matplotlib import pyplot as plt
 import os, json, util
@@ -225,15 +226,33 @@ def plot_rrspan_sweep(dat_file, n_layers, n_heads):
     fig.savefig("res_fig/block_prune/sweep_rrspan.pdf")
 
 
-if __name__ == "__main__":
-    plot_dat_list = [
-        "./res_fig/block_prune/bprune_sweep_chainlen/10",
-        "./res_fig/block_prune/bprune_sweep_chainlen/14",
-    ]
-    label_list = ["10-small", "14-small"]
-    plot_hw_perf(plot_dat_list, label_list, "./res_fig/block_prune/bprune_sweep_chainlen")
-    exit()
+def plot_rr_spmm_latdiff(dat_file, n_layers, n_heads):
+    with open(dat_file, "r") as f:
+        dat = json.load(f)
 
+    for l in range(n_layers):
+        fig, ax = plt.subplots(4, 8, figsize=(20, 10))
+        for h in range(n_heads):
+            for inst_idx, inst in enumerate(dat[f"l{l}h{h}"]):
+                ax[h // 8][h % 8].plot(
+                    list(range(len(inst))), 
+                    inst, 
+                    color=f"C{inst_idx}", 
+                    alpha=0.3,
+                    marker='.', 
+                    label=f"i{inst_idx}:{np.mean(inst):.1f}")
+                
+            ax[h // 8][h % 8].set_xlim(xmin=0)
+            ax[h // 8][h % 8].legend(loc="upper left")
+    
+        fig.tight_layout(rect=(0.03, 0.03, 1, 1))
+        fig.supxlabel("iteration")
+        fig.supylabel("SpMM lat - redundancy removal lat (ns)")
+        fig.savefig(f"res_fig/block_prune/spmm_rr_lat_diff/l{l}.pdf")
+        fig.clf()
+    
+
+if __name__ == "__main__":
     # inst_idx = 4
     base_attn_path = f"/chronos_data/tji/.huggingface_cache/transformers/chatglm2-6b-32k-attn-bfp20-1e-3-hotpotqa-bprune-scaled/"
     # list all insts
@@ -250,10 +269,14 @@ if __name__ == "__main__":
     # res = block_prune_analysis(inst_list, (3, 20), 28, 32)
     # for f in inst_list:
     #     transfer_attn_to_bprune_dense_idx(f, (3, 20))
+
     # bprune_sweep_rrspan(inst_list, [0,1,2,4,6,8,10], 20)
-    plot_rrspan_sweep("res_fig/block_prune/sweep_rrspan.txt", 28, 32)
+    # plot_rrspan_sweep("res_fig/block_prune/sweep_rrspan.txt", 28, 32)
+
+    rr2spmm_latency_overlap_analysis(inst_list[0:4], 12, n_layers=28, n_heads=32, tc_core_shape=(4, 12, 12))
+    plot_rr_spmm_latdiff("res_fig/block_prune/spmm_rr_lat_diff.json", 28, 32)
     exit()
-    # import jsonw
+
     with open("./res_fig/block_prune/bprune_row_density_profile/bpruning_hotpotqa_bthres.json", "w") as f:
         json.dump(res, f)
 

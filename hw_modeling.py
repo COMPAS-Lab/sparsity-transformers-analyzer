@@ -856,6 +856,7 @@ class StratixDpuModel(DpuModel):
         tc_inbuff_loading_lat = self.CHAIN_LEN
         lat_list = [(tc_inbuff_loading_lat + 1) * 3]
         total_latency = 0.0
+        # TODO: delete b req merge lat because it will be moved out
         mat_b_breq_merge_lat = 10
         BARREL_SHIFTER_DELAY = log2Up(self.CHAIN_LEN) + 1
         BRAM_RD_DELAY = 2

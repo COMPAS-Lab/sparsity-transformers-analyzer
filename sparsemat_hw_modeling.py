@@ -1304,9 +1304,9 @@ def transfer_attn_to_bprune_dense_idx(inst, block_shape):
     np.save(f"{base_path}/{fname}.npy", res)
 
 
-def bprune_sweep_rrspan(inst_list: list[str], span_list: list[int], row_grp_size: int):
+def bprune_sweep_rrspan(inst_list: list[str], span_list: list[int], row_grp_size: int, n_layers: int = 28, n_heads: int = 32):
     block_ids = [np.load(i, allow_pickle=True) for i in inst_list]
-    for l_idx, h_idx in product(range(28), range(32)):
+    for l_idx, h_idx in product(range(n_layers), range(n_heads)):
         print(f"examine l{l_idx}h{h_idx}...")
         rr_rate_vs_span = []
         for curr_span in span_list:
@@ -1349,6 +1349,64 @@ def bprune_sweep_rrspan(inst_list: list[str], span_list: list[int], row_grp_size
             f.write(f"l{l_idx}h{h_idx}:{rr_rate_vs_span}\n")
 
 
+def rr2spmm_latency_overlap_analysis(
+        inst_list: list[str], 
+        row_grp_size: int, 
+        n_layers: int = 28, n_heads: int = 32,
+        tc_core_shape: tuple[int, int, int] = (4, 12, 12)):
+    '''
+    check if the spmm operation can overlap with redundancy removal based on the 
+    block pruned sparse attention
+    '''
+    spmm_freq, rremover_freq = 300.0, 150.0
+    spmm_cycle_delay, rremover_cycle_delay = 1./spmm_freq * 1000., 1./rremover_freq * 1000.
+    tc_row, tc_col, tc_chain_len = tc_core_shape
+    matB_rotate_delay = 4
+    block_ids = [np.load(i, allow_pickle=True) for i in inst_list]
+
+    assert(tc_col == row_grp_size, "#cols needs to be the same as row group size")
+    assert(tc_col == tc_chain_len, "#cols needs to be the same as chain length size")
+
+    res = {}
+    for l_idx, h_idx in tqdm(product(range(n_layers), range(n_heads))):
+        perhead_latdiff_rec = []
+        for i in block_ids:
+            #split block ids into many row groups
+            all_row_idx = np.unique([r[0] for r in i[l_idx][h_idx]])
+            split_ridx_list = [(i + 1) * row_grp_size for i in range(ceil(float(all_row_idx.shape[0]) / row_grp_size))]
+            row_grps = np.split(all_row_idx, split_ridx_list[0:-1])
+            spmm_rr_latdiff = []
+            for r_grp_idx in range(len(row_grps)-1):
+                curr_blk_cols = [blk[1] for blk in i[l_idx][h_idx] if blk[0] in row_grps[r_grp_idx]]
+                curr_blk_cols = np.unique(curr_blk_cols)
+                curr_cols_loading_iters = ceil(float(curr_blk_cols.shape[0]) / tc_chain_len)
+                # spmm latency: #col loading iterations x delay per iter which depends on 
+                # wether the Arow loading dominates it or the computation
+                # here when computing the mult latency, we assume that each sub A row does 
+                # not need to fulfill any entire tensor core chains, so that it doesn't need
+                # to track the utilization or capacity of each tensor core chain
+                if curr_cols_loading_iters > 1:
+                    spmm_latency = max(
+                        (tc_chain_len+1) * 3, 
+                        (128.0 / tc_row + matB_rotate_delay) * curr_cols_loading_iters)
+                else:
+                    spmm_latency = (128.0 / tc_row + matB_rotate_delay) * curr_cols_loading_iters
+                # and + the initial Arow loading
+                spmm_latency += (tc_chain_len + 2) * 3
+                # now we compute the redundant remover latency of the next group
+                next_blk_cols = [blk[1] for blk in i[l_idx][h_idx] if blk[0] in row_grps[r_grp_idx + 1]]
+                rremover_latency = 45
+                rremover_latency += ceil(float(len(next_blk_cols)) / float(tc_col))
+                # collect results
+                spmm_rr_latdiff.append(spmm_latency * spmm_cycle_delay - rremover_latency * rremover_cycle_delay)
+            perhead_latdiff_rec.append(spmm_rr_latdiff)
+
+        res[f"l{l_idx}h{h_idx}"] = perhead_latdiff_rec
+        
+        
+    with open("res_fig/block_prune/spmm_rr_lat_diff.json", "w+") as f:
+        json.dump(res, f)
+
 def main():
     data_path = "/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/"
     output_path = "./res_fig/"
@@ -1370,7 +1428,7 @@ def main():
     inst_list = [f.split(".")[0] \
                  for f in listdir(base_attn_path) \
                     if isfile(base_attn_path + f) and f[0] == "i" and f.endswith(".pt")]
-    # inst_list = inst_list[0:1]
+    inst_list = inst_list[0:4]
 
     # seq_len = 8192
     # dmodel = 2048
