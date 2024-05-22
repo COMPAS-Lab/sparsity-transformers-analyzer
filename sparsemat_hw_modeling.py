@@ -19,7 +19,7 @@ import json
 from functools import reduce
 from analyze_tcblock_vs_matsize import closest_factors_to_target
 from os import listdir
-from os.path import isfile, dirname, abspath
+from os.path import isfile, dirname, abspath, basename, dirname
 
 TCCORE_COL_SIZE = 3
 TCCORE_SIZE = 20
@@ -209,6 +209,7 @@ def compute_matmul_performance(data, chain_len, out_w, hw_array_shape, \
         # use a dense mat to calculate dens mat base lat
         if "dense" in perf_eva_list:
             fake_dense_data = np.ones(exps.shape)
+            fake_dense_data = np.tril(fake_dense_data)
             dense_model = hw_modeling.StratixDpuModel(exps.shape[0], exps.shape[1], exps.shape[1], out_w, \
                                             exp_dat=fake_dense_data, freq=freq, num_tcs=3960, tcc_array_shape=hw_array_shape, \
                                             tcc_chainlen=chain_len)
@@ -1364,9 +1365,6 @@ def rr2spmm_latency_overlap_analysis(
     matB_rotate_delay = 4
     block_ids = [np.load(i, allow_pickle=True) for i in inst_list]
 
-    assert(tc_col == row_grp_size, "#cols needs to be the same as row group size")
-    assert(tc_col == tc_chain_len, "#cols needs to be the same as chain length size")
-
     res = {}
     for l_idx, h_idx in tqdm(product(range(n_layers), range(n_heads))):
         perhead_latdiff_rec = []
@@ -1406,6 +1404,161 @@ def rr2spmm_latency_overlap_analysis(
         
     with open("res_fig/block_prune/spmm_rr_lat_diff.json", "w+") as f:
         json.dump(res, f)
+
+
+def spmm_non_rr_latency_analysis(
+        inst_list: list[str], 
+        row_grp_size: int, 
+        n_layers: int = 28, n_heads: int = 32,
+        tc_core_shape: tuple[int, int, int] = (4, 12, 12)):
+    '''
+    compute latency of the model without redundancy removal
+    '''
+    # fetch sequence length
+    seq_lens = []
+    for i in inst_list:
+        dir_path = dirname(i)
+        fname = basename(i).split(".")[0] + ".pt"
+        pt_data_path = dir_path + "/" + fname
+    
+        dat = torch.load(pt_data_path)
+        seq_lens.append(dat.size()[-1])
+        del(dat)
+
+    spmm_freq = 300.0
+    spmm_cycle_delay = 1./spmm_freq * 1000.
+    tc_row, tc_col, tc_chain_len = tc_core_shape
+    block_ids = [np.load(i, allow_pickle=True) for i in inst_list]
+
+    res = {}
+    for l_idx, h_idx in tqdm(product(range(n_layers), range(n_heads)), unit="head"):
+        perhead_latdiff_rec = {"lat_diff": [], "total_lat": [], "total_tops": []}
+        for inst_idx, i in enumerate(block_ids):
+            #split block ids into many row groups
+            all_row_idx = np.unique([r[0] for r in i[l_idx][h_idx]])
+            split_ridx_list = [(i + 1) * row_grp_size for i in range(ceil(float(all_row_idx.shape[0]) / row_grp_size))]
+            row_grps = np.split(all_row_idx, split_ridx_list[0:-1])
+            
+            curr_iter_lat = 0
+            for curr_row_grp in row_grps:
+                for r in curr_row_grp:
+                    selected_blocks = [blk[1] for blk in i[l_idx][h_idx] if blk[0] == r]
+                    # ignore the mat A loading latency here, assuming it can be hidden by 
+                    # the computation of the entire row
+                    curr_iter_lat += (128.0 / tc_row * ceil(len(selected_blocks) / tc_chain_len))
+
+            curr_iter_lat += 3 * (tc_chain_len + 1)
+            curr_iter_lat *= spmm_cycle_delay
+
+            perhead_latdiff_rec["total_lat"].append(curr_iter_lat)
+            # calculate throughput
+            l = seq_lens[inst_idx]
+            ops = l * l * 2 * 128
+            curr_actual_flops = float(ops) / (float(curr_iter_lat) * 1e-9) / 1e12
+            perhead_latdiff_rec["total_tops"].append(curr_actual_flops)
+
+        if l_idx == 0 and h_idx == 0:
+            res = {}
+        else:
+            with open(f"res_fig/block_prune/spmm_worr_lat_diff.json", "r") as f:
+                res = json.load(f)
+
+        with open(f"res_fig/block_prune/spmm_worr_lat_diff.json", "w") as f:
+            print(f"\nwriting l{l_idx}h{h_idx} results...")
+            res[f"l{l_idx}h{h_idx}"] = perhead_latdiff_rec
+            json.dump(res, f)
+
+
+def rr2spmm_fifo_latency_overlap_analysis(
+        inst_list: list[str], 
+        row_grp_size: int, 
+        n_layers: int = 28, n_heads: int = 32,
+        tc_core_shape: tuple[int, int, int] = (4, 12, 12),
+        fifo_depth: int = 400):
+    '''
+    check if the spmm operation can overlap with redundancy removal based on the 
+    block pruned sparse attention
+    '''
+    # fetch sequence length
+    seq_lens = []
+    for i in inst_list:
+        dir_path = dirname(i)
+        fname = basename(i).split(".")[0] + ".pt"
+        pt_data_path = dir_path + "/" + fname
+    
+        dat = torch.load(pt_data_path)
+        seq_lens.append(dat.size()[-1])
+        del(dat)
+
+    spmm_freq, rremover_freq = 300.0, 150.0
+    spmm_cycle_delay, rremover_cycle_delay = 1./spmm_freq * 1000., 1./rremover_freq * 1000.
+    tc_row, tc_col, tc_chain_len = tc_core_shape
+    matB_rotate_delay = 4
+    block_ids = [np.load(i, allow_pickle=True) for i in inst_list]
+
+    res = {}
+    for l_idx, h_idx in tqdm(product(range(n_layers), range(n_heads)), unit="head"):
+        perhead_latdiff_rec = {"lat_diff": [], "total_lat": [], "total_tops": []}
+        for inst_idx, i in enumerate(block_ids):
+            #split block ids into many row groups
+            all_row_idx = np.unique([r[0] for r in i[l_idx][h_idx]])
+            split_ridx_list = [(i + 1) * row_grp_size for i in range(ceil(float(all_row_idx.shape[0]) / row_grp_size))]
+            row_grps = np.split(all_row_idx, split_ridx_list[0:-1])
+            
+            spmm_rr_latdiff, spmm_rr_actual_lat = [], 0.0
+            row_grps_for_spmm = []
+
+            while len(row_grps) > 0 or len(row_grps_for_spmm):
+                #spmm latency:
+                spmm_latency = 0
+                if row_grps_for_spmm:
+                    for spmm_row_grp in row_grps_for_spmm:
+                        curr_cols_loading_iters = ceil(float(spmm_row_grp.shape[0]) / tc_chain_len)
+                        if curr_cols_loading_iters > 1:
+                            spmm_latency += max(
+                                (tc_chain_len + 1) * 3, 
+                                (128.0 / tc_row + matB_rotate_delay) * curr_cols_loading_iters)
+                        else:
+                            spmm_latency += (128.0 / tc_row + matB_rotate_delay) * curr_cols_loading_iters
+
+
+                # compute index generation latency
+                # compute them until it reaches a threshold defined by the FIFO
+                row_grps_for_spmm = []
+                n_sorted_idces, rremover_latency = 0, 0
+                while(n_sorted_idces < (fifo_depth / 2.0) and len(row_grps) > 0):
+                    next_blk_cols = [blk[1] for blk in i[l_idx][h_idx] if blk[0] in row_grps[0]]
+                    row_grps_for_spmm.append(np.unique(next_blk_cols))
+                    n_sorted_idces += np.unique(next_blk_cols).size
+                    rremover_latency = 45
+                    rremover_latency += ceil(float(len(next_blk_cols)) / float(tc_col))
+                    row_grps.pop(0)
+                if(len(row_grps) == 0 and spmm_latency == 0):
+                    print("\nall idx groups are loaded into the FIFO in the first iter!")
+                # collect results
+                spmm_rr_latdiff.append(spmm_latency * spmm_cycle_delay - rremover_latency * rremover_cycle_delay)
+                spmm_rr_actual_lat += max(spmm_latency * spmm_cycle_delay, rremover_latency * rremover_cycle_delay)
+                
+            perhead_latdiff_rec["lat_diff"].append(spmm_rr_latdiff)
+            perhead_latdiff_rec["total_lat"].append(spmm_rr_actual_lat)
+            # calculate throughput
+            l = seq_lens[inst_idx]
+            ops = l * l * 2 * 128
+            spmm_rr_actual_flops = float(ops) / (float(spmm_rr_actual_lat) * 1e-9) / 1e12
+            perhead_latdiff_rec["total_tops"].append(spmm_rr_actual_flops)
+
+        res[f"l{l_idx}h{h_idx}"] = perhead_latdiff_rec
+        
+        if l_idx == 0 and h_idx == 0:
+            res = {}
+        else:
+            with open(f"res_fig/block_prune/spmm_rr_lat_diff_wfifo_{fifo_depth}.json", "r") as f:
+                res = json.load(f)
+
+        with open(f"res_fig/block_prune/spmm_rr_lat_diff_wfifo_{fifo_depth}.json", "w") as f:
+            print(f"\nwriting l{l_idx}h{h_idx} results...")
+            res[f"l{l_idx}h{h_idx}"] = perhead_latdiff_rec
+            json.dump(res, f)
 
 def main():
     data_path = "/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/"
@@ -1555,13 +1708,12 @@ def main():
         #                                         plot_figure=False,
         #                                         res_json_path=rpath)
                 
-        rpath = f"res_fig/block_prune/bprune_sweep_chainlen/10"
+        rpath = f"res_fig/block_prune/hotpotqa_bprune_fixed"
         Path(rpath).mkdir(parents=True, exist_ok=True)
-        compute_stacked_matmul_performance(mats_list, 10, (2, 19), 
-        # compute_stacked_matmul_performance(mats_list, 14, (2, 14), 
+        compute_stacked_matmul_performance(mats_list, 12, (4, 12), 
                                         layer_idx, 
                                         # lat_compute_type=["dense", "ideal sparse", "sparse baseline", "blocked prune sparse"], 
-                                        lat_compute_type=["blocked prune sparse"], 
+                                        lat_compute_type=["dense"], 
                                         plot_figure=False,
                                         res_json_path=rpath)
     exit()

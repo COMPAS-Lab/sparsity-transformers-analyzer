@@ -8,6 +8,7 @@ import sys, logging
 import skimage.measure
 import logging
 import sympy as sp
+from deprecated import deprecated
 from itertools import chain
 
 formatter = logging.Formatter('%(name)s - %(levelname)s - %(message)s')
@@ -634,8 +635,14 @@ class StratixDpuModel(DpuModel):
             mat_a_loading_latency = []
             for idx, max_a_loading in enumerate(mat_a_to_load_in_row_grps):
                 chain_loading_a_lat = 0.0
-                a = max(effective_loading_lat * 3, mat_b_cols_used_to_hide_a_loading)
-                hw_modeling_logger.info(f"loading lat vs. computing: {effective_loading_lat*3}, {mat_b_cols_used_to_hide_a_loading}")
+                full_grp_loading = effective_loading_lat * 3
+                if idx == len(mat_a_to_load_in_row_grps) - 1:
+                    equi_loading_lat = 0
+                else:
+                    next_grp_loading = round(mat_a_to_load_in_row_grps[idx+1] / self.TCCORE_SIZE) * 3
+                    equi_loading_lat = min(next_grp_loading, full_grp_loading)
+                a = max(equi_loading_lat, mat_b_cols_used_to_hide_a_loading)
+                hw_modeling_logger.info(f"loading lat vs. computing: {equi_loading_lat}, {mat_b_cols_used_to_hide_a_loading}")
                 if (effective_loading_lat * 3) < mat_b_cols_used_to_hide_a_loading:
                     hw_modeling_logger.info("mat b computing dominants the a loading")
                 
@@ -644,7 +651,8 @@ class StratixDpuModel(DpuModel):
                 # first iteration of loading: including the latency of entry tc
                 chain_loading_a_lat = chain_loading_grps * a
                 if idx == 0:
-                    chain_loading_a_lat += (effective_loading_lat + 1) * 3
+                    equi_loading_lat = round(mat_a_to_load_in_row_grps[idx] / self.TCCORE_SIZE)
+                    chain_loading_a_lat += (equi_loading_lat + 1) * 3
                 mat_a_loading_latency.append(chain_loading_a_lat)
  
             # compute the latency block by block
@@ -850,6 +858,9 @@ class StratixDpuModel(DpuModel):
                 hw_modeling_logger.info(f"mat b load imbalance: {min_schlen}/{max_schlen}")
                 all_tccol_loads = np.unique(np.array(list(chain(*scheduled_tccol_loads))))
                 mat_b_rcycles_per_joint_a_block.append(all_tccol_loads.shape[0] // self.CHAIN_LEN)
+                tccol_used_counter = 0
+                scheduled_tccol_loads = [[] for _ in range(self.NUM_TCC_COLS)]
+
         # mat_b_rcycles_per_joint_a_block now saves how many iterations 
         # per a block needs to get its associated mat b block for an entire tc row
         
@@ -1033,6 +1044,7 @@ class StratixDpuModel(DpuModel):
         hw_modeling_logger.info(f"total util: {grp_util:.3f}")
         return flops, lat_ret, grp_util
     
+    @deprecated(reason="deprecated because of hardware failure")
     def tensor_rorp_sparse_flops(self, 
                                     sparse_mat, ideal=False, 
                                     sparse_block_size = 10.0,
@@ -1043,6 +1055,7 @@ class StratixDpuModel(DpuModel):
         sparse mat row reordering and heavily-accessed mat B elements replication.
         The parameters for the replication are hardcoded based on the analysis in 
         mem_matb_select_modeling.py
+        This method is deprecrated because of hardware timing failure.
         '''
         round = lambda x: x if ideal else ceil(x)
         get_padded_size = lambda x, fac: ceil(float(x)/fac) * fac

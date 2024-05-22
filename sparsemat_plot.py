@@ -6,11 +6,14 @@ from sparsemat_hw_modeling import (
     distance_of_dense_vals_per_row, 
     transfer_attn_to_bprune_dense_idx,
     bprune_sweep_rrspan,
-    rr2spmm_latency_overlap_analysis)
+    rr2spmm_latency_overlap_analysis,
+    spmm_non_rr_latency_analysis,
+    rr2spmm_fifo_latency_overlap_analysis)
 import matplotlib
 from matplotlib import pyplot as plt
 import os, json, util
 from tqdm import tqdm
+from itertools import product
 
 def gen_spmat_by_sparsity(ref_mat: np.array, 
                           target_seqlen: int, 
@@ -226,14 +229,17 @@ def plot_rrspan_sweep(dat_file, n_layers, n_heads):
     fig.savefig("res_fig/block_prune/sweep_rrspan.pdf")
 
 
-def plot_rr_spmm_latdiff(dat_file, n_layers, n_heads):
+def plot_rr_spmm_latdiff(dat_file, n_layers, n_heads, res_file):
     with open(dat_file, "r") as f:
         dat = json.load(f)
 
+    latdiff_profile = {}
     for l in range(n_layers):
         fig, ax = plt.subplots(4, 8, figsize=(20, 10))
         for h in range(n_heads):
-            for inst_idx, inst in enumerate(dat[f"l{l}h{h}"]):
+            lat_diff_per_head = []
+            for inst_idx, inst in enumerate(dat[f"l{l}h{h}"]["lat_diff"]):
+                lat_diff_per_head += inst
                 ax[h // 8][h % 8].plot(
                     list(range(len(inst))), 
                     inst, 
@@ -244,13 +250,50 @@ def plot_rr_spmm_latdiff(dat_file, n_layers, n_heads):
                 
             ax[h // 8][h % 8].set_xlim(xmin=0)
             ax[h // 8][h % 8].legend(loc="upper left")
+            latdiff_profile[f"l{l}h{h}"] = {"min": np.amin(lat_diff_per_head), "mean": np.mean(lat_diff_per_head)}
     
         fig.tight_layout(rect=(0.03, 0.03, 1, 1))
         fig.supxlabel("iteration")
         fig.supylabel("SpMM lat - redundancy removal lat (ns)")
-        fig.savefig(f"res_fig/block_prune/spmm_rr_lat_diff/l{l}.pdf")
+        fig.savefig(f"res_fig/block_prune/spmm_rr_lat_diff_wfifo/l{l}.pdf")
         fig.clf()
     
+    with open(res_file, "w") as f:
+        json.dump(latdiff_profile, f)
+
+def plot_rr_spmm_lat(dat_files, n_layers, n_heads, res_file):
+    dats = []
+    for pa in dat_files:
+        with open(pa, "r") as f:
+            dats.append(json.load(f))
+    
+    res = {}
+    for fname, dat in zip(dat_files, dats):
+        latdiff_profile, lat_profile, tops_profile = [], [], []
+        for l, h in product(range(n_layers), range(n_heads)):
+            lat_diff_per_head = []
+
+            if dat[f"l{l}h{h}"]["lat_diff"]:
+                for inst in dat[f"l{l}h{h}"]["lat_diff"]:
+                    lat_diff_per_head += inst[1:]
+                
+                if lat_diff_per_head:
+                    latdiff_profile += lat_diff_per_head
+
+            lat_profile += dat[f"l{l}h{h}"]["total_lat"]
+            tops_profile += dat[f"l{l}h{h}"]["total_tops"]
+        
+        res[f"{os.path.basename(fname)}"] = {}
+        if latdiff_profile:
+            res[f"{os.path.basename(fname)}"]["latdiff min"] = np.amin(latdiff_profile)
+            res[f"{os.path.basename(fname)}"]["latdiff mean"] = np.mean(latdiff_profile)
+
+        res[f"{os.path.basename(fname)}"]["lat mean"] = np.mean(lat_profile)
+        res[f"{os.path.basename(fname)}"]["tops mean"] = np.mean(tops_profile)
+
+    with open(res_file, "w") as f:
+        json.dump(res, f, indent=2)
+
 
 if __name__ == "__main__":
     # inst_idx = 4
@@ -273,8 +316,26 @@ if __name__ == "__main__":
     # bprune_sweep_rrspan(inst_list, [0,1,2,4,6,8,10], 20)
     # plot_rrspan_sweep("res_fig/block_prune/sweep_rrspan.txt", 28, 32)
 
-    rr2spmm_latency_overlap_analysis(inst_list[0:4], 12, n_layers=28, n_heads=32, tc_core_shape=(4, 12, 12))
-    plot_rr_spmm_latdiff("res_fig/block_prune/spmm_rr_lat_diff.json", 28, 32)
+    fdeps = [20, 50, 100, 200, 500, 800]
+    def rr2spmm_wrap(fdep): 
+        rr2spmm_fifo_latency_overlap_analysis(inst_list[0:4], 12, 28, 32, (4, 12, 12), fdep)
+    
+    import multiprocessing
+    with multiprocessing.Pool() as pool:
+        pool.map(rr2spmm_wrap, fdeps)
+        
+    profile_list = [
+        "res_fig/block_prune/spmm_rr_lat_diff_wfifo_20.json",
+        "res_fig/block_prune/spmm_rr_lat_diff_wfifo_50.json",
+        "res_fig/block_prune/spmm_rr_lat_diff_wfifo_100.json",
+        "res_fig/block_prune/spmm_rr_lat_diff_wfifo_200.json",
+        "res_fig/block_prune/spmm_rr_lat_diff_wfifo_500.json",
+        "res_fig/block_prune/spmm_rr_lat_diff_wfifo_800.json",
+        "res_fig/block_prune/spmm_worr_lat_diff.json"
+    ]
+    plot_rr_spmm_lat(profile_list, 28, 32, "res_fig/block_prune/spmm_rr_lat_profile.json")
+
+    # spmm_non_rr_latency_analysis(inst_list[0:4], 12, 28, 32, (4, 12, 12))
     exit()
 
     with open("./res_fig/block_prune/bprune_row_density_profile/bpruning_hotpotqa_bthres.json", "w") as f:
