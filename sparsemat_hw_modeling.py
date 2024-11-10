@@ -1445,7 +1445,7 @@ def spmm_non_rr_latency_analysis(
                     selected_blocks = [blk[1] for blk in i[l_idx][h_idx] if blk[0] == r]
                     # ignore the mat A loading latency here, assuming it can be hidden by 
                     # the computation of the entire row
-                    curr_iter_lat += (128.0 / tc_row * ceil(len(selected_blocks) / tc_chain_len))
+                    curr_iter_lat += (ceil(128.0 / tc_row) * ceil(len(selected_blocks) / tc_chain_len))
 
             curr_iter_lat += 3 * (tc_chain_len + 1)
             curr_iter_lat *= spmm_cycle_delay
@@ -1517,9 +1517,9 @@ def rr2spmm_fifo_latency_overlap_analysis(
                         if curr_cols_loading_iters > 1:
                             spmm_latency += max(
                                 (tc_chain_len + 1) * 3, 
-                                (128.0 / tc_row + matB_rotate_delay) * curr_cols_loading_iters)
+                                (ceil(128.0 / tc_row) + matB_rotate_delay) * curr_cols_loading_iters)
                         else:
-                            spmm_latency += (128.0 / tc_row + matB_rotate_delay) * curr_cols_loading_iters
+                            spmm_latency += (ceil(128.0 / tc_row) + matB_rotate_delay) * curr_cols_loading_iters
 
 
                 # compute index generation latency
@@ -1527,11 +1527,16 @@ def rr2spmm_fifo_latency_overlap_analysis(
                 row_grps_for_spmm = []
                 n_sorted_idces, rremover_latency = 0, 0
                 while(n_sorted_idces < (fifo_depth / 2.0) and len(row_grps) > 0):
-                    next_blk_cols = [blk[1] for blk in i[l_idx][h_idx] if blk[0] in row_grps[0]]
+                    next_blk_cols, input_sizes = [], []
+                    for r in row_grps[0]:
+                        curr_row_blks = [blk[1] for blk in i[l_idx][h_idx] if r == blk[0]]
+                        next_blk_cols += curr_row_blks
+                        input_sizes.append(len(curr_row_blks))
+                    input_cycles = max(input_sizes)
                     row_grps_for_spmm.append(np.unique(next_blk_cols))
                     n_sorted_idces += np.unique(next_blk_cols).size
-                    rremover_latency = 45
-                    rremover_latency += ceil(float(len(next_blk_cols)) / float(tc_col))
+                    rremover_latency = 82
+                    rremover_latency += input_cycles
                     row_grps.pop(0)
                 if(len(row_grps) == 0 and spmm_latency == 0):
                     print("\nall idx groups are loaded into the FIFO in the first iter!")
@@ -1581,7 +1586,7 @@ def main():
     inst_list = [f.split(".")[0] \
                  for f in listdir(base_attn_path) \
                     if isfile(base_attn_path + f) and f[0] == "i" and f.endswith(".pt")]
-    inst_list = inst_list[0:4]
+    inst_list = inst_list
 
     # seq_len = 8192
     # dmodel = 2048
@@ -1708,9 +1713,9 @@ def main():
         #                                         plot_figure=False,
         #                                         res_json_path=rpath)
                 
-        rpath = f"res_fig/block_prune/hotpotqa_bprune_fixed"
+        rpath = f"res_fig/block_prune/hotpotqa_bprune_r6_c12_l8"
         Path(rpath).mkdir(parents=True, exist_ok=True)
-        compute_stacked_matmul_performance(mats_list, 12, (4, 12), 
+        compute_stacked_matmul_performance(mats_list, 8, (6, 12), 
                                         layer_idx, 
                                         # lat_compute_type=["dense", "ideal sparse", "sparse baseline", "blocked prune sparse"], 
                                         lat_compute_type=["dense"], 

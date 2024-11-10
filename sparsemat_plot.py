@@ -316,26 +316,23 @@ if __name__ == "__main__":
     # bprune_sweep_rrspan(inst_list, [0,1,2,4,6,8,10], 20)
     # plot_rrspan_sweep("res_fig/block_prune/sweep_rrspan.txt", 28, 32)
 
+    # hardware config
+    nrows, ncols, chain_len = 6, 12, 8
     fdeps = [20, 50, 100, 200, 500, 800]
     def rr2spmm_wrap(fdep): 
-        rr2spmm_fifo_latency_overlap_analysis(inst_list[0:4], 12, 28, 32, (4, 12, 12), fdep)
+        rr2spmm_fifo_latency_overlap_analysis(inst_list, 12, 28, 32, (nrows, ncols, chain_len), fdep)
     
     import multiprocessing
     with multiprocessing.Pool() as pool:
         pool.map(rr2spmm_wrap, fdeps)
-        
-    profile_list = [
-        "res_fig/block_prune/spmm_rr_lat_diff_wfifo_20.json",
-        "res_fig/block_prune/spmm_rr_lat_diff_wfifo_50.json",
-        "res_fig/block_prune/spmm_rr_lat_diff_wfifo_100.json",
-        "res_fig/block_prune/spmm_rr_lat_diff_wfifo_200.json",
-        "res_fig/block_prune/spmm_rr_lat_diff_wfifo_500.json",
-        "res_fig/block_prune/spmm_rr_lat_diff_wfifo_800.json",
-        "res_fig/block_prune/spmm_worr_lat_diff.json"
-    ]
-    plot_rr_spmm_lat(profile_list, 28, 32, "res_fig/block_prune/spmm_rr_lat_profile.json")
 
-    # spmm_non_rr_latency_analysis(inst_list[0:4], 12, 28, 32, (4, 12, 12))
+    spmm_non_rr_latency_analysis(inst_list, 12, 28, 32, (nrows, ncols, chain_len))
+        
+    profile_list = [f"res_fig/block_prune/spmm_rr_lat_diff_wfifo_{i}.json" for i in fdeps]
+    profile_list.append("res_fig/block_prune/spmm_worr_lat_diff.json")
+    plot_rr_spmm_lat(profile_list, 28, 32, 
+                     f"res_fig/block_prune/spmm_rr_lat_profile_r{nrows}_c{ncols}_l{chain_len}.json")
+
     exit()
 
     with open("./res_fig/block_prune/bprune_row_density_profile/bpruning_hotpotqa_bthres.json", "w") as f:
