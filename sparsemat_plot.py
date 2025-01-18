@@ -2,21 +2,22 @@ import numpy as np
 import random
 import torch
 from scipy import optimize
+import hw_modeling
 from sparsemat_hw_modeling import (
     distance_of_dense_vals_per_row, 
+    PerfData, 
     transfer_attn_to_bprune_dense_idx,
     bprune_sweep_rrspan,
     rr2spmm_latency_overlap_analysis,
     spmm_non_rr_latency_analysis,
+    get_tccore_config,
     rr2spmm_fifo_latency_overlap_analysis)
 import matplotlib
 from matplotlib import pyplot as plt
 import os, json, util
-from tqdm import tqdm
-from itertools import product, chain
+from itertools import product
 import pandas as pd
 import seaborn as sns
-import textwrap
 
 def gen_spmat_by_sparsity(ref_mat: np.array, 
                           target_seqlen: int, 
@@ -472,7 +473,119 @@ def plot_rr_spmm_lat(dat_files, n_layers, n_heads, res_file):
         json.dump(res, f, indent=2)
 
 
+def get_onchip_res(dat_path, models_name, tasks_name, spmm_freq=300.0, tc_core_shape=(6, 12, 8)):
+    if dat_path[-1] != "/":
+        dat_path += "/"
+
+    spmm_cycle_delay = 1./spmm_freq * 1000.
+
+    # create pandas dataframe with columns: model,  task, onchip_lat, onchip_tp, seq_len
+    df = pd.DataFrame(columns=["model", "task", "inst_id", "head_id", "onchip_lat", "onchip_tp", "seq_len", "dense_lat", "dense_tp"])
+
+    # get the onchip res from the dat_path
+    for model, task in product(models_name, tasks_name):
+        model_task_path = os.path.join(dat_path + f"{model}-attn-bfp20-{task}/")
+        # get subdirs under model_task_path
+        subdirs = [os.path.join(model_task_path, d) for d in os.listdir(model_task_path) if os.path.isdir(os.path.join(model_task_path, d))]
+        for subdir in subdirs:
+            # get the inst_id from the subdir name
+            inst_id = subdir.split("/")[-1]
+            # get the seq_len from the subdir's "inst_profile.json" file
+            with open(os.path.join(subdir, "inst_profile.json"), "r") as f:
+                inst_profile = json.load(f)
+                seq_len = inst_profile["seq_len"]
+
+            # get dense res based on seq_len
+            fake_dense_data = np.ones((seq_len, seq_len))
+            fake_dense_data = np.tril(fake_dense_data)
+            hw_array_shape = (tc_core_shape[0], tc_core_shape[1])
+            dense_model = hw_modeling.StratixDpuModel(seq_len, 
+                                                        seq_len, 
+                                                        seq_len, 
+                                                        128,
+                                                        exp_dat=fake_dense_data, 
+                                                        freq=spmm_freq, 
+                                                        num_tcs=3960, 
+                                                        tcc_array_shape=hw_array_shape, 
+                                                        tcc_chainlen=tc_core_shape[2])
+            dense_model.set_tccore_size(20)
+            dense_flops, dense_lat, dense_util = \
+                dense_model.tensor_fpga21_mat_sparse_flops(fake_dense_data, sparse_block_size=20)
+            
+            dense_res = PerfData()
+            dense_res.total_lat += dense_lat
+            total_ops = seq_len * seq_len * 2 * 128
+            dense_res.add_data(dense_util, "util")
+            dense_res.set_flops(total_ops)
+
+            # search for all the files starting with "hwconfig_h" and ending with ".json" under subdir
+            hwconfig_files = [os.path.join(subdir, f) for f in os.listdir(subdir) if f.startswith("hwconfig_h") and f.endswith(".json")]
+            for hwconfig_file in hwconfig_files:
+                hwconfig = None
+                # get the head id from the hwconfig_file with the format "hwconfig_h{head_id}.json"
+                hid = int(hwconfig_file.split("_")[-1].split(".")[0][1:])
+                with open(hwconfig_file, "r") as f:
+                    hwconfig = json.load(f)
+
+                if hwconfig.get("lat_counter_res", None) is not None:
+                    # get the onchip_lat and onchip_tp from the hwconfig
+                    latency_res = hwconfig["lat_counter_res"] * spmm_cycle_delay
+                    spmm_rr_flops = float(total_ops) / (float(latency_res) * 1e-9) / 1e12
+
+                    # append the onchip_lat, onchip_tp, seq_len to the df
+                    df.loc[len(df)] = {
+                                        "model": model, 
+                                        "task": task, 
+                                        "inst_id": inst_id, 
+                                        "head_id": hid,
+                                        "onchip_lat": latency_res, 
+                                        "onchip_tp": spmm_rr_flops, 
+                                        "seq_len": seq_len, 
+                                        "dense_lat": dense_res.total_lat, 
+                                        "dense_tp": dense_res.total_flops
+                    }
+
+    df.to_csv("./res_fig/block_prune/onchip_res.csv")
+    return df
+
+def plot_onchip_res(dat: pd.DataFrame):
+    dat["speedup"] = dat["onchip_tp"] / dat["dense_tp"]
+    # delete the "inst_id" column
+    dat = dat.drop(columns=["inst_id"])
+    # calculate the mean of onchip_tp of different inst_id for the same model and task
+    dat_mean = dat.groupby(["model", "task"], group_keys=True).mean()
+
+    # set the plot size to be 16,  6 for seaborn barplot
+    sns.set(rc={'figure.figsize':(16, 6)}, font_scale=1.3)
+    
+    print(dat_mean)
+
+    # plot the mean of onchip_tp and dense_tp in a same bar chart, on the x-axis group tasks 
+    # with the same model without gaps, and add a gap between each model    
+    model_seq = ["chatglm2-6b-32k", "llama2-7b-chat-4k", "mixtral-8x7b"]
+    task_seq = ["lcc", "multifieldqa_en", "multifieldqa_zh", "passage_retrieval_zh", "qasper", "samsum", "trec", "vcsum"]
+    bplot = sns.barplot(dat_mean, x="task", y="speedup", hue="model",
+                        width=0.4, palette={"llama2-7b-chat-4k": "C1", "mixtral-8x7b": "C2", "chatglm2-6b-32k": "C0"})
+
+    # for cont_idx, i in enumerate(bplot.containers):
+    #     labels = [int(dat_mean.loc[model_seq[cont_idx], task_seq[task_idx]]["seq_len"]) for task_idx in range(len(task_seq))]
+    #     bplot.bar_label(i, labels, fmt='%d')
+        
+    bplot.set_ylabel("throughput speedup")
+    bplot.set_ylim(ymin=0, ymax=7)
+
+    # set the legend to be outside the plot, and one line for each legend
+    bplot.get_figure().axes[0].legend(loc="upper center", ncol=3)
+    bplot.get_figure().tight_layout()
+    bplot.get_figure().savefig("./res_fig/block_prune/onchip_res_speedup.pdf")
+
 if __name__ == "__main__":
+    # hardware config
+    # hw_shapes = get_tccore_config((range(9, 18, 1)), 864, 11*16)
+    # print(hw_shapes)
+    hw_shapes = [
+    ]
+
     # inst_idx = 4
     model_names = ["llama2-7b-chat-4k", "mixtral-8x7b", "chatglm2-6b-32k"]
     task_list = ["lcc", "multifieldqa_en", "multifieldqa_zh", "passage_retrieval_zh", "qasper", "samsum", "trec", "vcsum"]
@@ -502,38 +615,57 @@ if __name__ == "__main__":
     # bprune_sweep_rrspan(inst_list, [0,1,2,4,6,8,10], 20)
     # plot_rrspan_sweep("res_fig/block_prune/sweep_rrspan.txt", 28, 32)
 
-    # hardware config
-    nrows, ncols, chain_len = 6, 12, 8
-    fdeps = [20, 50, 100, 200, 500, 800]
-    def rr2spmm_wrap(fdep): 
-        rr2spmm_fifo_latency_overlap_analysis(inst_list, 12, 28, 32, (nrows, ncols, chain_len), fdep)
+    # # preprocess index inputs
+    # base_attn_ridx_path = "/var/services/homes/tianchu.ji/mackeson-home/HGO/proj/intel-tensor-core-matmul/sim/tb/sparse_matmul_data/midsize_ridx.npy"
+    # base_attn_cidx_path = "/var/services/homes/tianchu.ji/mackeson-home/HGO/proj/intel-tensor-core-matmul/sim/tb/sparse_matmul_data/midsize_cidx.npy"
+    # ridx_dat = np.load(base_attn_ridx_path)
+    # cidx_dat = np.load(base_attn_cidx_path)
     
-    import multiprocessing
-    with multiprocessing.Pool() as pool:
-        pool.map(rr2spmm_wrap, fdeps)
+    # # extract one head
+    # headgrp_ridx, headgrp_cidx = [], []
+    # curr_head_ridx, curr_head_cidx = [], []
+    # for ridx, cidx in zip(ridx_dat, cidx_dat):
+    #     if ridx == -1 and cidx == -1:
+    #         headgrp_ridx.append(curr_head_ridx.copy())
+    #         headgrp_cidx.append(curr_head_cidx.copy())
+    #         curr_head_ridx, curr_head_cidx = [], []
+    #     else:
+    #         curr_head_ridx.append(ridx)
+    #         curr_head_cidx.append(cidx)
 
-    spmm_non_rr_latency_analysis(inst_list, 12, 28, 32, (nrows, ncols, chain_len))
+    # # fetch a head
+    # idx_dat = []
+    # print(f"get {len(headgrp_ridx)} heads in total")
+    # for hidx in range(len(headgrp_ridx)):
+    #     src_ridx, src_cidx = headgrp_ridx[hidx], headgrp_cidx[hidx] 
+    #     idx_dat.append([(r, c) for r, c in zip(src_ridx, src_cidx)])
+
+    # fdeps = [200]
+    # def rr2spmm_wrap(hw_shape): 
+    #     rr2spmm_fifo_latency_overlap_analysis(
+    #         [idx_dat], [4480], hw_shape[1], hw_shape, 200, out_buff_depth=1024)
+    
+    # import multiprocessing
+    # with multiprocessing.Pool() as pool:
+    #     pool.map(rr2spmm_wrap, hw_shapes)
+
+    # spmm_non_rr_latency_analysis(inst_list, 12, 28, 32, (nrows, ncols, chain_len))
         
-    profile_list = [f"res_fig/block_prune/spmm_rr_lat_diff_wfifo_{i}.json" for i in fdeps]
-    profile_list.append("res_fig/block_prune/spmm_worr_lat_diff.json")
-    plot_rr_spmm_lat(profile_list, 28, 32, 
-                     f"res_fig/block_prune/spmm_rr_lat_profile_r{nrows}_c{ncols}_l{chain_len}.json")
+    # profile_list = [f"res_fig/block_prune/spmm_rr_lat_diff_wfifo_{i}.json" for i in fdeps]
+    # profile_list.append("res_fig/block_prune/spmm_worr_lat_diff.json")
+    # plot_rr_spmm_lat(profile_list, 28, 32, 
+    #                  f"res_fig/block_prune/spmm_rr_lat_profile_r{nrows}_c{ncols}_l{chain_len}.json")
 
 
-    # with open("./res_fig/block_prune/bprune_row_density_profile/bpruning_hotpotqa_bthres.json", "w") as f:
-    #     json.dump(res, f)
+    # onchip_df_res = get_onchip_res(
+    #     "/compas-old/projects/sparse-attention/onchip", 
+    #     ["chatglm2-6b-32k", "llama2-7b-chat-4k", "mixtral-8x7b"], 
+    #     ["lcc", "multifieldqa_en", "multifieldqa_zh", "passage_retrieval_zh", "qasper", "samsum", "trec", "vcsum"], 
+    #     spmm_freq=300.0, 
+    #     tc_core_shape=(6, 12, 8)
+    #     )
+    onchip_df_res = pd.read_csv("./res_fig/block_prune/onchip_res.csv")
+    plot_onchip_res(onchip_df_res)
 
-    # elem_spars = []
-    # for i in [base_attn_path + p + ".json" for p in inst_list]:
-    #     with open(i) as fp:
-    #         res = json.load(fp)
-    #         elem_spars.append(res["spar_mean"])
-
-    # all_bsparse = None
-    # with open("./res_fig/block_prune/bprune_row_density_profile/bpruning_hotpotqa_bthres.json") as fp:
-    #     res = json.load(fp)
-    #     all_bsparse = list(res.values())
-
-    # print(f"element-wise sparsity: {np.mean(elem_spars)}")
-    # print(f"block sparsity: {np.mean(all_bsparse)}")
+    exit()
     

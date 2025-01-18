@@ -8,7 +8,8 @@ import matplotlib.cbook as cbook
 import skimage.measure
 from tqdm import tqdm
 from scipy.spatial.distance import hamming
-from math import ceil, floor, sqrt
+from math import ceil, floor, sqrt, log2
+
 import random
 import multiprocessing
 from pathlib import Path
@@ -19,7 +20,7 @@ import json
 from functools import reduce
 from analyze_tcblock_vs_matsize import closest_factors_to_target
 from os import listdir
-from os.path import isfile, dirname, abspath, basename, dirname
+from os.path import isfile, dirname, abspath, basename, dirname, exists
 import util
 
 TCCORE_COL_SIZE = 3
@@ -34,23 +35,6 @@ def factor_int(n: int):
 
     if val < val2: val, val2 = val2, val
     return val, val2
-
-## find optimized chain_len of dense matmul
-## deprecated
-# chain_len = 1
-# max_flops = 0.0
-# for l in range(1, 35):
-#     base_model = hw_modeling.StratixDpuModel(384, 384, 384, 768, \
-#                                         freq=400, num_tcs=3960, tcc_chainlen=l)
-#     curr_flops, _ = base_model.tensor_fpga21_mat_flops(l, False, False)
-#     if curr_flops > max_flops:
-#         max_flops = curr_flops
-#         chain_len = l
-#     elif curr_flops == max_flops and chain_len < l:
-#         chain_len = l
-
-# print(max_flops, chain_len)
-# hw_array_shape = (22, 12)
 
 def get_mat_sparsity(dat):
     '''
@@ -108,44 +92,39 @@ def prepare_wei_dat(data_path):
     print("load weight with shape ", w.shape)
     return w
 
-def get_tccore_config_by_row(tccore_col: float, core_tc_util=990.0, mat_b_col=128.0):
+def get_tccore_config(tc_lens: list, core_tc_util=990.0, max_trans_unit_complex=32):
     '''
-    return the tccore config with a given tccore row and util
-    return tuple(row, chain len)
+    return the tccore config with a given tccore chain length
+    return tuple(row, col, chain_len)
     '''
-    # 1. define range of the rows
-    def possible_max_row():
-        min_loading_lat = 3 * (0 + 1.)
-        max_row = mat_b_col / min_loading_lat
-        return max_row
-    
-    # 2. according to the row, define possible chain_len
-    def possible_chainlen(row):
-        max_chainlen = floor(mat_b_col / row / 3.0 - 1.0)
-        if max_chainlen > 1:
-            return range(1, max_chainlen)
-        else:
-            return None
+    def possible_tcarray_size(n_tcchains: int, chain_len: int):
+        filtered_hwshape_cands = []
+        for r in range(1, n_tcchains+1):
+            c = n_tcchains // r
+            if abs(ceil(128.0 / r) - 3 * chain_len) < 36:
+                filtered_hwshape_cands.append((r, c, chain_len))
 
-    # 3. sweep across possible rows and chain_len, find the max sta util config
-    def get_sta_util(r, clen):
-        return (clen + 2.0) * r * tccore_col / core_tc_util
+        print(f"possible hw shape for chain_len {chain_len}: {filtered_hwshape_cands}")
+        return filtered_hwshape_cands
     
-    max_sta_util, curr_sta_util= 0., 0.
-    curr_res = None
-    for r in range(1, ceil(possible_max_row())):
-        clen_range = possible_chainlen(r)
-        if clen_range is not None:
-            for clen in clen_range:
-                curr_sta_util = get_sta_util(clen, r)
-                if curr_sta_util < 1.0 and curr_sta_util > max_sta_util:
-                    max_sta_util = curr_sta_util
-                    curr_res = (r, clen)
+    possible_shapes = []
+    for tc_len in tc_lens:
+        n_tcchains = int(core_tc_util / (tc_len + 2))
+        hwshapes = possible_tcarray_size(n_tcchains, tc_len)
+        for hwshape in hwshapes:
+            max_folding_fac = sqrt(128.0 / (hwshape[0] * tc_len))
+            possible_folding_fac = list(np.arange(1, max_folding_fac, 1))
+            print(f"possible pff for shape {hwshape}: {possible_folding_fac}")
+            is_curr_shape_possible = False
+            for pff in possible_folding_fac:
+                # check if the trans unit is too complex:
+                if (ceil(128 / hwshape[0]) / pff * tc_len) < max_trans_unit_complex:
+                    is_curr_shape_possible = True
 
-    if max_sta_util == 0.0 and curr_sta_util == 0.0:
-        return None
-    else:
-        return curr_res
+            if is_curr_shape_possible:
+                possible_shapes.append((hwshape[0], hwshape[1], tc_len))
+                            
+    return possible_shapes
     
 @dataclass
 class PerfData:
@@ -1471,42 +1450,55 @@ def spmm_non_rr_latency_analysis(
 
 
 def rr2spmm_fifo_latency_overlap_analysis(
-        inst_list: list[str], 
+        inst_list: list, 
+        seqlen_list: list[int],
         row_grp_size: int, 
-        n_layers: int = 28, n_heads: int = 32,
         tc_core_shape: tuple[int, int, int] = (4, 12, 12),
-        fifo_depth: int = 400):
+        fifo_depth: int = 400,
+        out_buff_depth: int = 0):
     '''
     check if the spmm operation can overlap with redundancy removal based on the 
     block pruned sparse attention
     '''
-    # fetch sequence length
-    seq_lens = []
-    for i in inst_list:
-        dir_path = dirname(i)
-        fname = basename(i).split(".")[0] + ".pt"
-        pt_data_path = dir_path + "/" + fname
-    
-        dat = torch.load(pt_data_path)
-        seq_lens.append(dat.size()[-1])
-        del(dat)
-
-    spmm_freq, rremover_freq = 300.0, 150.0
+    spmm_freq, rremover_freq = 300.0, 300.0
     spmm_cycle_delay, rremover_cycle_delay = 1./spmm_freq * 1000., 1./rremover_freq * 1000.
     tc_row, tc_col, tc_chain_len = tc_core_shape
-    matB_rotate_delay = 4
-    block_ids = [np.load(i, allow_pickle=True) for i in inst_list]
+    transpose_ram_fold_factor = 2
+    matB_rotate_delay = ceil(log2(ceil(128/tc_core_shape[0])/transpose_ram_fold_factor)) + 2
+
+    block_ids = []
+    for i in inst_list:
+        if type(i) == str:
+            dir_path = dirname(i)
+            fname = basename(i).split(".")[0] + ".pt"
+            pt_data_path = dir_path + "/" + fname
+        
+            dat = np.load(i, allow_pickle=True)
+            block_ids += [dat]
+        else:
+            block_ids += [i]
 
     res = {}
-    for l_idx, h_idx in tqdm(product(range(n_layers), range(n_heads)), unit="head"):
-        perhead_latdiff_rec = {"lat_diff": [], "total_lat": [], "total_tops": []}
-        for inst_idx, i in enumerate(block_ids):
+    for inst_idx, i in enumerate(block_ids):
+        perhead_latdiff_rec = {
+            "lat_diff": [], 
+            "total_lat": [], 
+            "total_tops": [], 
+            "matmul_lat_cycles": [], 
+            "out_bd_req": [],
+            "out_bd_wbuffer_req": [],
+            "out_bd_req_bfp12": [],
+        }
+        l = seqlen_list[inst_idx]
+        total_ops = l * l * 2 * 128
+        
+        for h_idx, curr_head in tqdm(enumerate(i), unit="head"):
             #split block ids into many row groups
-            all_row_idx = np.unique([r[0] for r in i[l_idx][h_idx]])
+            all_row_idx = np.unique([r[0] for r in curr_head])
             split_ridx_list = [(i + 1) * row_grp_size for i in range(ceil(float(all_row_idx.shape[0]) / row_grp_size))]
             row_grps = np.split(all_row_idx, split_ridx_list[0:-1])
             
-            spmm_rr_latdiff, spmm_rr_actual_lat = [], 0.0
+            spmm_rr_latdiff, spmm_rr_actual_lat, spmm_lat_cycles = [], 0.0, 0.0
             row_grps_for_spmm = []
 
             while len(row_grps) > 0 or len(row_grps_for_spmm):
@@ -1516,55 +1508,103 @@ def rr2spmm_fifo_latency_overlap_analysis(
                     for spmm_row_grp in row_grps_for_spmm:
                         curr_cols_loading_iters = ceil(float(spmm_row_grp.shape[0]) / tc_chain_len)
                         if curr_cols_loading_iters > 1:
-                            spmm_latency += max(
-                                (tc_chain_len + 1) * 3, 
-                                (ceil(128.0 / tc_row) + matB_rotate_delay) * curr_cols_loading_iters)
+                            spmm_latency += max((tc_chain_len) * 3, ceil(128.0 / tc_row)) \
+                                                * curr_cols_loading_iters
                         else:
                             spmm_latency += (ceil(128.0 / tc_row) + matB_rotate_delay) * curr_cols_loading_iters
 
 
                 # compute index generation latency
                 # compute them until it reaches a threshold defined by the FIFO
+                ## TODO: fix rremover_latency here
                 row_grps_for_spmm = []
                 n_sorted_idces, rremover_latency = 0, 0
                 while(n_sorted_idces < (fifo_depth / 2.0) and len(row_grps) > 0):
                     next_blk_cols, input_sizes = [], []
                     for r in row_grps[0]:
-                        curr_row_blks = [blk[1] for blk in i[l_idx][h_idx] if r == blk[0]]
+                        curr_row_blks = [blk[1] for blk in curr_head if r == blk[0]]
                         next_blk_cols += curr_row_blks
                         input_sizes.append(len(curr_row_blks))
                     input_cycles = max(input_sizes)
                     row_grps_for_spmm.append(np.unique(next_blk_cols))
                     n_sorted_idces += np.unique(next_blk_cols).size
-                    rremover_latency = 82
+                    rremover_latency = 5
                     rremover_latency += input_cycles
                     row_grps.pop(0)
                 if(len(row_grps) == 0 and spmm_latency == 0):
                     print("\nall idx groups are loaded into the FIFO in the first iter!")
                 # collect results
                 spmm_rr_latdiff.append(spmm_latency * spmm_cycle_delay - rremover_latency * rremover_cycle_delay)
-                spmm_rr_actual_lat += max(spmm_latency * spmm_cycle_delay, rremover_latency * rremover_cycle_delay)
+                # spmm_rr_actual_lat += max(spmm_latency * spmm_cycle_delay, rremover_latency * rremover_cycle_delay)
+                spmm_rr_actual_lat += spmm_latency * spmm_cycle_delay
+                spmm_lat_cycles += spmm_latency
                 
             perhead_latdiff_rec["lat_diff"].append(spmm_rr_latdiff)
             perhead_latdiff_rec["total_lat"].append(spmm_rr_actual_lat)
+            perhead_latdiff_rec["matmul_lat_cycles"].append(spmm_lat_cycles)
+            # compute output size
+            out_size = l * 128
+            effective_out_size = out_size - tc_row * tc_col * out_buff_depth
+            out_size *= (24 / 8)
+            effective_out_size *= (24 / 8)
+            out_bfp12_comprate = (128.0 / 20*(88+12)) / (128.0*(24+12))
+            # compute output bd
+            out_bd_req = out_size / (float(spmm_lat_cycles) * 1.0 / (spmm_freq * 1e6)) / 1e9
+            out_bd_wbuff_req = effective_out_size / (float(spmm_lat_cycles) * 1.0 / (spmm_freq * 1e6)) / 1e9
+            perhead_latdiff_rec["out_bd_req"].append(out_bd_req)
+            perhead_latdiff_rec["out_bd_wbuffer_req"].append(out_bd_wbuff_req)
+            perhead_latdiff_rec["out_bd_req_bfp12"].append(out_bd_req * out_bfp12_comprate)
             # calculate throughput
-            l = seq_lens[inst_idx]
-            ops = l * l * 2 * 128
-            spmm_rr_actual_flops = float(ops) / (float(spmm_rr_actual_lat) * 1e-9) / 1e12
+            spmm_rr_actual_flops = float(total_ops) / (float(spmm_rr_actual_lat) * 1e-9) / 1e12
             perhead_latdiff_rec["total_tops"].append(spmm_rr_actual_flops)
 
-        res[f"l{l_idx}h{h_idx}"] = perhead_latdiff_rec
+        # get dense res
+        fake_dense_data = np.ones((seqlen_list[inst_idx], seqlen_list[inst_idx]))
+        fake_dense_data = np.tril(fake_dense_data)
+        hw_array_shape = (tc_core_shape[0], tc_core_shape[1])
+        dense_model = hw_modeling.StratixDpuModel(seqlen_list[inst_idx], 
+                                                  seqlen_list[inst_idx], 
+                                                  seqlen_list[inst_idx], 
+                                                  128,
+                                                  exp_dat=fake_dense_data, 
+                                                  freq=300.0, 
+                                                  num_tcs=3960, 
+                                                  tcc_array_shape=hw_array_shape, 
+                                                  tcc_chainlen=tc_core_shape[2])
+        dense_model.set_tccore_size(TCCORE_SIZE)
+        dense_flops, dense_lat, dense_util = \
+            dense_model.tensor_fpga21_mat_sparse_flops(fake_dense_data, sparse_block_size=TCCORE_SIZE)
         
-        if l_idx == 0 and h_idx == 0:
-            res = {}
-        else:
-            with open(f"res_fig/block_prune/spmm_rr_lat_diff_wfifo_{fifo_depth}.json", "r") as f:
-                res = json.load(f)
+        dense_res = PerfData()
+        dense_res.total_lat += dense_lat
+        dense_res.add_data(dense_util, "util")
+        dense_res.set_flops(total_ops)
 
-        with open(f"res_fig/block_prune/spmm_rr_lat_diff_wfifo_{fifo_depth}.json", "w") as f:
-            print(f"\nwriting l{l_idx}h{h_idx} results...")
-            res[f"l{l_idx}h{h_idx}"] = perhead_latdiff_rec
-            json.dump(res, f)
+        res = {}
+        res[f"inst_{inst_idx}"] = perhead_latdiff_rec
+        res[f"inst_{inst_idx}"]["avg_tops"] = np.mean(perhead_latdiff_rec["total_tops"])
+        res[f"inst_{inst_idx}"]["dense_avg_tops"] = dense_res.avg_data("flops")
+        res[f"inst_{inst_idx}"]["max_out_bd_req"] = np.amax(perhead_latdiff_rec["out_bd_req"])
+        res[f"inst_{inst_idx}"]["max_out_bd_wbuffer_req"] = np.amax(perhead_latdiff_rec["out_bd_wbuffer_req"])
+        res[f"inst_{inst_idx}"]["max_out_bd_req_bfp12"] = np.amax(perhead_latdiff_rec["out_bd_req_bfp12"])
+
+        fpath = f"res_fig/block_prune/spmm_rr_lat_diff_wfifo_{fifo_depth}_r{tc_row}_c{tc_col}_cl{tc_chain_len}.json"
+        if exists(fpath):
+            with open(fpath, 'r') as file:
+                try:
+                    existing_data = json.load(file)
+                    if not isinstance(existing_data, dict):
+                        raise ValueError("The file does not contain a valid JSON object.")
+                except json.JSONDecodeError:
+                    existing_data = {}
+            
+            existing_data.update(res)
+        else:
+            existing_data = res
+
+        with open(fpath, 'w') as file:
+            json.dump(existing_data, file, indent=2)
+
 
 def main():
     model_name = "llama2-7b-chat-4k"
