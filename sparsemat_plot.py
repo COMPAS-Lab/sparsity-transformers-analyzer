@@ -13,7 +13,10 @@ import matplotlib
 from matplotlib import pyplot as plt
 import os, json, util
 from tqdm import tqdm
-from itertools import product
+from itertools import product, chain
+import pandas as pd
+import seaborn as sns
+import textwrap
 
 def gen_spmat_by_sparsity(ref_mat: np.array, 
                           target_seqlen: int, 
@@ -128,6 +131,180 @@ def explore_row_features(mats: list, inst_idx: int):
     plt.savefig(f"./res_fig/temp/row_first_dval_i{inst_idx}l.png")
     plt.clf()
 
+
+def get_unique_colidx_ratio(idx_list: list[tuple[int, int]], n_shared_chans: int, omit_last_iter=False):
+    '''
+    get unique colidx ratio of a head
+    '''
+    res_redidx_count_list, res_total_idx_count_list = [], []
+
+    def get_unique_idx_rate(curr_blk_list: list) -> list[tuple]:
+        # redundant index count computing method
+        total_idx_count = len(list(chain(*curr_blk_list)))
+        sorted_idx_res = list(np.unique(list(chain(*curr_blk_list))))
+        n_removed_redidx = total_idx_count - len(sorted_idx_res)
+        unique_idx_rate = len(sorted_idx_res)
+
+        return n_removed_redidx, total_idx_count
+
+    last_ridx = idx_list[0][0] if idx_list else None
+    curr_idx_blk = [[] for i in range(n_shared_chans)]
+    curr_rowblk_counter = 0
+    # bfp conversion and idx attaching
+    for rec_idx in range(len(idx_list)):
+        curr_ridx = idx_list[rec_idx][0]
+        if curr_ridx > last_ridx:
+            last_ridx = curr_ridx
+            curr_rowblk_counter += 1
+
+        if curr_rowblk_counter == n_shared_chans:
+            curr_redidx_count, curr_total_idx_count = get_unique_idx_rate(curr_idx_blk)
+            res_redidx_count_list.append(curr_redidx_count)
+            res_total_idx_count_list.append(curr_total_idx_count)
+            curr_idx_blk = [[] for i in range(n_shared_chans)]
+            curr_rowblk_counter = 0
+
+        curr_idx_blk[curr_rowblk_counter].append(idx_list[rec_idx][1])
+
+        # tail
+        if (rec_idx == len(idx_list)-1) and (not omit_last_iter):
+            curr_redidx_count, curr_total_idx_count = get_unique_idx_rate(curr_idx_blk)
+            res_redidx_count_list.append(curr_redidx_count)
+            res_total_idx_count_list.append(curr_total_idx_count)
+            curr_idx_blk = [[] for i in range(n_shared_chans)]
+            curr_rowblk_counter = 0
+
+    return res_redidx_count_list, res_total_idx_count_list
+
+def get_unique_colidx_ratio_inst(
+        inst_ridx_list: list[str], 
+        inst_cidx_list: list[str],
+        n_shared_chans: int, 
+        aggre_method = None):
+    
+    all_inst_res_redidx_count, all_inst_res_total_idx_count = [], []
+    for rinst, cinst in zip(inst_ridx_list, inst_cidx_list):
+        src_ridx = np.load(rinst)    
+        src_cidx = np.load(cinst)
+        # extract one head
+        headgrp_idx = []
+        curr_head_idx = []
+        for ridx, cidx in zip(src_ridx, src_cidx):
+            if ridx == -1 and cidx == -1:
+                headgrp_idx.append(curr_head_idx.copy())
+                curr_head_idx = []
+            else:
+                curr_head_idx.append((ridx, cidx))
+
+        # fetch a head
+        print(f"get {len(headgrp_idx)} heads in total")
+        curr_inst_res_redidx_count, curr_inst_res_total_idx_count = [], []
+        for h_idx in range(len(headgrp_idx)):
+            head_common_ratio_list, head_total_idx_count_list = \
+                get_unique_colidx_ratio(headgrp_idx[h_idx], n_shared_chans, omit_last_iter=True)
+            curr_inst_res_redidx_count += head_common_ratio_list
+            curr_inst_res_total_idx_count += head_total_idx_count_list
+
+        all_inst_res_redidx_count.append(curr_inst_res_redidx_count)
+        all_inst_res_total_idx_count.append(curr_inst_res_total_idx_count)
+
+    if aggre_method is not None:
+        return aggre_method(all_inst_res_redidx_count), aggre_method(all_inst_res_total_idx_count)
+    
+    return all_inst_res_redidx_count, all_inst_res_total_idx_count
+
+def compute_unique_colidx_ratio(task_list: list[str], model_names: list[str], swindow_list: list[int], method: str):
+    records = {"tasks": [], "redundant index count": [], "total index count": [], "model": [], "swindow": []}
+    
+    for swindow in swindow_list:
+        for model_name in model_names:
+            for task_name in (task_list):
+                base_attn_path = f"/chronos_data/tji/.huggingface_cache/transformers/bprune-data/isca/{model_name}-attn-bfp20-{task_name}/"
+                inst_rlist = util.get_pts_under_dir(base_attn_path, postfix="npy", datatype="ridx")
+                inst_clist = util.get_pts_under_dir(base_attn_path, postfix="npy", datatype="cidx")
+                task_res_redidx_count, task_res_total_idx_count = get_unique_colidx_ratio_inst(inst_rlist, inst_clist, int(swindow), lambda x: list(chain(*x)))
+                # make sure the length of task_res_redidx_count and task_res_total_idx_count are the same
+                assert len(task_res_redidx_count) == len(task_res_total_idx_count)
+                
+                records["tasks"] += [task_name] * len(task_res_redidx_count)
+                records["redundant index count"] += task_res_redidx_count
+                records["total index count"] += task_res_total_idx_count
+                records["model"] += [model_name] * len(task_res_redidx_count)
+                records["swindow"] += [swindow] * len(task_res_redidx_count)
+
+    records = pd.DataFrame(records)
+    # store records as pandas dataframe
+    records.to_csv(f"/chronos_data/tji/.huggingface_cache/transformers/bprune-data/isca/redidx-count.csv", index=False)
+
+def plot_unique_colidx_ratio_boxplot_by_task():
+    # read records from csv
+    records = pd.read_csv(f"/chronos_data/tji/.huggingface_cache/transformers/bprune-data/isca/redidx-count.csv")
+    # select records that has swindow = 12
+    records = records[records['swindow'] == 16]
+    # add a new column "removable redundant index ratio"
+    records["removable redundant index ratio"] = records["redundant index count"] / records["total index count"]
+
+    sns.set_theme(rc={'figure.figsize': (18, 4.5)}, font_scale=1.5)
+    sns.set_style("whitegrid", {'grid.linestyle': '--'})
+    lm = sns.violinplot(
+        data=records, 
+        x = "tasks", 
+        y = "removable redundant index ratio", 
+        inner_kws=dict(color=".8"),
+        hue = "model",
+        legend=True,
+        palette={"llama2-7b-chat-4k": "C1", "mixtral-8x7b": "C2", "chatglm2-6b-32k": "C0"}
+        )
+    lm.set(ylim=(0.0, 1.0))
+    # lm.get_legend().set_title(None)
+    
+    ax = lm.axes
+    ax.legend(title=None)
+    labels = []
+    for label in ax.get_xticklabels():
+        text = label.get_text()
+        # labels.append(textwrap.fill(text, width=10, break_on_hyphens=True))
+        labels.append(text)
+    ax.set_xticklabels(labels, rotation=10)
+    sns.move_legend(ax, "upper left", bbox_to_anchor=(1, 1))
+    
+    plt.tight_layout()
+    plt.savefig(f"./res_fig/block_prune/isca/redidx-ratio-bplot-omit-last-iter.pdf")
+
+def plot_unique_colidx_ratio_by_swindow():
+    records = pd.read_csv(f"/chronos_data/tji/.huggingface_cache/transformers/bprune-data/isca/redidx-count.csv")
+
+    # group the records by tasks, model and swindow
+    records = records[records['swindow'] < 64]
+    grouped_records = records.groupby(['model', 'swindow'])['redundant index count'].mean().reset_index()
+    
+    # plot the grouped records as scatter plot with line connecting the points,
+    # separate lines for each model and tasks, for different models use different colors
+    # use different line style for different tasks
+    # use swindow on x-axis with log scale, unique index ratio on y-axis
+    plt.rcParams.update({'font.size': 22})
+    plt.figure(figsize=(12, 8))
+    lstyles = {"lcc": "-", "multifieldqa_en": "--", "multifieldqa_zh": "-.", "passage_retrieval_zh": ":", "qasper": "-", "samsum": "--", "trec": "-.", "vcsum": ":"}
+    for model_idx, model in enumerate(grouped_records['model'].unique()):
+        # plot 
+        color_table = {"llama2-7b-chat-4k": "C1", "mixtral-8x7b": "C2", "chatglm2-6b-32k": "C0"}
+        plt.plot(grouped_records[grouped_records['model'] == model]['swindow'], 
+                    grouped_records[grouped_records['model'] == model]['redundant index count'], 
+                    marker='s', markersize=10, 
+                    label=f"{model}", linewidth=5, color=color_table[model])
+
+    plt.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
+    plt.xscale('log')
+    plt.xlim(xmin=2)
+    plt.ylim(ymin=0)
+    plt.legend()
+    plt.xlabel("row group size (R)")
+    plt.ylabel("average #removable redundant index")
+    plt.tight_layout()
+    plt.savefig("./res_fig/block_prune/isca/redidx-count-by-swindow-zoomin.pdf")
+    plt.clf()
+
+    return
 
 def plot_hw_perf(json_path_lists: list[str], label_list: list[str], res_path: str):
     dat_delay = {c:[] for c in json_path_lists}
@@ -297,9 +474,18 @@ def plot_rr_spmm_lat(dat_files, n_layers, n_heads, res_file):
 
 if __name__ == "__main__":
     # inst_idx = 4
-    base_attn_path = f"/chronos_data/tji/.huggingface_cache/transformers/chatglm2-6b-32k-attn-bfp20-1e-3-hotpotqa-bprune-scaled/"
-    # list all insts
-    inst_list = util.get_pts_under_dir(base_attn_path, "npy")
+    model_names = ["llama2-7b-chat-4k", "mixtral-8x7b", "chatglm2-6b-32k"]
+    task_list = ["lcc", "multifieldqa_en", "multifieldqa_zh", "passage_retrieval_zh", "qasper", "samsum", "trec", "vcsum"]
+    # task_list = ["lcc", "multifieldqa_en", "multifieldqa_zh", "passage_retrieval_zh", "qasper"]
+
+    # plot_unique_colidx_ratio_boxplot_by_task(task_list, model_names)
+    # generate a list with power of 2, from 4 to 5000
+    # swindow_list = [2**i for i in range(2, 12)]
+    # swindow_list = list(sorted(swindow_list + [12]))
+    # compute_unique_colidx_ratio(task_list, model_names, swindow_list, method="unique")
+    # plot_unique_colidx_ratio_boxplot_by_task()
+    plot_unique_colidx_ratio_by_swindow()
+    exit()
     # attn_path_chatglm = inst_list[0] + ".pt"
     # src_attn = torch.load(attn_path_chatglm).numpy()
     # explore_row_features(src_attn, inst_idx=inst_idx)
@@ -333,22 +519,21 @@ if __name__ == "__main__":
     plot_rr_spmm_lat(profile_list, 28, 32, 
                      f"res_fig/block_prune/spmm_rr_lat_profile_r{nrows}_c{ncols}_l{chain_len}.json")
 
-    exit()
 
-    with open("./res_fig/block_prune/bprune_row_density_profile/bpruning_hotpotqa_bthres.json", "w") as f:
-        json.dump(res, f)
+    # with open("./res_fig/block_prune/bprune_row_density_profile/bpruning_hotpotqa_bthres.json", "w") as f:
+    #     json.dump(res, f)
 
-    elem_spars = []
-    for i in [base_attn_path + p + ".json" for p in inst_list]:
-        with open(i) as fp:
-            res = json.load(fp)
-            elem_spars.append(res["spar_mean"])
+    # elem_spars = []
+    # for i in [base_attn_path + p + ".json" for p in inst_list]:
+    #     with open(i) as fp:
+    #         res = json.load(fp)
+    #         elem_spars.append(res["spar_mean"])
 
-    all_bsparse = None
-    with open("./res_fig/block_prune/bprune_row_density_profile/bpruning_hotpotqa_bthres.json") as fp:
-        res = json.load(fp)
-        all_bsparse = list(res.values())
+    # all_bsparse = None
+    # with open("./res_fig/block_prune/bprune_row_density_profile/bpruning_hotpotqa_bthres.json") as fp:
+    #     res = json.load(fp)
+    #     all_bsparse = list(res.values())
 
-    print(f"element-wise sparsity: {np.mean(elem_spars)}")
-    print(f"block sparsity: {np.mean(all_bsparse)}")
+    # print(f"element-wise sparsity: {np.mean(elem_spars)}")
+    # print(f"block sparsity: {np.mean(all_bsparse)}")
     

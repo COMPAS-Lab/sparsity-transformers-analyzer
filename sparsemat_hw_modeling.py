@@ -20,6 +20,7 @@ from functools import reduce
 from analyze_tcblock_vs_matsize import closest_factors_to_target
 from os import listdir
 from os.path import isfile, dirname, abspath, basename, dirname
+import util
 
 TCCORE_COL_SIZE = 3
 TCCORE_SIZE = 20
@@ -1566,9 +1567,11 @@ def rr2spmm_fifo_latency_overlap_analysis(
             json.dump(res, f)
 
 def main():
-    data_path = "/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/"
+    model_name = "llama2-7b-chat-4k"
+    task_name = "lcc"
+    data_path = f"/chronos_data/tji/.huggingface_cache/transformers/bprune-data/isca/{model_name}-attn-bfp20-{task_name}"
     output_path = "./res_fig/"
-    num_layers = 28
+    num_layers = 1
 
     # Evaulating sparse 
     # construct multiple instances of the llama inference
@@ -1583,10 +1586,9 @@ def main():
 
     base_attn_path = f"/chronos_data/tji/.huggingface_cache/transformers/chatglm2-6b-32k-attn-bfp20-1e-3-hotpotqa-bprune-scaled/"
     # list all insts
-    inst_list = [f.split(".")[0] \
-                 for f in listdir(base_attn_path) \
-                    if isfile(base_attn_path + f) and f[0] == "i" and f.endswith(".pt")]
+    inst_list = util.get_pts_under_dir(data_path, "json")
     inst_list = inst_list
+    print(inst_list)
 
     # seq_len = 8192
     # dmodel = 2048
@@ -1607,14 +1609,11 @@ def main():
         for i in inst_list:
             param_path_7b = "/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/llama-7b-hf-sparsegpt-bfp12/"
             attn_path_7b = f"/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/llama-7b-hf-attsample/attn_s{i}b0.pt"
-            attn_path_flongseq = \
-                f"/var/services/homes/tianchu.ji/mackeson-home/spar_test_params/seqlen_2048_interp_llama7bhf/attn_s{i}b0.pt"
-            attn_path_opt350m = f"/chronos_data/tji/opt_350m_sparse_attn/attn_s{i}b0.pt"
             # attn_path_chatglm = f"/chronos_data/tji/.huggingface_cache/transformers/chatglm2-6b-32k-attn-bfp20-1e-3/attn_s{i}.pt"
             attn_path_chatglm = base_attn_path + i + ".pt"
             #figure out actual seq len
-            attn = torch.load(base_attn_path + i + ".pt")
-            seq_len = attn.size()[-1]
+            # seq_len = json.load(i)["seq_len"]
+            seq_len = 4480
 
             print(f"loaded seq len: {seq_len}")
 
@@ -1648,54 +1647,10 @@ def main():
                     [{"size": [4096, 4096, 4096, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],
                 }
 
-            mats_llama_attnv_only = {\
-                "compress blue":
-                    [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.6, "label": "attxv", "repeat": 32,
-                        "file": attn_path_7b}],
-                }
-
             mats_chatglm2_attnv_only = {\
                 "compress blue":
-                    [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.6, "label": "attxv", "repeat": 32,
-                        "file": attn_path_chatglm}],
+                    [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.0, "label": "attxv", "repeat": 1}],
             }
-
-            mats_opt350m = {\
-                "compress blue":
-                    [{"size": [seq_len, seq_len, seq_len, 64], "row_sparsity": 0.6, "label": "attxv", "repeat": 16,
-                        "file": attn_path_opt350m}] + \
-                    [{"size": [seq_len, 64, 64, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 16}] + \
-                    [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}] + \
-                    [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}] + \
-                    [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
-                    [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],  
-                "original":
-                    [{"size": [seq_len, seq_len, seq_len, 64], "row_sparsity": 0.0, "label": "attxv", "repeat": 16}] + \
-                    [{"size": [seq_len, 64, 64, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 16}] + \
-                    [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}] + \
-                    [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}] + \
-                    [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
-                    [{"size": [1024, 1024, 1024, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],
-                }
-            
-            dmodel = 12288
-            seq_len = dmodel * 4
-            mats_opt6_7b = {\
-                "compress blue":
-                    [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.9, "label": "attxv", "repeat": 96}] + \
-                    [{"size": [seq_len, 128, 128, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 96}] + \
-                    [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}] + \
-                    [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}] + \
-                    [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
-                    [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],  
-                "original":
-                    [{"size": [seq_len, seq_len, seq_len, 128], "row_sparsity": 0.0, "label": "attxv", "repeat": 96}] + \
-                    [{"size": [seq_len, 128, 128, seq_len], "row_sparsity": 0.0, "label": "att", "repeat": 96}] + \
-                    [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "q proj", "repeat": 1}] + \
-                    [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "k proj", "repeat": 1}] + \
-                    [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "v proj", "repeat": 1}] + \
-                    [{"size": [dmodel, dmodel, dmodel, seq_len], "row_sparsity": 0., "label": "o proj", "repeat": 1}],
-                }
         
             mats_list.append(mats_chatglm2_attnv_only)
 
@@ -1712,8 +1667,8 @@ def main():
         #                                         lat_compute_type=["ideal sparse", "sparse baseline", "blocked prune sparse"], 
         #                                         plot_figure=False,
         #                                         res_json_path=rpath)
-                
-        rpath = f"res_fig/block_prune/hotpotqa_bprune_r6_c12_l8"
+        
+        rpath = f"res_fig/block_prune/isca/dense/{model_name}-{task_name}/"
         Path(rpath).mkdir(parents=True, exist_ok=True)
         compute_stacked_matmul_performance(mats_list, 8, (6, 12), 
                                         layer_idx, 
