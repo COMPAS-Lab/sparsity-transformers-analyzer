@@ -1,8 +1,9 @@
 import numpy as np
 import random
-import torch
 from scipy import optimize
+from scipy.stats import pearsonr
 import hw_modeling
+from roofline import Roofline
 from sparsemat_hw_modeling import (
     distance_of_dense_vals_per_row, 
     PerfData, 
@@ -14,10 +15,28 @@ from sparsemat_hw_modeling import (
     rr2spmm_fifo_latency_overlap_analysis)
 import matplotlib
 from matplotlib import pyplot as plt
-import os, json, util
+import os, json, util, pathlib, math
 from itertools import product, chain
+import multiprocessing
 import pandas as pd
 import seaborn as sns
+import heapq
+
+model_palette = {
+    "chatglm2-6b-32k": ("#1f77b4", "#84cdff"), 
+    "llama2-7b-chat-4k": ("#ff7f0e", "#ffc85f"), 
+    "mixtral-8x7b": ("#2ca02c", "#76ce55")
+}
+
+def sublist_creator(lst, n):
+    lists = [[] for _ in range(n)]
+    totals = [(0, i) for i in range(n)]
+    heapq.heapify(totals)
+    for value in lst:
+        total, index = heapq.heappop(totals)
+        lists[index].append(value)
+        heapq.heappush(totals, (total + value, index))
+    return lists
 
 def gen_spmat_by_sparsity(ref_mat: np.array, 
                           target_seqlen: int, 
@@ -138,7 +157,9 @@ def get_unique_colidx_ratio(idx_list: list[tuple[int, int]], n_shared_chans: int
     get unique colidx ratio of a head
     '''
     res_redidx_count_list, res_total_idx_count_list = [], []
+    res_effec_area = []
     res_inner_area_util_list, res_total_area_util_list = [], []
+    res_n_route_ratio = []
 
     def get_unique_idx_rate(curr_blk_list: list) -> tuple:
         # redundant index count computing method
@@ -146,9 +167,9 @@ def get_unique_colidx_ratio(idx_list: list[tuple[int, int]], n_shared_chans: int
         total_idx_count = len(all_col_idx)
         sorted_idx_res = list(np.unique(all_col_idx))
         n_removed_redidx = total_idx_count - len(sorted_idx_res)
-        unique_idx_rate = len(sorted_idx_res)
+        n_unique_idx = len(sorted_idx_res)
 
-        return n_removed_redidx, total_idx_count
+        return n_removed_redidx, total_idx_count, n_unique_idx * n_shared_chans
     
     def get_agg_util_area(curr_blk_list: list, seq_len: int) -> list[tuple]:
         # compute aggregated area / total area
@@ -159,6 +180,38 @@ def get_unique_colidx_ratio(idx_list: list[tuple[int, int]], n_shared_chans: int
         inner_area_util = float(len(all_col_idx)) / float((max(unique_col_idx_res)+1) * n_shared_chans)
         return inner_area_util, total_area_util
 
+    def get_n_route_ratio(curr_blk_list: list, cl: int) -> float:
+        # compute number of max iterations, pad each row to the same length
+        n_iters = max([math.ceil(len(r) / cl) for r in curr_blk_list])
+        padded_blk_list = []
+        for r in curr_blk_list:
+            padded = []
+            if len(r) < (n_iters * cl):
+                padded = r + [-1] * (n_iters * cl - len(r))
+            else:
+                padded = r
+            padded_blk_list.append(padded)
+
+        # compute shared n routes
+        all_col_idx = list(chain(*curr_blk_list))
+        n_unique_col_idx = len(list(np.unique(all_col_idx)))
+        shared_routes = float(cl) if n_unique_col_idx > cl else float(n_unique_col_idx)
+
+        # calculate number of routing paths for each iter
+        n_routes_ratio = []
+        for i in range(n_iters):
+            # get current iter's input
+            iter_idx_grp = [r[i * cl : (i+1) * cl] for r in padded_blk_list]
+            n_unique_access = 0
+            for col_idx in range(cl):
+                # check how many unique access in each iteration
+                uniq_colidx = list(np.sort(np.unique([r[col_idx] for r in iter_idx_grp])))
+                n_unique_access += len(uniq_colidx) - 1 if uniq_colidx[0] == -1 else len(uniq_colidx)
+            
+            n_routes_ratio.append(shared_routes / float(n_unique_access))
+            
+        return np.mean(n_routes_ratio)
+
     last_ridx = idx_list[0][0] if idx_list else None
     curr_seq_len = last_ridx
     curr_idx_blk = [[] for i in range(n_shared_chans)]
@@ -166,18 +219,22 @@ def get_unique_colidx_ratio(idx_list: list[tuple[int, int]], n_shared_chans: int
     # bfp conversion and idx attaching
     for rec_idx in range(len(idx_list)):
         curr_ridx = idx_list[rec_idx][0]
-        curr_seq_len = last_ridx
+        curr_seq_len = (last_ridx+1) * 3
         if curr_ridx > last_ridx:
             last_ridx = curr_ridx
             curr_rowblk_counter += 1
 
         if curr_rowblk_counter == n_shared_chans:
-            curr_redidx_count, curr_total_idx_count = get_unique_idx_rate(curr_idx_blk)
-            curr_inner_area_util, curr_total_area_util = get_agg_util_area(curr_idx_blk, curr_seq_len+1)
+            curr_redidx_count, curr_total_idx_count, curr_effective_area = get_unique_idx_rate(curr_idx_blk)
+            curr_inner_area_util, curr_total_area_util = get_agg_util_area(curr_idx_blk, math.ceil(curr_seq_len / 20.0))
+            curr_n_route_ratio = get_n_route_ratio(curr_idx_blk, 8)
+
             res_redidx_count_list.append(curr_redidx_count)
             res_total_idx_count_list.append(curr_total_idx_count)
+            res_effec_area.append(curr_effective_area)
             res_inner_area_util_list.append(curr_inner_area_util)
             res_total_area_util_list.append(curr_total_area_util)
+            res_n_route_ratio.append(curr_n_route_ratio)
             curr_idx_blk = [[] for i in range(n_shared_chans)]
             curr_rowblk_counter = 0
 
@@ -185,18 +242,29 @@ def get_unique_colidx_ratio(idx_list: list[tuple[int, int]], n_shared_chans: int
 
         # tail
         if (rec_idx == len(idx_list)-1) and (not omit_last_iter):
-            curr_redidx_count, curr_total_idx_count = get_unique_idx_rate(curr_idx_blk)
+            curr_redidx_count, curr_total_idx_count, curr_effective_area = get_unique_idx_rate(curr_idx_blk)
             curr_inner_area_util, curr_total_area_util = get_agg_util_area(curr_idx_blk, curr_seq_len+1)
+            curr_n_route_ratio = get_n_route_ratio(curr_idx_blk, 8)
+
             res_redidx_count_list.append(curr_redidx_count)
             res_total_idx_count_list.append(curr_total_idx_count)
+            res_effec_area.append(curr_effective_area)
             res_inner_area_util_list.append(curr_inner_area_util)
             res_total_area_util_list.append(curr_total_area_util)
+            res_n_route_ratio.append(curr_n_route_ratio)
             curr_idx_blk = [[] for i in range(n_shared_chans)]
             curr_rowblk_counter = 0
 
     # print(f"total area use: {['{0:.2f}'.format(i) for i in res_total_area_util_list]}")
     # print(f"inner area use: {['{0:.2f}'.format(i) for i in res_inner_area_util_list]}")
-    return res_redidx_count_list, res_total_idx_count_list, res_inner_area_util_list, res_total_area_util_list
+    return {
+        "head_common_ratio_list": res_redidx_count_list, 
+        "head_total_idx_count_list": res_total_idx_count_list, 
+        "head_effec_area": res_effec_area, 
+        "head_inner_area_util": res_inner_area_util_list, 
+        "head_total_area_util": res_total_area_util_list,
+        "head_mean_route_ratio": res_n_route_ratio,
+    }
 
 def get_unique_colidx_ratio_inst(
         inst_ridx_list: list[str], 
@@ -207,11 +275,24 @@ def get_unique_colidx_ratio_inst(
     
     all_inst_res_redidx_count, all_inst_res_total_idx_count = [], []
     all_inst_res_iarea_util, all_inst_res_tarea_util = [], []
+    all_inst_raw_density, all_inst_effec_density = [], []
+    all_inst_mean_route_ratio = []
+    all_inst_hidx, all_inst_seq_ids = [], []
+
     inst_ridx_list.sort()
     inst_cidx_list.sort()
     for rinst, cinst in zip(inst_ridx_list, inst_cidx_list):
         print(f"working on {rinst} and {cinst}")
         inst = rinst.split("/")[-1].split("_ridx.npy")[0]
+        # load seq len for current inst
+        # read seq len from inst profile
+        profile_path = pathlib.Path(rinst).parent / f"{inst}.json"
+        curr_seqlen = 0
+        with open(profile_path, "r") as profile_f:
+            curr_profile = json.load(profile_f)
+            curr_seqlen = curr_profile["seq_len"]
+
+        # load and extract all heads data
         src_ridx = np.load(rinst)
         src_cidx = np.load(cinst)
         # extract one head
@@ -228,39 +309,68 @@ def get_unique_colidx_ratio_inst(
         print(f"get {len(headgrp_idx)} heads in total")
         curr_inst_res_redidx_count, curr_inst_res_total_idx_count = [], []
         curr_inst_iarea_util, curr_inst_tarea_util = [], []
+        curr_inst_raw_density, curr_effec_density = [], []
+        curr_inst_mean_route_ratio = []
+        curr_hidx, curr_seq_id = [], []
         for h_idx in range(len(headgrp_idx)):
             curr_hidx_selected = selected_heads is None or h_idx in selected_heads[inst]
             if curr_hidx_selected:
                 print(f"get head {h_idx} in {inst}")
-                head_common_ratio_list, head_total_idx_count_list, head_inner_area_util, head_total_area_util = \
-                    get_unique_colidx_ratio(headgrp_idx[h_idx], n_shared_chans, omit_last_iter=True)
-                curr_inst_res_redidx_count += head_common_ratio_list
-                curr_inst_res_total_idx_count += head_total_idx_count_list
-                curr_inst_iarea_util += head_inner_area_util
-                curr_inst_tarea_util += head_total_area_util
+                total_nblks = math.ceil(math.ceil(curr_seqlen / 3.) * math.ceil(curr_seqlen / 20.0) / 2.0)
+                curr_res = get_unique_colidx_ratio(headgrp_idx[h_idx], n_shared_chans, omit_last_iter=True)
+                curr_inst_res_redidx_count += curr_res["head_common_ratio_list"]
+                curr_inst_res_total_idx_count += curr_res["head_total_idx_count_list"]
+                curr_inst_iarea_util += curr_res["head_inner_area_util"]
+                curr_inst_tarea_util += curr_res["head_total_area_util"]
+                curr_inst_mean_route_ratio += curr_res["head_mean_route_ratio"]
+                curr_hidx += [h_idx] * len(curr_res["head_total_area_util"])
+                curr_seq_id += [inst] * len(curr_res["head_total_area_util"])
+                curr_inst_raw_density += [float(len(headgrp_idx[h_idx])) / float(total_nblks)] * len(curr_res["head_total_area_util"])
+                curr_effec_density += [sum(curr_res["head_effec_area"]) / float(total_nblks)] * len(curr_res["head_total_area_util"])
 
+        # store all results of an inst to the entire result 
         all_inst_res_redidx_count.append(curr_inst_res_redidx_count)
         all_inst_res_total_idx_count.append(curr_inst_res_total_idx_count)
         all_inst_res_iarea_util.append(curr_inst_iarea_util)
         all_inst_res_tarea_util.append(curr_inst_tarea_util)
+        all_inst_mean_route_ratio.append(curr_inst_mean_route_ratio)
+        all_inst_raw_density.append(curr_inst_raw_density)
+        all_inst_effec_density.append(curr_effec_density)
+        all_inst_hidx.append(curr_hidx)
+        all_inst_seq_ids.append(curr_seq_id)
+
+    func_ret = {
+        "task_res_redidx_count": all_inst_res_redidx_count, 
+        "task_res_total_idx_count": all_inst_res_total_idx_count, 
+        "task_res_iarea_util": all_inst_res_iarea_util, 
+        "task_res_tarea_util": all_inst_res_tarea_util,
+        "task_res_mean_route_ratio": all_inst_mean_route_ratio,
+        "task_res_raw_density": all_inst_raw_density,
+        "task_res_effec_density": all_inst_effec_density,
+        "task_res_hidx": all_inst_hidx,
+        "task_res_seq_ids": all_inst_seq_ids,
+    }
 
     if aggre_method is not None:
-        return aggre_method(all_inst_res_redidx_count), \
-            aggre_method(all_inst_res_total_idx_count), \
-            aggre_method(all_inst_res_iarea_util), \
-            aggre_method(all_inst_res_tarea_util), \
+        for k in func_ret.keys():
+            func_ret[k] = aggre_method(func_ret[k])
     
-    return all_inst_res_redidx_count, all_inst_res_total_idx_count, all_inst_res_iarea_util, all_inst_res_tarea_util
+    return func_ret
 
-def compute_unique_colidx_ratio(task_list: list[str], model_names: list[str], swindow_list: list[int], method: str):
+def compute_unique_colidx_ratio(task_list: list[str], model_names: list[str], swindow_list: list[int]):
     records = {
         "tasks": [], 
+        "inst id": [],
+        "head idx": [],
         "redundant index count": [], 
         "total index count": [], 
         "inner area util": [],
         "total area util": [],
+        "raw head density": [],
+        "effec head density": [],
+        "mean_route_ratio": [],
         "model": [], 
-        "swindow": []
+        "swindow": [],
     }
     
     for swindow in swindow_list:
@@ -273,6 +383,7 @@ def compute_unique_colidx_ratio(task_list: list[str], model_names: list[str], sw
                 insts = [i.split("/")[-1].split("_ridx.npy")[0] for i in inst_rlist]
 
                 head_ids = {}
+                seq_lens = {}
                 for inst in insts:
                     hwconfig_path = f"/compas-old/projects/sparse-attention/onchip-5hbm/{model_name}-attn-bfp20-{task_name}/{inst}/"
                     # get json files start with "hwconfig" under hwconfig_path
@@ -283,22 +394,27 @@ def compute_unique_colidx_ratio(task_list: list[str], model_names: list[str], sw
                     head_ids[inst] = hwconfig_head_ids
                     print(f"head list: {hwconfig_head_ids} for inst {inst}")
                 
-                task_res_redidx_count, task_res_total_idx_count, task_res_iarea_util, task_res_tarea_util = \
-                    get_unique_colidx_ratio_inst(inst_rlist, inst_clist, int(swindow), lambda x: list(chain(*x)), head_ids)
+                # compute all metric for all insts
+                ret = get_unique_colidx_ratio_inst(inst_rlist, inst_clist, int(swindow), lambda x: list(chain(*x)), head_ids)
                 # make sure the length of task_res_redidx_count and task_res_total_idx_count are the same
-                assert len(task_res_redidx_count) == len(task_res_total_idx_count)
+                assert len(ret["task_res_redidx_count"]) == len(ret["task_res_total_idx_count"])
                 
-                records["tasks"] += [task_name] * len(task_res_redidx_count)
-                records["redundant index count"] += task_res_redidx_count
-                records["total index count"] += task_res_total_idx_count
-                records["inner area util"] += task_res_iarea_util
-                records["total area util"] += task_res_tarea_util
-                records["model"] += [model_name] * len(task_res_redidx_count)
-                records["swindow"] += [swindow] * len(task_res_redidx_count)
+                records["tasks"] += [task_name] * len(ret["task_res_redidx_count"])
+                records["inst id"] += ret["task_res_seq_ids"]
+                records["head idx"] += ret["task_res_hidx"]
+                records["redundant index count"] += ret["task_res_redidx_count"]
+                records["total index count"] += ret["task_res_total_idx_count"]
+                records["inner area util"] += ret["task_res_iarea_util"]
+                records["total area util"] += ret["task_res_tarea_util"]
+                records["raw head density"] += ret["task_res_raw_density"]
+                records["effec head density"] += ret["task_res_effec_density"]
+                records["mean_route_ratio"] += ret["task_res_mean_route_ratio"]
+                records["model"] += [model_name] * len(ret["task_res_redidx_count"])
+                records["swindow"] += [swindow] * len(ret["task_res_redidx_count"])
 
     records = pd.DataFrame(records)
     # store records as pandas dataframe
-    records.to_csv(f"/compas-old/projects/sparse-attention/redidx-areautil-all.csv", index=False)
+    records.to_csv(f"/compas-old/projects/sparse-attention/onchip-5hbm/spars-analysis-onchip-related.csv", index=False, mode="w")
 
 def plot_redunt_colidx_ratio_distribution():
     # read records from csv
@@ -325,31 +441,144 @@ def plot_redunt_colidx_ratio_distribution():
     plt.savefig(f"./res_fig/block_prune/redidx-ratio-dist-omit-last-iter.pdf")
 
 
-def plot_unique_colidx_ratio_boxplot_by_task():
-    # read records from csv
-    records = pd.read_csv(f"/compas-old/projects/sparse-attention/redidx-areautil-all.csv")
+def plot_unique_colidx_ratio_boxplot_by_task(records: pd.DataFrame):
     # select records that has swindow = 12
-    records = records[records['swindow'] == 12]
+    selected_records = records.loc[records['swindow'] == 12, :].copy()
     # add a new column "removable redundant index ratio"
-    records["removable redundant index ratio"] = records["redundant index count"] / records["total index count"]
-    records["effective density"] = records["total area util"]
-    records["tensor block utilization"] = records["inner area util"]
+    selected_records["removable redundant index ratio"] = \
+        selected_records["redundant index count"] / selected_records["total index count"]
+    # selected_records["effective sparsity"] = 1. - selected_records["total area util"]
+    selected_records["effective sparsity"] = 1. - selected_records["effec head density"]
+    selected_records["original sparsity"] = 1. - selected_records["raw head density"]
+    selected_records["tensor block utilization"] = selected_records["inner area util"]
+
+    # print(selected_records[selected_records["effec head density"] > 0.98])
+    # with open("./res_fig/block_prune/very_dense_heads.txt", "w+") as f:
+    #     f.writelines(selected_records[selected_records["effec head density"] > 0.98][["inst id", "head idx", "tasks", "model"]].drop_duplicates().to_string())
+
+    global model_palette
+
+    sns.set(rc={'figure.figsize': (21, 6)}, font_scale=1.3)
+    sns.set_style("whitegrid", {'grid.linestyle': '--'})
+    fig, axes = plt.subplots(2, 1)
+    plt.subplots_adjust(hspace=0.2)
+
+    lm = sns.boxplot(
+        data=selected_records, 
+        x = "tasks", 
+        y = "effective sparsity",
+        hue = "model",
+        legend=True,
+        palette={k:v[1] for k, v in zip(model_palette.keys(), model_palette.values())},
+        gap=.1,
+        flierprops={"alpha": 0.5},
+        whis=[1,99], 
+        ax=axes[0]
+    )
+
+    errorbar_ax = axes[0].twiny()
+    mean_sparsity = selected_records[["model", "tasks", "effective sparsity"]] \
+                        .groupby(["model", "tasks"]).mean()["effective sparsity"]
+    print(f"mean of effective sparsity: {mean_sparsity.min()}, {mean_sparsity.max()}")
+    sns.pointplot(
+        data=selected_records, 
+        x="tasks", 
+        y="effective sparsity", 
+        errorbar="sd", 
+        hue="model", 
+        err_kws={'linewidth': 5},
+        ax=errorbar_ax,
+        legend=False,
+        dodge=0.53,
+        linestyle="none",
+        palette={k:v[0] for k, v in zip(model_palette.keys(), model_palette.values())},
+    )
+    axes[0].set(ylim=(-0.01, 1.01))
+    axes[0].legend(title=None)
+    axes[0].set_xticklabels([])
+    axes[0].set_xlabel("")
+    axes[0].set_ylabel("Effective sparsity")
+    axes[0].tick_params(bottom=False)
+    errorbar_ax.set_xticklabels([])
+    errorbar_ax.set_xlabel("")
+    errorbar_ax.tick_params(top=False) 
+
+    lm = sns.boxplot(
+        data=selected_records, 
+        x = "tasks", 
+        y = "original sparsity",
+        hue = "model",
+        legend=False,
+        palette={k:v[1] for k, v in zip(model_palette.keys(), model_palette.values())},
+        gap=.1,
+        flierprops={"alpha": 0.5},
+        whis=[1,99], 
+        ax=axes[1]
+    )
+
+    errorbar_ax = axes[1].twiny()
+    sns.pointplot(
+        data=selected_records, 
+        x="tasks", 
+        y="original sparsity", 
+        errorbar="sd", 
+        hue="model", 
+        err_kws={'linewidth': 5},
+        ax=errorbar_ax,
+        legend=False,
+        dodge=0.53,
+        linestyle="none",
+        palette={k:v[0] for k, v in zip(model_palette.keys(), model_palette.values())},
+    )
+
+    axes[1].set(ylim=(-0.01, 1.01))
+    axes[1].set_ylabel("Pre-aggregation sparsity")
+    axes[1].set_xlabel("Tasks")
+    errorbar_ax.set_xticklabels([])
+    errorbar_ax.set_xlabel("")
+    errorbar_ax.tick_params(top=False) 
+    sns.move_legend(axes[0], "upper center", ncol=3, bbox_to_anchor=(0.5, 1.25))
+    plt.savefig(f"./res_fig/block_prune/effective_sparsity_boxplot.pdf", bbox_inches='tight')
+
+
+def plot_route_ratio_by_task(records: pd.DataFrame):
+    # select records that has swindow = 12
+    selected_records = records.loc[records['swindow'] == 12, :].copy()
+
+    global model_palette
 
     sns.set_theme(rc={'figure.figsize': (18, 5)}, font_scale=1.5)
     sns.set_style("whitegrid", {'grid.linestyle': '--'})
     lm = sns.boxplot(
-        data=records, 
+        data=selected_records, 
         x = "tasks", 
-        y = "effective density",
+        y = "mean_route_ratio",
         hue = "model",
         legend=True,
-        palette={"chatglm2-6b-32k": "C0", "llama2-7b-chat-4k": "C1", "mixtral-8x7b": "C2"},
-        gap=.1
+        palette={k:v[1] for k, v in zip(model_palette.keys(), model_palette.values())},
+        gap=.1,
+        flierprops={"alpha": 0.5},
+        whis=[1,99]
     )
-    lm.set(ylim=(0.0, 0.21))
+    ax = lm.axes
+    errorbar_ax = ax.twiny()
+
+    sns.pointplot(
+        data=selected_records, 
+        x="tasks", 
+        y="mean_route_ratio", 
+        errorbar="sd", 
+        hue="model", 
+        err_kws={'linewidth': 5},
+        ax=errorbar_ax,
+        legend=False,
+        dodge=0.53,
+        linestyle="none",
+        palette={k:v[0] for k, v in zip(model_palette.keys(), model_palette.values())},
+    )
+    # lm.set(ylim=(0.0, 1.0))
     # lm.get_legend().set_title(None)
     
-    ax = lm.axes
     ax.legend(title=None)
     labels = []
     for label in ax.get_xticklabels():
@@ -357,42 +586,92 @@ def plot_unique_colidx_ratio_boxplot_by_task():
         # labels.append(textwrap.fill(text, width=10, break_on_hyphens=True))
         labels.append(text)
     ax.set_xticklabels(labels, rotation=10)
-    sns.move_legend(ax, "upper center", ncol=3)
-    
-    plt.tight_layout()
-    plt.savefig(f"./res_fig/block_prune/tarea-util-box-omit-last-iter.pdf")
+    errorbar_ax.set_xticklabels([])
+    errorbar_ax.set_xlabel("")
 
-def plot_unique_colidx_ratio_by_swindow():
-    records = pd.read_csv(f"/compas-old/projects/sparse-attention/redidx-count-all.csv")
+    sns.move_legend(ax, "upper center", ncol=3, bbox_to_anchor=(0.5, 1.15))
+    plt.savefig(f"./res_fig/block_prune/route_ratio_boxplot.pdf", bbox_inches='tight')
 
+def plot_unique_colidx_ratio_by_swindow(records: pd.DataFrame, fixed_dim_size=8):
+    '''
+    fixed_dim_size is the size of the fixed hardware dimension in hw shape sweeping
+    '''
+    models = records['model'].unique()
+    tasks = records['tasks'].unique()
+    swindow_list = sorted(records["swindow"].unique())
     # group the records by tasks, model and swindow
-    records = records[records['swindow'] < 64]
-    grouped_records = records.groupby(['model', 'swindow'])['redundant index count'].mean().reset_index()
-    
+    selected_records = records.loc[records['swindow'] <= 128, :].copy()
+    selected_records["effective sparsity"] = 1. - selected_records["total area util"]
+    grouped_records = selected_records.groupby(['swindow'])['effective sparsity'].mean().reset_index()
+
+    # get latency records of different configs
+    # structure: {modelname: {fix_r:[], fix_cl:[]}}
+    lat_dat = {"fix_r": {}, "fix_cl": {}}
+    for mname, taskname in product(models, tasks):
+        fpath = f"./res_fig/block_prune/idxmerge_window_experi/{mname}-attn-bfp20-{taskname}/"
+        lat_files = util.get_pts_under_dir(fpath, "json")
+        for lat_file in lat_files:
+            hwconfig_in_fname = os.path.basename(lat_file).split(".")[0].split("_")[-3:]
+            r, c, cl = int(hwconfig_in_fname[0][1:]), int(hwconfig_in_fname[1][1:]), int(hwconfig_in_fname[2][2:])
+            print(f"find config {os.path.basename(lat_file)}: {(r, c, cl)}")
+            with open(lat_file, "r") as f:
+                sparse_lat_profile = json.load(f)
+                sparse_lats = np.mean([int(sparse_lat_profile[k]["avg_tops"]) for k in sparse_lat_profile.keys()])
+                if cl == fixed_dim_size:
+                    lat_dat["fix_cl"][c] = lat_dat["fix_cl"].get(c, []) + [sparse_lats]
+                if r == fixed_dim_size:
+                    lat_dat["fix_r"][c] = lat_dat["fix_r"].get(c, []) + [sparse_lats]
+
     # plot the grouped records as scatter plot with line connecting the points,
     # separate lines for each model and tasks, for different models use different colors
     # use different line style for different tasks
     # use swindow on x-axis with log scale, unique index ratio on y-axis
+    global model_palette
     plt.rcParams.update({'font.size': 22})
-    plt.figure(figsize=(12, 8))
-    lstyles = {"lcc": "-", "multifieldqa_en": "--", "multifieldqa_zh": "-.", "passage_retrieval_zh": ":", "qasper": "-", "samsum": "--", "trec": "-.", "vcsum": ":"}
-    for model_idx, model in enumerate(grouped_records['model'].unique()):
-        # plot 
-        color_table = {"llama2-7b-chat-4k": "C1", "mixtral-8x7b": "C2", "chatglm2-6b-32k": "C0"}
-        plt.plot(grouped_records[grouped_records['model'] == model]['swindow'], 
-                    grouped_records[grouped_records['model'] == model]['redundant index count'], 
-                    marker='s', markersize=10, 
-                    label=f"{model}", linewidth=5, color=color_table[model])
+    fig, ax1 = plt.subplots(figsize=(12, 8))
+    ax2 = ax1.twinx()
+    ln1=ax1.plot(grouped_records['swindow'], 
+                grouped_records['effective sparsity'], 
+                marker='s', markersize=20, 
+                label=f"effective sparsity", linewidth=5, color="C2")
+    # ln2=ax2.plot(sorted(lat_dat["fix_r"].keys()), 
+    #             [np.mean(d[1]) for d in sorted(lat_dat["fix_r"].items())], 
+    #             marker='o', markersize=20, linestyle="-.",
+    #             label=f"fixed #row", linewidth=5, color="C4")
+    # ln3=ax2.plot(sorted(lat_dat["fix_cl"].keys()), 
+    #             [np.mean(d[1]) for d in sorted(lat_dat["fix_cl"].items())], 
+    #             marker='v', markersize=20, linestyle="--",
+    #             label=f"fixed chain length", linewidth=5, color="C4")
+    
+    selected_max_tps = \
+        [max(np.mean(d0[1]), np.mean(d1[1])) for d0, d1 in zip(sorted(lat_dat["fix_cl"].items()), sorted(lat_dat["fix_r"].items()))]
+    ln2=ax2.plot(sorted(lat_dat["fix_cl"].keys()), 
+                selected_max_tps, 
+                marker='v', markersize=20, linestyle="--",
+                label=f"fixed chain length", linewidth=5, color="C4")
+    
+    # lns = ln1 + ln2
+    # labs = [l.get_label() for l in lns]
+    # ax2.legend(lns, labs, loc="lower right")
+
+    print(f"list of swindows: {grouped_records['swindow']}")
+    print(f"list of effec spar: {grouped_records['effective sparsity']}")
+    print(f"list of tops: {selected_max_tps}")
 
     plt.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
-    plt.xscale('log')
-    plt.xlim(xmin=2)
-    plt.ylim(ymin=0)
-    plt.legend()
-    plt.xlabel("row group size (R)")
-    plt.ylabel("average #removable redundant index")
-    plt.tight_layout()
-    plt.savefig("./res_fig/block_prune/redidx-count-by-swindow-zoomin.pdf")
+    ax1.set_xlim(xmin=1)
+    ax1.set_ylim(ymin=0, ymax=1)
+    ax1.set_xlabel("#Index merging & sorting tree entries")
+    ax1.set_ylabel("Average effective sparsity", color="C2")
+    ax1.spines['left'].set_color('C2')
+    ax1.tick_params(axis='y', colors='C2')
+
+    ax2.spines['right'].set_color('C4')
+    ax2.tick_params(axis='y', colors='C4')
+    ax2.set_ylim(ymin=0)
+    ax2.set_ylabel("TOPS", color="C4")
+
+    plt.savefig("./res_fig/block_prune/effective-density-by-swindow.pdf", bbox_inches='tight')
     plt.clf()
 
     return
@@ -427,13 +706,13 @@ def plot_hw_perf(json_path_lists: list[str], label_list: list[str], res_path: st
         ax.bar(x_pos, dat_delay[p], 
                 width=bar_width, color=f"C{i}", linewidth=1, label=label_list[i])
 
-    ax.set_ylabel('latency (sec)')
+    ax.set_ylabel('Latency (sec)')
     ax.set_ylim(ymin=0)
     ax.set_xlim(xmin=0)
     ax.set_xticks(x_labels)
     ax.set_xticklabels(x_labels)
     ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
-    ax.set_xlabel('layer')
+    ax.set_xlabel('Layer')
     ax.legend()
     fig.tight_layout()
     fig.savefig(res_path + "/res_delay_s.pdf")
@@ -457,13 +736,13 @@ def plot_hw_perf(json_path_lists: list[str], label_list: list[str], res_path: st
         ax.bar(x_pos, dat_tp[p], 
                 width=bar_width, color=f"C{i}", linewidth=1, label=label_list[i])
 
-    ax.set_ylabel('throughput (TOPs)')
+    ax.set_ylabel('Throughput (TOPs)')
     ax.set_xlim(xmin=0)
     ax.set_ylim(ymin=0)
     ax.set_xticks(x_labels)
     ax.set_xticklabels(x_labels)
     ax.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
-    ax.set_xlabel('layer')
+    ax.set_xlabel('Layer')
     ax.legend()
     fig.tight_layout()
     fig.savefig(res_path + "/res_tp_s.pdf")
@@ -568,6 +847,7 @@ def get_onchip_res(dat_path, models_name, tasks_name, spmm_freq=300.0, tc_core_s
         dat_path += "/"
 
     spmm_cycle_delay = 1./spmm_freq * 1000.
+    mat_b_load_delay_factor = 3.0
 
     # create pandas dataframe with columns: model,  task, onchip_lat, onchip_tp, seq_len
     df = pd.DataFrame(
@@ -580,6 +860,7 @@ def get_onchip_res(dat_path, models_name, tasks_name, spmm_freq=300.0, tc_core_s
             "onchip_total_tp", 
             "onchip_comp_lat",
             "onchip_comp_tp",
+            "onchip_mat_b_load_lat",
             "seq_len", 
             "dense_lat", 
             "dense_tp"
@@ -640,6 +921,7 @@ def get_onchip_res(dat_path, models_name, tasks_name, spmm_freq=300.0, tc_core_s
                     total_spmm_rr_flops = float(total_ops) / (float(total_latency_res) * 1e-9) / 1e12
                     componly_latency_res = hwconfig["compute_lat_counter_res"] * spmm_cycle_delay
                     comp_spmm_rr_flops = float(total_ops) / (float(componly_latency_res) * 1e-9) / 1e12
+                    mat_b_load_delay = hwconfig["mat b size"] * spmm_cycle_delay / mat_b_load_delay_factor
 
                     # append the onchip_lat, onchip_tp, seq_len to the df
                     df.loc[len(df)] = {
@@ -651,44 +933,51 @@ def get_onchip_res(dat_path, models_name, tasks_name, spmm_freq=300.0, tc_core_s
                                         "onchip_total_tp": total_spmm_rr_flops, 
                                         "onchip_comp_lat": componly_latency_res, 
                                         "onchip_comp_tp": comp_spmm_rr_flops, 
+                                        "onchip_mat_b_load_lat": mat_b_load_delay,
                                         "seq_len": seq_len, 
                                         "dense_lat": dense_res.total_lat, 
                                         "dense_tp": dense_res.total_flops
                     }
 
-    df.to_csv("./res_fig/block_prune/onchip_res_5hbm.csv")
+    df.to_csv(f"/compas-old/projects/sparse-attention/onchip-5hbm/onchip_res_{int(spmm_freq)}mhz.csv")
     return df
 
 def plot_onchip_res(dat: pd.DataFrame):
     dat["total_speedup"] = dat["onchip_total_tp"] / dat["onchip_comp_tp"]
     dat["comp_speedup"] = dat["onchip_comp_tp"] / dat["dense_tp"]
     # delete the "inst_id" column
+    dat_ori = dat.copy()
+    dat_inst_mean = dat.groupby(["model", "task", "inst_id"]).mean()
+
     dat = dat.drop(columns=["inst_id"])
     # calculate the mean of onchip_tp of different inst_id for the same model and task
-    dat_mean = dat.groupby(["model", "task"], group_keys=True).mean()
-    dat_overall_mean = dat.drop(columns=["task"]).groupby(["model"], group_keys=True).mean()
-    print(dat_overall_mean)
+    dat_mean = dat.groupby(["model", "task"]).mean()
+    # print(f"speedup by tasks: {dat_mean.to_string()}")
+    dat_overall_mean = dat.drop(columns=["task"]).groupby(["model"]).mean()
+    print(f"over all speedup: {dat_overall_mean}")
 
     # set the plot size to be 16,  6 for seaborn barplot
     sns.set(rc={'figure.figsize':(18, 4.5)}, font_scale=1.3)
     fig, axes = plt.subplots(1, 1)
-    print(dat_mean)
 
     # plot the mean of onchip_tp and dense_tp in a same bar chart, on the x-axis group tasks 
     # with the same model without gaps, and add a gap between each model    
     model_seq = ["chatglm2-6b-32k", "llama2-7b-chat-4k", "mixtral-8x7b"]
     task_seq = ["lcc", "multifieldqa_en", "multifieldqa_zh", "passage_retrieval_zh", "qasper", "samsum", "trec", "vcsum"]
-    model_palette = {"llama2-7b-chat-4k": "C1", "mixtral-8x7b": "C2", "chatglm2-6b-32k": "C0"}
+    global model_palette
+    curr_model_palette = {k:model_palette[k][0] for k in model_palette.keys()}
     sns.barplot(dat_mean, x="task", y="comp_speedup", hue="model", width=0.4, 
-                        palette=model_palette, ax=axes)
+                        palette=curr_model_palette, ax=axes)
     # sns.barplot(dat_mean, x="task", y="total_speedup", hue="model", width=0.4, 
     #                     palette=model_palette, ax=axes[1])
     # for cont_idx, i in enumerate(bplot.containers):
     #     labels = [int(dat_mean.loc[model_seq[cont_idx], task_seq[task_idx]]["seq_len"]) for task_idx in range(len(task_seq))]
     #     bplot.bar_label(i, labels, fmt='%d')
-        
-    axes.set_ylabel("throughput speedup")
-    axes.set_xlabel("tasks")
+    
+    labels = [label.get_text() for label in axes.get_xticklabels()]
+    axes.set_xticklabels(labels, rotation=10)
+    axes.set_ylabel("Average normalized throughput\n of heads")
+    axes.set_xlabel("Tasks")
     axes.set_ylim(ymin=0, ymax=5.5)
 
     # axes[1].set_xlabel("tasks measuring total latency")
@@ -696,9 +985,354 @@ def plot_onchip_res(dat: pd.DataFrame):
     # axes[1].set_ylim(ymin=0, ymax=1)
     # set the legend to be outside the plot, and one line for each legend
     axes.legend(loc="upper center", ncol=3)
-    fig.tight_layout()
-    fig.savefig("./res_fig/block_prune/onchip_res_total_speedup_new.pdf")
+    fig.savefig("./res_fig/block_prune/onchip_res_total_speedup.pdf", bbox_inches='tight')
     fig.clf()
+
+    # set the plot size to be 16,  6 for seaborn barplot
+    sns.set(rc={'figure.figsize':(15, 15)}, font_scale=3.5)
+    fig, axes = plt.subplots(1, 1)
+
+    # plot the mean of onchip_tp and dense_tp in a same bar chart, on the x-axis group tasks 
+    # with the same model without gaps, and add a gap between each model
+    sns.scatterplot(dat_inst_mean, x="seq_len", y="comp_speedup",
+                    s=300, alpha=0.8, hue="model", style="model", 
+                    palette=curr_model_palette, ax=axes, legend=True)
+        
+    axes.set_ylabel("Average normalized throughput\n per instance")
+    axes.set_xlabel("Context length")
+    axes.set_ylim(ymin=-0.1, ymax=5.5)
+    axes.set_xlim(xmin=-0.1)
+    axes.legend(title=None)
+    sns.move_legend(axes, "upper center", ncol=3, bbox_to_anchor=(0.5, 1.15))
+
+    fig.savefig("./res_fig/block_prune/onchip_res_speedup_vs_seqlen.pdf", bbox_inches='tight')
+    fig.clf()
+
+    # extract throughput without offchip loading
+    onchip_thr_list = {m:{t: [] for t in task_seq} for m in model_seq}
+    all_thr = []
+    n_queus = 2
+    for m, t in product(model_seq, task_seq):
+        selected = dat_ori.query(f"`model` == '{m}' and `task` == '{t}'")
+        inst_ids = selected["inst_id"].unique()
+        for i in inst_ids:
+            inst_df = selected.query(f"inst_id == '{i}'").sort_values("head_id")
+            inst_total_lats = list(inst_df["onchip_comp_lat"])
+            seq_len = inst_df["seq_len"].mean()
+            total_ops = seq_len * seq_len * 2 * 128 * len(inst_total_lats)
+            # balance all loads
+            total_lats = sublist_creator(inst_total_lats, n_queus)
+
+            effec_total_lat = max([sum(l) for l in total_lats])
+            curr_ops = float(total_ops) / (float(effec_total_lat) * 1e-9) / 1e12
+            onchip_thr_list[m][t].append(curr_ops) 
+            all_thr.append(curr_ops)
+
+    print(f"throughput with onchip bd: {np.mean(all_thr)} TOPS")
+
+    # extract throughput with offchip loading
+    offchip_thr_list = {m:{t: [] for t in task_seq} for m in model_seq}
+    all_thr = []
+    for m, t in product(model_seq, task_seq):
+        selected = dat_ori.query(f"`model` == '{m}' and `task` == '{t}'")
+        inst_ids = selected["inst_id"].unique()
+        for i in inst_ids:
+            inst_df = selected.query(f"inst_id == '{i}'").sort_values("head_id")
+            inst_total_lats = list(inst_df["onchip_total_lat"])
+            inst_load_lats = list(inst_df["onchip_mat_b_load_lat"])
+            seq_len = inst_df["seq_len"].mean()
+            total_ops = seq_len * seq_len * 2 * 128 * len(inst_total_lats)
+            total_lats = [[] for q in range(n_queus)]
+            for q in range(n_queus):
+                hlist = list(range(len(inst_total_lats)))[q:len(inst_total_lats):n_queus]
+                for hidx in range(len(hlist) + 1):
+                    if hidx == 0:
+                        total_lats[q].append(inst_load_lats[hlist[hidx]])
+                    elif hidx == (len(hlist)):
+                        total_lats[q].append(inst_total_lats[hlist[-1]])
+                    else:
+                        total_lats[q].append(max(inst_load_lats[hlist[hidx-1]], inst_total_lats[hlist[hidx]]))
+
+            effec_total_lat = max([sum(l) for l in total_lats])
+            curr_ops = float(total_ops) / (float(effec_total_lat) * 1e-9) / 1e12
+            offchip_thr_list[m][t].append(curr_ops) 
+            all_thr.append(curr_ops)
+
+    print(f"throughput with offchip bd: {np.mean(all_thr)} TOPS")
+
+def plot_speedup_vs_sparsity(hw_perf_df: pd.DataFrame, density_df: pd.DataFrame):
+    hw_perf_df["total_speedup"] = hw_perf_df["onchip_total_tp"] / hw_perf_df["onchip_comp_tp"]
+    hw_perf_df["comp_speedup"] = hw_perf_df["onchip_comp_tp"] / hw_perf_df["dense_tp"]
+
+    selected_hw_df = hw_perf_df[["model", "task", "inst_id", "head_id", "seq_len", "comp_speedup"]]
+    selected_density_df = density_df[["model", "tasks", "inst id", "head idx", "effec head density", "raw head density"]]
+    selected_density_df = selected_density_df.groupby(["model", "tasks", "inst id", "head idx"]).mean().reset_index()
+    selected_density_df.rename(columns={"tasks": "task", "inst id" : "inst_id", "head idx": "head_id"}, inplace=True)
+    dat = selected_hw_df.merge(selected_density_df, how="left", on=["model", "task", "inst_id", "head_id"])
+
+    dat["raw head sparsity"] = 1. - dat["raw head density"]
+    dat["effec head sparsity"] = 1. - dat["effec head density"]
+
+    global model_palette
+    curr_model_palette = {k:model_palette[k][0] for k in model_palette.keys()}
+    
+    # plot scatter figure
+    models = ["llama2-7b-chat-4k", "chatglm2-6b-32k", "mixtral-8x7b"]
+    tasks = ["lcc", "multifieldqa_en", "multifieldqa_zh", "passage_retrieval_zh", "qasper", "samsum", "trec", "vcsum"]
+    
+    sns.set(rc={'figure.figsize':(15, 15)}, font_scale=3.4)
+    fig, axes = plt.subplots(1, 1)
+    dat_sampled = dat.groupby('model').apply(lambda x: x.sample(n=200, random_state=42)).reset_index(drop=True)
+    sns.scatterplot(
+        dat_sampled, 
+        x="effec head sparsity", 
+        y="comp_speedup", 
+        s=400, 
+        ax=axes,
+        alpha=0.65,
+        hue="model",
+        palette=curr_model_palette,
+        style="model",
+        legend=False,
+    )
+    
+    axes.set_ylabel("Normalized throughput per head")
+    axes.set_xlabel(f"Effective sparsity per head")
+    axes.set_ylim(ymin=-0.01)
+    axes.set_xlim(xmin=-0.01, xmax=1)
+
+    fig.savefig("./res_fig/block_prune/speedup_vs_sparsity.pdf", dpi=1200, bbox_inches='tight')
+    fig.clf()
+
+    sns.set(rc={'figure.figsize':(15, 15)}, font_scale=3.4)
+    fig, axes = plt.subplots(1, 1)
+    dat_inst_level = dat.groupby(["model", "task", "inst_id"]).mean().reset_index()
+    sns.scatterplot(
+        dat_sampled, 
+        x="seq_len", 
+        y="effec head sparsity", 
+        s=400, 
+        ax=axes,
+        alpha=0.65,
+        hue="model",
+        palette=curr_model_palette,
+        style="model",
+        legend=False
+    )
+    
+    axes.set_ylabel("Effective sparsity per head")
+    axes.set_xlabel("Context length")
+    axes.set_ylim(ymin=-0.01, ymax=1)
+    axes.set_xlim(xmin=-0.01)
+    
+    fig.savefig("./res_fig/block_prune/sparsity_vs_seqlen.pdf", dpi=1200, bbox_inches='tight')
+    fig.clf()
+
+    # check correlation
+    # Function to compute Pearson r for each group
+    def compute_pearson(group):
+        r_effc, p_effc = pearsonr(group['seq_len'], group['effec head sparsity'])
+        r_raw, p_raw = pearsonr(group['seq_len'], group['raw head sparsity'])
+        return pd.Series({
+            'r_effc_spars': r_effc,
+            'p_effc_spars': p_effc,
+            'r_raw_spars': r_raw,
+            'p_raw_spars': p_raw
+        })
+
+    # Group by 'model' and apply the function
+    correlations = dat.groupby('model').apply(compute_pearson).reset_index()
+    print(correlations)
+
+
+def rr2spmm_wrap(all_inst_dat, seq_lens, hw_shape, out_path): 
+    rr2spmm_fifo_latency_overlap_analysis(
+        all_inst_dat, seq_lens, 
+        hw_shape[1], hw_shape, 
+        512, 
+        out_buff_depth=1024,
+        out_json_basepath=out_path)
+
+def sweep_rr_swindow_get_tops(model_name, task_name):
+    base_attn_path = f"/compas-old/projects/sparse-attention/{model_name}-attn-bfp20-{task_name}/"
+    inst_rlist = sorted(util.get_pts_under_dir(base_attn_path, postfix="npy", datatype="ridx", fname_filter="iiSeqInst"))
+    inst_clist = sorted(util.get_pts_under_dir(base_attn_path, postfix="npy", datatype="cidx", fname_filter="iiSeqInst"))
+
+    insts = [i.split("/")[-1].split("_ridx.npy")[0] for i in inst_rlist]
+
+    head_ids, seq_lens = {}, {}
+    for inst in insts:
+        hwconfig_path = f"/compas-old/projects/sparse-attention/onchip-5hbm/{model_name}-attn-bfp20-{task_name}/{inst}/"
+        inst_profile_path = f"/compas-old/projects/sparse-attention/onchip-5hbm/{model_name}-attn-bfp20-{task_name}/{inst}/inst_profile.json"
+        # get json files start with "hwconfig" under hwconfig_path
+        hwconfig_list = util.get_pts_under_dir(hwconfig_path, postfix="json")
+        hwconfig_list = [os.path.basename(pa) for pa in hwconfig_list if os.path.basename(pa).startswith("hwconfig")]
+        # extract head id from each member of hwconfig_list following the pattern "hwconfig_h<head_id>.json"
+        hwconfig_head_ids = [int(os.path.basename(pa).split("_h")[1].split(".")[0]) for pa in hwconfig_list]
+        head_ids[inst] = hwconfig_head_ids
+        with open(inst_profile_path, "r") as inst_pf:
+            inst_pf_dict = json.load(inst_pf)
+            seq_lens[inst] = int(inst_pf_dict["seq_len"])
+
+    all_inst_dat = {}
+    for inst_id, inst_rp, inst_cp in zip(insts, inst_rlist, inst_clist):
+        print(f"loading {inst_rp} and {inst_cp}...")
+        # preprocess index inputs
+        ridx_dat = np.load(inst_rp)
+        cidx_dat = np.load(inst_cp)
+        # extract one head
+        headgrp_ridx, headgrp_cidx = [], []
+        curr_head_ridx, curr_head_cidx = [], []
+        for ridx, cidx in zip(ridx_dat, cidx_dat):
+            if ridx == -1 and cidx == -1:
+                headgrp_ridx.append(curr_head_ridx.copy())
+                headgrp_cidx.append(curr_head_cidx.copy())
+                curr_head_ridx, curr_head_cidx = [], []
+            else:
+                curr_head_ridx.append(ridx)
+                curr_head_cidx.append(cidx)
+
+        # fetch a head
+        idx_dat = []
+        print(f"get {len(headgrp_ridx)} heads in total")
+        for hidx in head_ids[inst_id]:
+            src_ridx, src_cidx = headgrp_ridx[hidx], headgrp_cidx[hidx] 
+            idx_dat.append([(r, c) for r, c in zip(src_ridx, src_cidx)])
+        
+        all_inst_dat[inst_id] = idx_dat
+
+    # run the experiment
+    out_path = f"./res_fig/block_prune/idxmerge_window_experi/{model_name}-attn-bfp20-{task_name}"
+    if not os.path.exists(out_path):
+        os.makedirs(out_path)
+
+    hw_shapes = [(18, 4, 8), (9, 8, 8), (6, 12, 8), (3, 24, 8), (2, 36, 8),
+                 (8, 4, 18), (8, 8, 9), (8, 12, 6), (8, 24, 3), (8, 36, 2)]
+    args = [(all_inst_dat, seq_lens, i, out_path) for i in hw_shapes]    
+    with multiprocessing.Pool(processes=10) as pool:
+        pool.starmap(rr2spmm_wrap, args)
+
+def eval_emulator(dat: pd.DataFrame, models, tasks):
+    # get latency records of required config:
+    r, c, cl = 6, 12, 8
+    lat_dat = {m: {t: {} for t in tasks} for m in model_names}
+    for mname, taskname in product(models, tasks):
+        fpath = \
+            f"./res_fig/block_prune/idxmerge_window_experi/{mname}-attn-bfp20-{taskname}/spmm_rr_lat_diff_wfifo_512_r{r}_c{c}_cl{cl}.json"
+        with open(fpath, "r") as f:
+            sparse_lat_profile = json.load(f)
+            inst_list = sparse_lat_profile.keys()
+            for inst in sparse_lat_profile.keys():
+                lat_dat[mname][taskname][inst] = sparse_lat_profile[inst]["avg_tops"]
+
+    # get latency records of onchip res
+    
+    dat["total_speedup"] = dat["onchip_total_tp"] / dat["onchip_comp_tp"]
+    dat["comp_speedup"] = dat["onchip_comp_tp"] / dat["dense_tp"]
+    # delete the "inst_id" column
+    dat_inst_mean = dat.groupby(["model", "task", "inst_id"]).mean()
+
+    errs = []
+    for m, t in product(models, tasks):
+        for i in lat_dat[m][t].keys():
+            onchip_res = dat_inst_mean.query(f"`model` == '{m}' and `task` == '{t}' and `inst_id` == '{i}' ")["onchip_comp_tp"]
+            emu_res = lat_dat[m][t][i]
+            err = abs(onchip_res-emu_res) / float(onchip_res)
+            errs.append(err)
+
+    print(f"average err: {np.mean(errs):.4f}")
+
+
+
+def plot_roofline(hw_perf_df: pd.DataFrame, density_df: pd.DataFrame, hw_size: dict):
+    # calculate hw arithmetic capability and input bandwidth for ideal roofline
+    n_input_bits = (hw_size["r"] * hw_size["l"] + hw_size["c"]) * 88 / 8.0 / (1024.0 ** 3)
+    max_bandwidth = n_input_bits / (1. / hw_size["freq"]* 1e-6)
+    tops = hw_size["r"] * hw_size["l"] * hw_size["c"] * (20 * 3 * 2) / 1e12
+    tops = tops / (1. / hw_size["freq"]* 1e-6)
+    print(f"max tops: {tops:.2f}, max bandwidth: {max_bandwidth:.2f}")
+
+    # sample some data from hw results
+    hw_perf_df["total_speedup"] = hw_perf_df["onchip_total_tp"] / hw_perf_df["onchip_comp_tp"]
+    hw_perf_df["comp_speedup"] = hw_perf_df["onchip_comp_tp"] / hw_perf_df["dense_tp"]
+
+    selected_density_df = density_df[density_df["swindow"] == 12].copy()
+    selected_density_df = selected_density_df.groupby(["model", "tasks", "inst id", "head idx"]).mean().reset_index()
+    selected_density_df.rename(columns={"tasks": "task", "inst id" : "inst_id", "head idx": "head_id"}, inplace=True)
+    dat = hw_perf_df.merge(selected_density_df, how="left", on=["model", "task", "inst_id", "head_id"])
+    sampled_dat = dat.sample(500)
+
+    # iterate through and log data points
+    data_points_raw_density_sparse, data_points_effect_density_sparse = [], []
+    data_points_raw_density_mild, data_points_effect_density_mild = [], []
+    data_points_raw_density_dense, data_points_effect_density_dense = [], []
+    for _, record in sampled_dat.iterrows():
+        # devided by 2 because the density excluded the upper right matrix
+        print(record)
+        n_dense_blks = \
+            math.ceil(math.ceil(record["seq_len"] / 20.) * math.ceil(record["seq_len"] / 3.) / 2 * record["raw head density"])
+        n_ops = n_dense_blks * 128 * (20 * 3 * 2) / (1000 ** 4)
+        latency = record["onchip_comp_lat"] * 1e-9
+        compute_tops = n_ops / latency
+        mem_usage = (n_dense_blks * 88 * 3 + n_dense_blks * 128 * 88) / 8.0 / (1024.0 ** 3)
+        arith_intensity = n_ops / mem_usage
+        if record["raw head density"] > 0.5:
+            data_points_raw_density_dense.append((compute_tops, arith_intensity))
+        elif 0.2 < record["raw head density"] < 0.5:
+            data_points_raw_density_mild.append((compute_tops, arith_intensity))
+        elif record["raw head density"] < 0.2:
+            data_points_raw_density_sparse.append((compute_tops, arith_intensity))
+        
+        n_dense_blks = \
+            math.ceil(math.ceil(record["seq_len"] / 20.) * math.ceil(record["seq_len"] / 3.) / 2 * record["effec head density"])
+        n_ops = n_dense_blks * 128 * (20 * 3 * 2) / (1000 ** 4)
+        latency = record["onchip_comp_lat"] * 1e-9
+        compute_tops = n_ops / latency
+        mem_usage = (n_dense_blks * 88 * 3 + n_dense_blks * 128 * 88) / 8.0 / (1024.0 ** 3)
+        arith_intensity = n_ops / mem_usage
+        if record["effec head density"] > 0.5:
+            data_points_effect_density_dense.append((compute_tops, arith_intensity))
+        elif 0.2 < record["effec head density"] < 0.5:
+            data_points_effect_density_mild.append((compute_tops, arith_intensity))
+        elif record["effec head density"] < 0.2:
+            data_points_effect_density_sparse.append((compute_tops, arith_intensity))
+
+    # Initialize plotter
+    rl = Roofline()
+
+    # Configure units and performance limits
+    rl.set_units("TOPs", "GB")
+    rl.set_ideal(max_arith=tops, max_bandwidth=max_bandwidth)  # Your hardware limits
+
+    raw_dps = [
+        ("s<50%", data_points_raw_density_dense), 
+        ("50%<s<80%", data_points_raw_density_mild), 
+        ("80%<s", data_points_raw_density_sparse)]
+    effective_dps = [
+        ("s<50%", data_points_effect_density_dense), 
+        ("50%<s<80%", data_points_effect_density_mild), 
+        ("80%<s", data_points_effect_density_sparse)]
+    # Add data points
+    # for cate in raw_dps:
+    #     for dp in cate[1]:
+    #         rl.add_point(dp[0], dp[1], category=f"w/o aggregation, {cate[0]}")
+
+    for cate in effective_dps:
+        for dp in cate[1]:
+            rl.add_point(dp[0], dp[1], category=f"w/ aggregation, {cate[0]}")
+
+
+    rl.set_palette({
+        "w/o aggregation, s<50%": "#001F3F",
+        "w/o aggregation, 50%<s<80%,": "#87CEEB",
+        "w/o aggregation, 80%<s": "#0074D9",
+        "w/ aggregation, s<50%": "#CC5500",
+        "w/ aggregation, 50%<s<80%": "#FF7518",
+        "w/ aggregation, 80%<s": "#FF4500",
+    })
+    # Generate plot
+    rl.plot(pathlib.Path("./res_fig/block_prune/roofline_plot_diff_s_agg.pdf"))
+ 
 
 if __name__ == "__main__":
     # hardware config
@@ -706,26 +1340,33 @@ if __name__ == "__main__":
 
     # inst_idx = 4
     model_names = ["chatglm2-6b-32k", "llama2-7b-chat-4k", "mixtral-8x7b"]
-    task_list = ["lcc", "multifieldqa_en", "multifieldqa_zh", "passage_retrieval_zh", "qasper", "samsum", "trec", "vcsum"]
+    task_list = ["multifieldqa_en", "multifieldqa_zh", "passage_retrieval_zh", "qasper", "samsum", "trec", "vcsum"]
 
-    # plot_unique_colidx_ratio_boxplot_by_task(task_list, model_names)
     # generate a list with power of 2, from 4 to 5000
-    swindow_list = [2**i for i in range(2, 10)]
-    swindow_list += [12]
-    swindow_list.sort()
-    # compute_unique_colidx_ratio(task_list, model_names, swindow_list, method="unique")
-    # plot_unique_colidx_ratio_boxplot_by_task()
-    # plot_unique_colidx_ratio_by_swindow()
-    # plot_redunt_colidx_ratio_distribution()
-    # exit()
-    
+    # swindow_list = [4,8,12,24,36]
+
+    # compute_unique_colidx_ratio(task_list, model_names, swindow_list)
     # onchip_df_res = get_onchip_res(
     #     "/compas-old/projects/sparse-attention/onchip-5hbm", 
     #     model_names, task_list, spmm_freq=300.0, tc_core_shape=(6, 12, 8)
     # )
-    onchip_df_res = pd.read_csv("./res_fig/block_prune/onchip_res_5hbm.csv")
-    plot_onchip_res(onchip_df_res)
+    onchip_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/onchip_res_300mhz.csv")
+    density_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/spars-analysis-onchip-related.csv")
+
+    # print(density_df_res["swindow"].unique())
+
+    # plot_onchip_res(onchip_df_res)
+    # eval_emulator(onchip_df_res, model_names, task_list)
+    # plot_unique_colidx_ratio_boxplot_by_task(density_df_res)
+    # plot_route_ratio_by_task(density_df_res)
+    # plot_unique_colidx_ratio_by_swindow(density_df_res, 8)
+    # plot_redunt_colidx_ratio_distribution()
+    plot_speedup_vs_sparsity(onchip_df_res, density_df_res)
+    # plot_roofline(onchip_df_res, density_df_res, {"r": 6, "c": 12, "l": 8, "freq": 300})
     
+    # for mname, task in product(model_names, task_list):
+    #     sweep_rr_swindow_get_tops(mname, task)
+
     # attn_path_chatglm = inst_list[0] + ".pt"
     # src_attn = torch.load(attn_path_chatglm).numpy()
     # explore_row_features(src_attn, inst_idx=inst_idx)
@@ -747,34 +1388,7 @@ if __name__ == "__main__":
     # base_attn_cidx_path = "/var/services/homes/tianchu.ji/mackeson-home/HGO/proj/intel-tensor-core-matmul/sim/tb/sparse_matmul_data/midsize_cidx.npy"
     # ridx_dat = np.load(base_attn_ridx_path)
     # cidx_dat = np.load(base_attn_cidx_path)
-    
-    # # extract one head
-    # headgrp_ridx, headgrp_cidx = [], []
-    # curr_head_ridx, curr_head_cidx = [], []
-    # for ridx, cidx in zip(ridx_dat, cidx_dat):
-    #     if ridx == -1 and cidx == -1:
-    #         headgrp_ridx.append(curr_head_ridx.copy())
-    #         headgrp_cidx.append(curr_head_cidx.copy())
-    #         curr_head_ridx, curr_head_cidx = [], []
-    #     else:
-    #         curr_head_ridx.append(ridx)
-    #         curr_head_cidx.append(cidx)
 
-    # # fetch a head
-    # idx_dat = []
-    # print(f"get {len(headgrp_ridx)} heads in total")
-    # for hidx in range(len(headgrp_ridx)):
-    #     src_ridx, src_cidx = headgrp_ridx[hidx], headgrp_cidx[hidx] 
-    #     idx_dat.append([(r, c) for r, c in zip(src_ridx, src_cidx)])
-
-    # fdeps = [200]
-    # def rr2spmm_wrap(hw_shape): 
-    #     rr2spmm_fifo_latency_overlap_analysis(
-    #         [idx_dat], [4480], hw_shape[1], hw_shape, 200, out_buff_depth=1024)
-    
-    # import multiprocessing
-    # with multiprocessing.Pool() as pool:
-    #     pool.map(rr2spmm_wrap, hw_shapes)
 
     # spmm_non_rr_latency_analysis(inst_list, 12, 28, 32, (nrows, ncols, chain_len))
         

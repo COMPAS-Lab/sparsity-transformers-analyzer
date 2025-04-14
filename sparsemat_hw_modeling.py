@@ -1450,12 +1450,13 @@ def spmm_non_rr_latency_analysis(
 
 
 def rr2spmm_fifo_latency_overlap_analysis(
-        inst_list: list, 
-        seqlen_list: list[int],
+        inst_list: dict, 
+        seqlen_list: dict,
         row_grp_size: int, 
         tc_core_shape: tuple[int, int, int] = (4, 12, 12),
         fifo_depth: int = 400,
-        out_buff_depth: int = 0):
+        out_buff_depth: int = 0,
+        out_json_basepath: str = ""):
     '''
     check if the spmm operation can overlap with redundancy removal based on the 
     block pruned sparse attention
@@ -1466,20 +1467,9 @@ def rr2spmm_fifo_latency_overlap_analysis(
     transpose_ram_fold_factor = 2
     matB_rotate_delay = ceil(log2(ceil(128/tc_core_shape[0])/transpose_ram_fold_factor)) + 2
 
-    block_ids = []
-    for i in inst_list:
-        if type(i) == str:
-            dir_path = dirname(i)
-            fname = basename(i).split(".")[0] + ".pt"
-            pt_data_path = dir_path + "/" + fname
-        
-            dat = np.load(i, allow_pickle=True)
-            block_ids += [dat]
-        else:
-            block_ids += [i]
-
     res = {}
-    for inst_idx, i in enumerate(block_ids):
+    for k in inst_list.keys():
+        i = inst_list[k]
         perhead_latdiff_rec = {
             "lat_diff": [], 
             "total_lat": [], 
@@ -1489,10 +1479,10 @@ def rr2spmm_fifo_latency_overlap_analysis(
             "out_bd_wbuffer_req": [],
             "out_bd_req_bfp12": [],
         }
-        l = seqlen_list[inst_idx]
+        l = seqlen_list[k]
         total_ops = l * l * 2 * 128
         
-        for h_idx, curr_head in tqdm(enumerate(i), unit="head"):
+        for curr_head in tqdm(i, unit="head"):
             #split block ids into many row groups
             all_row_idx = np.unique([r[0] for r in curr_head])
             split_ridx_list = [(i + 1) * row_grp_size for i in range(ceil(float(all_row_idx.shape[0]) / row_grp_size))]
@@ -1559,18 +1549,11 @@ def rr2spmm_fifo_latency_overlap_analysis(
             perhead_latdiff_rec["total_tops"].append(spmm_rr_actual_flops)
 
         # get dense res
-        fake_dense_data = np.ones((seqlen_list[inst_idx], seqlen_list[inst_idx]))
+        fake_dense_data = np.ones((l, l))
         fake_dense_data = np.tril(fake_dense_data)
-        hw_array_shape = (tc_core_shape[0], tc_core_shape[1])
-        dense_model = hw_modeling.StratixDpuModel(seqlen_list[inst_idx], 
-                                                  seqlen_list[inst_idx], 
-                                                  seqlen_list[inst_idx], 
-                                                  128,
-                                                  exp_dat=fake_dense_data, 
-                                                  freq=300.0, 
-                                                  num_tcs=3960, 
-                                                  tcc_array_shape=hw_array_shape, 
-                                                  tcc_chainlen=tc_core_shape[2])
+        dense_model = hw_modeling.StratixDpuModel(l, l, l, 128, exp_dat=fake_dense_data, 
+                                                  freq=300.0, num_tcs=tc_col * tc_row * (tc_chain_len + 2), 
+                                                  tcc_array_shape=(tc_row, tc_col), tcc_chainlen=tc_chain_len)
         dense_model.set_tccore_size(TCCORE_SIZE)
         dense_flops, dense_lat, dense_util = \
             dense_model.tensor_fpga21_mat_sparse_flops(fake_dense_data, sparse_block_size=TCCORE_SIZE)
@@ -1580,15 +1563,14 @@ def rr2spmm_fifo_latency_overlap_analysis(
         dense_res.add_data(dense_util, "util")
         dense_res.set_flops(total_ops)
 
-        res = {}
-        res[f"inst_{inst_idx}"] = perhead_latdiff_rec
-        res[f"inst_{inst_idx}"]["avg_tops"] = np.mean(perhead_latdiff_rec["total_tops"])
-        res[f"inst_{inst_idx}"]["dense_avg_tops"] = dense_res.avg_data("flops")
-        res[f"inst_{inst_idx}"]["max_out_bd_req"] = np.amax(perhead_latdiff_rec["out_bd_req"])
-        res[f"inst_{inst_idx}"]["max_out_bd_wbuffer_req"] = np.amax(perhead_latdiff_rec["out_bd_wbuffer_req"])
-        res[f"inst_{inst_idx}"]["max_out_bd_req_bfp12"] = np.amax(perhead_latdiff_rec["out_bd_req_bfp12"])
+        res[k] = perhead_latdiff_rec
+        res[k]["avg_tops"] = np.mean(perhead_latdiff_rec["total_tops"])
+        res[k]["dense_avg_tops"] = dense_res.avg_data("flops")
+        res[k]["max_out_bd_req"] = np.amax(perhead_latdiff_rec["out_bd_req"])
+        res[k]["max_out_bd_wbuffer_req"] = np.amax(perhead_latdiff_rec["out_bd_wbuffer_req"])
+        res[k]["max_out_bd_req_bfp12"] = np.amax(perhead_latdiff_rec["out_bd_req_bfp12"])
 
-        fpath = f"res_fig/block_prune/spmm_rr_lat_diff_wfifo_{fifo_depth}_r{tc_row}_c{tc_col}_cl{tc_chain_len}.json"
+        fpath = f"{out_json_basepath}/spmm_rr_lat_diff_wfifo_{fifo_depth}_r{tc_row}_c{tc_col}_cl{tc_chain_len}.json"
         if exists(fpath):
             with open(fpath, 'r') as file:
                 try:
