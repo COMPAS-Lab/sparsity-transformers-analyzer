@@ -1478,6 +1478,8 @@ def rr2spmm_fifo_latency_overlap_analysis(
             "out_bd_req": [],
             "out_bd_wbuffer_req": [],
             "out_bd_req_bfp12": [],
+            "tbc_compute_lat": [],
+            "tbc_load_lat": [],
         }
         l = seqlen_list[k]
         total_ops = l * l * 2 * 128
@@ -1489,6 +1491,7 @@ def rr2spmm_fifo_latency_overlap_analysis(
             row_grps = np.split(all_row_idx, split_ridx_list[0:-1])
             
             spmm_rr_latdiff, spmm_rr_actual_lat, spmm_lat_cycles = [], 0.0, 0.0
+            tbc_total_compute_cycles, tbc_total_load_cycles = 0.0, 0.0
             row_grps_for_spmm = []
 
             while len(row_grps) > 0 or len(row_grps_for_spmm):
@@ -1497,6 +1500,8 @@ def rr2spmm_fifo_latency_overlap_analysis(
                 if row_grps_for_spmm:
                     for spmm_row_grp in row_grps_for_spmm:
                         curr_cols_loading_iters = ceil(float(spmm_row_grp.shape[0]) / tc_chain_len)
+                        tbc_total_compute_cycles += ceil(128.0 / tc_row) * curr_cols_loading_iters
+                        tbc_total_load_cycles += (tc_chain_len) * 3 * curr_cols_loading_iters
                         if curr_cols_loading_iters > 1:
                             spmm_latency += max((tc_chain_len) * 3, ceil(128.0 / tc_row)) \
                                                 * curr_cols_loading_iters
@@ -1532,6 +1537,8 @@ def rr2spmm_fifo_latency_overlap_analysis(
             perhead_latdiff_rec["lat_diff"].append(spmm_rr_latdiff)
             perhead_latdiff_rec["total_lat"].append(spmm_rr_actual_lat)
             perhead_latdiff_rec["matmul_lat_cycles"].append(spmm_lat_cycles)
+            perhead_latdiff_rec["tbc_compute_lat"].append(tbc_total_compute_cycles * spmm_cycle_delay)
+            perhead_latdiff_rec["tbc_load_lat"].append(tbc_total_load_cycles * spmm_cycle_delay)
             # compute output size
             out_size = l * 128
             effective_out_size = out_size - tc_row * tc_col * out_buff_depth
@@ -1569,6 +1576,8 @@ def rr2spmm_fifo_latency_overlap_analysis(
         res[k]["max_out_bd_req"] = np.amax(perhead_latdiff_rec["out_bd_req"])
         res[k]["max_out_bd_wbuffer_req"] = np.amax(perhead_latdiff_rec["out_bd_wbuffer_req"])
         res[k]["max_out_bd_req_bfp12"] = np.amax(perhead_latdiff_rec["out_bd_req_bfp12"])
+        res[k]["avg_tbc_load_lat"] = np.mean(perhead_latdiff_rec["tbc_load_lat"])
+        res[k]["avg_tbc_compute_lat"] = np.mean(perhead_latdiff_rec["tbc_compute_lat"])
 
         fpath = f"{out_json_basepath}/spmm_rr_lat_diff_wfifo_{fifo_depth}_r{tc_row}_c{tc_col}_cl{tc_chain_len}.json"
         if exists(fpath):

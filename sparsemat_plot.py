@@ -21,6 +21,8 @@ import multiprocessing
 import pandas as pd
 import seaborn as sns
 import heapq
+import operator
+from util import find_positive_integer_pairs
 
 model_palette = {
     "chatglm2-6b-32k": ("#1f77b4", "#84cdff"), 
@@ -458,6 +460,7 @@ def plot_unique_colidx_ratio_boxplot_by_task(records: pd.DataFrame):
 
     global model_palette
 
+    # boxplot with errorbars 
     sns.set(rc={'figure.figsize': (21, 6)}, font_scale=1.3)
     sns.set_style("whitegrid", {'grid.linestyle': '--'})
     fig, axes = plt.subplots(2, 1)
@@ -479,7 +482,8 @@ def plot_unique_colidx_ratio_boxplot_by_task(records: pd.DataFrame):
     errorbar_ax = axes[0].twiny()
     mean_sparsity = selected_records[["model", "tasks", "effective sparsity"]] \
                         .groupby(["model", "tasks"]).mean()["effective sparsity"]
-    print(f"mean of effective sparsity: {mean_sparsity.min()}, {mean_sparsity.max()}")
+    print(f"{mean_sparsity}")
+    # print(f"mean of effective sparsity: {mean_sparsity.min()}, {mean_sparsity.max()}")
     sns.pointplot(
         data=selected_records, 
         x="tasks", 
@@ -538,7 +542,94 @@ def plot_unique_colidx_ratio_boxplot_by_task(records: pd.DataFrame):
     errorbar_ax.set_xlabel("")
     errorbar_ax.tick_params(top=False) 
     sns.move_legend(axes[0], "upper center", ncol=3, bbox_to_anchor=(0.5, 1.25))
-    plt.savefig(f"./res_fig/block_prune/effective_sparsity_boxplot.pdf", bbox_inches='tight')
+    plt.savefig(f"./res_fig/block_prune/effective_sparsity_boxplot.png", bbox_inches='tight')
+
+    # vertical version of the boxplot
+    sns.set(rc={'figure.figsize': (10, 11)}, font_scale=1.3)
+    sns.set_style("whitegrid", {'grid.linestyle': '--'})
+    fig, axes = plt.subplots(1,2)
+    plt.subplots_adjust(wspace=0.1)
+
+    lm = sns.boxplot(
+        data=selected_records, 
+        x = "effective sparsity",
+        y = "tasks",
+        hue = "model",
+        legend=True,
+        palette={k:v[1] for k, v in zip(model_palette.keys(), model_palette.values())},
+        gap=.1,
+        flierprops={"alpha": 0.5},
+        whis=[1,99], 
+        ax=axes[0]
+    )
+
+    errorbar_ax = axes[0].twiny()
+    sns.pointplot(
+        data=selected_records, 
+        x= "effective sparsity",
+        y= "tasks",
+        errorbar="sd", 
+        hue="model", 
+        err_kws={'linewidth': 5},
+        ax=errorbar_ax,
+        legend=False,
+        dodge=0.53,
+        linestyle="none",
+        palette={k:v[0] for k, v in zip(model_palette.keys(), model_palette.values())},
+    )
+    
+    labels = [label.get_text() for label in axes[0].get_yticklabels()]
+    axes[0].set_yticklabels(labels, rotation=40)
+    axes[0].set(xlim=(-0.01, 1.01))
+    axes[0].set_xlabel("Effective sparsity")
+    axes[0].set_ylabel("Tasks")
+    axes[0].tick_params(bottom=False)
+    axes[0].legend(title=None)
+    errorbar_ax.grid(visible=False)
+    errorbar_ax.set_xticklabels([])
+    errorbar_ax.set_xlabel("")
+    errorbar_ax.tick_params(top=False) 
+    sns.move_legend(axes[0], "upper center", ncol=3, bbox_to_anchor=(1.06, 1.07))
+    # plt.savefig(f"./res_fig/block_prune/effective_sparsity_boxplot_vertical_upper.png", bbox_inches='tight', dpi=400)
+
+    # fig, axes = plt.subplots(1,1)
+    lm = sns.boxplot(
+        data=selected_records, 
+        x = "original sparsity",
+        y = "tasks",
+        hue = "model",
+        legend=False,
+        palette={k:v[1] for k, v in zip(model_palette.keys(), model_palette.values())},
+        gap=.1,
+        flierprops={"alpha": 0.5},
+        whis=[1,99], 
+        ax=axes[1]
+    )
+
+    errorbar_ax = axes[1].twiny()
+    sns.pointplot(
+        data=selected_records, 
+        x="original sparsity", 
+        y="tasks",
+        errorbar="sd", 
+        hue="model", 
+        err_kws={'linewidth': 5},
+        ax=errorbar_ax,
+        legend=False,
+        dodge=0.53,
+        linestyle="none",
+        palette={k:v[0] for k, v in zip(model_palette.keys(), model_palette.values())},
+    )
+    axes[1].set(xlim=(-0.01, 1.01))
+    axes[1].set_xlabel("Pre-aggregation sparsity")
+    axes[1].set_ylabel("")
+    axes[1].set_yticklabels([])
+    errorbar_ax.grid(visible=False)
+    errorbar_ax.set_xticklabels([])
+    errorbar_ax.set_xlabel("")
+    errorbar_ax.tick_params(top=False) 
+    # sns.move_legend(axes, "upper center", ncol=3, bbox_to_anchor=(0.5, 1.05))
+    plt.savefig(f"./res_fig/block_prune/effective_sparsity_boxplot_vertical_2col.png", bbox_inches='tight', dpi=400)
 
 
 def plot_route_ratio_by_task(records: pd.DataFrame):
@@ -592,7 +683,7 @@ def plot_route_ratio_by_task(records: pd.DataFrame):
     sns.move_legend(ax, "upper center", ncol=3, bbox_to_anchor=(0.5, 1.15))
     plt.savefig(f"./res_fig/block_prune/route_ratio_boxplot.pdf", bbox_inches='tight')
 
-def plot_unique_colidx_ratio_by_swindow(records: pd.DataFrame, fixed_dim_size=8):
+def plot_unique_colidx_ratio_by_swindow(records: pd.DataFrame, fixed_dim_size=8, budget=720):
     '''
     fixed_dim_size is the size of the fixed hardware dimension in hw shape sweeping
     '''
@@ -607,6 +698,7 @@ def plot_unique_colidx_ratio_by_swindow(records: pd.DataFrame, fixed_dim_size=8)
     # get latency records of different configs
     # structure: {modelname: {fix_r:[], fix_cl:[]}}
     lat_dat = {"fix_r": {}, "fix_cl": {}}
+    all_recs = {}
     for mname, taskname in product(models, tasks):
         fpath = f"./res_fig/block_prune/idxmerge_window_experi/{mname}-attn-bfp20-{taskname}/"
         lat_files = util.get_pts_under_dir(fpath, "json")
@@ -614,14 +706,34 @@ def plot_unique_colidx_ratio_by_swindow(records: pd.DataFrame, fixed_dim_size=8)
             hwconfig_in_fname = os.path.basename(lat_file).split(".")[0].split("_")[-3:]
             r, c, cl = int(hwconfig_in_fname[0][1:]), int(hwconfig_in_fname[1][1:]), int(hwconfig_in_fname[2][2:])
             print(f"find config {os.path.basename(lat_file)}: {(r, c, cl)}")
+            assert r*c*(cl+2) == budget
             with open(lat_file, "r") as f:
                 sparse_lat_profile = json.load(f)
-                sparse_lats = np.mean([int(sparse_lat_profile[k]["avg_tops"]) for k in sparse_lat_profile.keys()])
+                sparse_tops = np.mean([int(sparse_lat_profile[k]["avg_tops"]) for k in sparse_lat_profile.keys()])
+                avg_load_lat = np.mean([int(sparse_lat_profile[k]["avg_tbc_load_lat"]) for k in sparse_lat_profile.keys()])
+                avg_compute_lat = np.mean([int(sparse_lat_profile[k]["avg_tbc_compute_lat"]) for k in sparse_lat_profile.keys()])
+                all_recs[f"{c}, {r}, {cl}"] = all_recs.get(f"{c}, {r}, {cl}", []) + \
+                                                [{"tp": sparse_tops, "load": avg_load_lat, "compute": avg_compute_lat}]
                 if cl == fixed_dim_size:
-                    lat_dat["fix_cl"][c] = lat_dat["fix_cl"].get(c, []) + [sparse_lats]
+                    lat_dat["fix_cl"][c] = \
+                        lat_dat["fix_cl"].get(c, []) + \
+                        [{"tp": sparse_tops, "load": avg_load_lat, "compute": avg_compute_lat}]
                 if r == fixed_dim_size:
-                    lat_dat["fix_r"][c] = lat_dat["fix_r"].get(c, []) + [sparse_lats]
+                    lat_dat["fix_r"][c] = \
+                        lat_dat["fix_r"].get(c, []) + \
+                        [{"tp": sparse_tops, "load": avg_load_lat, "compute": avg_compute_lat}]
 
+    # combine and average all configs 
+    avg_all_recs = {}
+    for config in all_recs.keys():
+        avg_tp = np.mean([i["tp"] for i in all_recs[config]])
+        avg_load = np.mean([i["load"] for i in all_recs[config]])
+        avg_compute = np.mean([i["compute"] for i in all_recs[config]])
+        avg_all_recs[config] = {"tp": float(avg_tp), "load": float(avg_load), "compute": float(avg_compute)} 
+
+    with open("res_fig/block_prune/dse.all.json", "w") as f:
+        json.dump(dict(sorted(avg_all_recs.items())), f)
+    exit()
     # plot the grouped records as scatter plot with line connecting the points,
     # separate lines for each model and tasks, for different models use different colors
     # use different line style for different tasks
@@ -643,8 +755,20 @@ def plot_unique_colidx_ratio_by_swindow(records: pd.DataFrame, fixed_dim_size=8)
     #             marker='v', markersize=20, linestyle="--",
     #             label=f"fixed chain length", linewidth=5, color="C4")
     
-    selected_max_tps = \
-        [max(np.mean(d0[1]), np.mean(d1[1])) for d0, d1 in zip(sorted(lat_dat["fix_cl"].items()), sorted(lat_dat["fix_r"].items()))]
+    selected_max_tps, selected_ld_lat, selected_cp_lat = [], [], []
+    for d0, d1 in zip(sorted(lat_dat["fix_cl"].items()), sorted(lat_dat["fix_r"].items())):
+        mean_tp_d0 = np.mean([record["tp"] for record in d0[1]]) 
+        mean_tp_d1 = np.mean([record["tp"] for record in d1[1]])
+        selected_max_tps.append(max(mean_tp_d0, mean_tp_d1))
+        if mean_tp_d0 > mean_tp_d1:
+            selected_rec = lambda x: np.mean([record[x] for record in d0[1]])
+            selected_ld_lat.append(selected_rec("load"))
+            selected_cp_lat.append(selected_rec("compute"))
+        else:
+            selected_rec = lambda x: np.mean([record[x] for record in d1[1]])
+            selected_ld_lat.append(selected_rec("load"))
+            selected_cp_lat.append(selected_rec("compute"))
+
     ln2=ax2.plot(sorted(lat_dat["fix_cl"].keys()), 
                 selected_max_tps, 
                 marker='v', markersize=20, linestyle="--",
@@ -657,6 +781,8 @@ def plot_unique_colidx_ratio_by_swindow(records: pd.DataFrame, fixed_dim_size=8)
     print(f"list of swindows: {grouped_records['swindow']}")
     print(f"list of effec spar: {grouped_records['effective sparsity']}")
     print(f"list of tops: {selected_max_tps}")
+    print(f"list of ld lats: {selected_ld_lat}")
+    print(f"list of cp lats: {selected_cp_lat}")
 
     plt.grid(linestyle='--', color='grey', alpha=0.5, linewidth=1)
     ax1.set_xlim(xmin=1)
@@ -842,7 +968,7 @@ def plot_rr_spmm_lat(dat_files, n_layers, n_heads, res_file):
         json.dump(res, f, indent=2)
 
 
-def get_onchip_res(dat_path, models_name, tasks_name, spmm_freq=300.0, tc_core_shape=(6, 12, 8)):
+def get_onchip_res(dat_path, models_name, tasks_name, spmm_freq=300.0, tc_core_shape=(6, 12, 8), threshold_postfix=None):
     if dat_path[-1] != "/":
         dat_path += "/"
 
@@ -869,7 +995,11 @@ def get_onchip_res(dat_path, models_name, tasks_name, spmm_freq=300.0, tc_core_s
 
     # get the onchip res from the dat_path
     for model, task in product(models_name, tasks_name):
-        model_task_path = os.path.join(dat_path + f"{model}-attn-bfp20-{task}/")
+        if threshold_postfix:
+            model_task_path = os.path.join(dat_path + f"{model}-attn-bfp20-{task}-{threshold_postfix}/")
+        else:
+            model_task_path = os.path.join(dat_path + f"{model}-attn-bfp20-{task}/")
+
         # get subdirs under model_task_path
         subdirs = [os.path.join(model_task_path, d) for d in os.listdir(model_task_path) if os.path.isdir(os.path.join(model_task_path, d))]
         for subdir in subdirs:
@@ -939,7 +1069,12 @@ def get_onchip_res(dat_path, models_name, tasks_name, spmm_freq=300.0, tc_core_s
                                         "dense_tp": dense_res.total_flops
                     }
 
-    df.to_csv(f"/compas-old/projects/sparse-attention/onchip-5hbm/onchip_res_{int(spmm_freq)}mhz.csv")
+    if threshold_postfix:
+        outpath = pathlib.Path(dat_path) / pathlib.Path(f"onchip_res_t{threshold_postfix}_{int(spmm_freq)}mhz.csv")
+    else:
+        outpath = pathlib.Path(dat_path) / pathlib.Path(f"onchip_res_{int(spmm_freq)}mhz.csv")
+    
+    df.to_csv(str(outpath.absolute()))
     return df
 
 def plot_onchip_res(dat: pd.DataFrame):
@@ -948,52 +1083,56 @@ def plot_onchip_res(dat: pd.DataFrame):
     # delete the "inst_id" column
     dat_ori = dat.copy()
     dat_inst_mean = dat.groupby(["model", "task", "inst_id"]).mean()
+    dat_numbers_only = dat.drop(columns=["model", "task", "inst_id"])
 
     dat = dat.drop(columns=["inst_id"])
     # calculate the mean of onchip_tp of different inst_id for the same model and task
     dat_mean = dat.groupby(["model", "task"]).mean()
     # print(f"speedup by tasks: {dat_mean.to_string()}")
-    dat_overall_mean = dat.drop(columns=["task"]).groupby(["model"]).mean()
-    print(f"over all speedup: {dat_overall_mean}")
+    dat_overall_mean = dat.drop(columns=["task"]).groupby("model").mean().reset_index()
+    print(f"over all speedup by models: \n{dat_overall_mean[['model', 'onchip_comp_tp']].to_markdown()}")
 
+    print(f"single core sparse throughput with onchip bd: {dat_numbers_only['onchip_comp_tp'].mean()} TOPS")
+    print(f"single core dense throughput with onchip bd: {dat_numbers_only['dense_tp'].mean()} TOPS")
+
+    global model_palette
+    model_seq = ["chatglm2-6b-32k", "llama2-7b-chat-4k", "mixtral-8x7b"]
+    task_seq = ["lcc", "multifieldqa_en", "multifieldqa_zh", "passage_retrieval_zh", "qasper", "samsum", "trec", "vcsum"]
+
+    # plot normalized speed up
     # set the plot size to be 16,  6 for seaborn barplot
     sns.set(rc={'figure.figsize':(18, 4.5)}, font_scale=1.3)
     fig, axes = plt.subplots(1, 1)
-
-    # plot the mean of onchip_tp and dense_tp in a same bar chart, on the x-axis group tasks 
-    # with the same model without gaps, and add a gap between each model    
-    model_seq = ["chatglm2-6b-32k", "llama2-7b-chat-4k", "mixtral-8x7b"]
-    task_seq = ["lcc", "multifieldqa_en", "multifieldqa_zh", "passage_retrieval_zh", "qasper", "samsum", "trec", "vcsum"]
-    global model_palette
     curr_model_palette = {k:model_palette[k][0] for k in model_palette.keys()}
     sns.barplot(dat_mean, x="task", y="comp_speedup", hue="model", width=0.4, 
-                        palette=curr_model_palette, ax=axes)
-    # sns.barplot(dat_mean, x="task", y="total_speedup", hue="model", width=0.4, 
-    #                     palette=model_palette, ax=axes[1])
-    # for cont_idx, i in enumerate(bplot.containers):
-    #     labels = [int(dat_mean.loc[model_seq[cont_idx], task_seq[task_idx]]["seq_len"]) for task_idx in range(len(task_seq))]
-    #     bplot.bar_label(i, labels, fmt='%d')
-    
+                        palette=curr_model_palette, ax=axes)    
     labels = [label.get_text() for label in axes.get_xticklabels()]
     axes.set_xticklabels(labels, rotation=10)
     axes.set_ylabel("Average normalized throughput\n of heads")
     axes.set_xlabel("Tasks")
     axes.set_ylim(ymin=0, ymax=5.5)
-
-    # axes[1].set_xlabel("tasks measuring total latency")
-    # axes[1].set_ylabel("HBM-transfer-included TOPs / compute-only TOPs")
-    # axes[1].set_ylim(ymin=0, ymax=1)
-    # set the legend to be outside the plot, and one line for each legend
     axes.legend(loc="upper center", ncol=3)
     fig.savefig("./res_fig/block_prune/onchip_res_total_speedup.pdf", bbox_inches='tight')
     fig.clf()
 
-    # set the plot size to be 16,  6 for seaborn barplot
+    # vertical version of the same plot as above
+    sns.set(rc={'figure.figsize':(8, 8)}, font_scale=1.3)
+    fig, axes = plt.subplots(1, 1)
+    
+    sns.barplot(dat_mean, x="comp_speedup", y="task", hue="model", width=0.8, 
+                        palette=curr_model_palette, ax=axes, legend=True)
+    axes.set_ylabel("Tasks")
+    axes.set_xlabel("Average normalized throughput of heads")
+    axes.set_xlim(xmin=0, xmax=4.5)
+    axes.legend(title=None)
+    sns.move_legend(axes, "upper center", ncol=3, bbox_to_anchor=(0.5, 1.09))
+    fig.savefig("./res_fig/block_prune/onchip_res_total_speedup_vertical.pdf", bbox_inches='tight')
+    fig.clf()
+
+    # plot speedup vs seq len
     sns.set(rc={'figure.figsize':(15, 15)}, font_scale=3.5)
     fig, axes = plt.subplots(1, 1)
 
-    # plot the mean of onchip_tp and dense_tp in a same bar chart, on the x-axis group tasks 
-    # with the same model without gaps, and add a gap between each model
     sns.scatterplot(dat_inst_mean, x="seq_len", y="comp_speedup",
                     s=300, alpha=0.8, hue="model", style="model", 
                     palette=curr_model_palette, ax=axes, legend=True)
@@ -1008,9 +1147,11 @@ def plot_onchip_res(dat: pd.DataFrame):
     fig.savefig("./res_fig/block_prune/onchip_res_speedup_vs_seqlen.pdf", bbox_inches='tight')
     fig.clf()
 
+    # calculate onchip and offchip bandwidth
     # extract throughput without offchip loading
     onchip_thr_list = {m:{t: [] for t in task_seq} for m in model_seq}
     all_thr = []
+    all_dense_thr = []
     n_queus = 2
     for m, t in product(model_seq, task_seq):
         selected = dat_ori.query(f"`model` == '{m}' and `task` == '{t}'")
@@ -1018,20 +1159,28 @@ def plot_onchip_res(dat: pd.DataFrame):
         for i in inst_ids:
             inst_df = selected.query(f"inst_id == '{i}'").sort_values("head_id")
             inst_total_lats = list(inst_df["onchip_comp_lat"])
+            inst_total_lats_dense = list(inst_df["dense_lat"])
             seq_len = inst_df["seq_len"].mean()
             total_ops = seq_len * seq_len * 2 * 128 * len(inst_total_lats)
             # balance all loads
             total_lats = sublist_creator(inst_total_lats, n_queus)
+            total_lats_dense = sublist_creator(inst_total_lats_dense, n_queus)
 
             effec_total_lat = max([sum(l) for l in total_lats])
+            effec_total_lat_dense = max([sum(l) for l in total_lats_dense])
             curr_ops = float(total_ops) / (float(effec_total_lat) * 1e-9) / 1e12
+            # dense latency has a different time unit
+            curr_ops_dense = float(total_ops) / float(effec_total_lat_dense) / 1e12
             onchip_thr_list[m][t].append(curr_ops) 
             all_thr.append(curr_ops)
+            all_dense_thr.append(curr_ops_dense)
 
-    print(f"throughput with onchip bd: {np.mean(all_thr)} TOPS")
+    print(f"dual core sparse throughput with onchip bd: {np.mean(all_thr)} TOPS")
+    print(f"dual core dense throughput with onchip bd: {np.mean(all_dense_thr)} TOPS")
 
-    # extract throughput with offchip loading
+    # extract throughput with offchip loading assuming a single core
     offchip_thr_list = {m:{t: [] for t in task_seq} for m in model_seq}
+    n_queus = 1
     all_thr = []
     for m, t in product(model_seq, task_seq):
         selected = dat_ori.query(f"`model` == '{m}' and `task` == '{t}'")
@@ -1058,7 +1207,38 @@ def plot_onchip_res(dat: pd.DataFrame):
             offchip_thr_list[m][t].append(curr_ops) 
             all_thr.append(curr_ops)
 
-    print(f"throughput with offchip bd: {np.mean(all_thr)} TOPS")
+    print(f"single core sparse throughput with offchip bd: {np.mean(all_thr)} TOPS")
+
+    # extract throughput with offchip loading assuming a dual core
+    offchip_thr_list = {m:{t: [] for t in task_seq} for m in model_seq}
+    n_queus = 2
+    all_thr = []
+    for m, t in product(model_seq, task_seq):
+        selected = dat_ori.query(f"`model` == '{m}' and `task` == '{t}'")
+        inst_ids = selected["inst_id"].unique()
+        for i in inst_ids:
+            inst_df = selected.query(f"inst_id == '{i}'").sort_values("head_id")
+            inst_total_lats = list(inst_df["onchip_total_lat"])
+            inst_load_lats = list(inst_df["onchip_mat_b_load_lat"])
+            seq_len = inst_df["seq_len"].mean()
+            total_ops = seq_len * seq_len * 2 * 128 * len(inst_total_lats)
+            total_lats = [[] for q in range(n_queus)]
+            for q in range(n_queus):
+                hlist = list(range(len(inst_total_lats)))[q:len(inst_total_lats):n_queus]
+                for hidx in range(len(hlist) + 1):
+                    if hidx == 0:
+                        total_lats[q].append(inst_load_lats[hlist[hidx]])
+                    elif hidx == (len(hlist)):
+                        total_lats[q].append(inst_total_lats[hlist[-1]])
+                    else:
+                        total_lats[q].append(max(inst_load_lats[hlist[hidx-1]], inst_total_lats[hlist[hidx]]))
+
+            effec_total_lat = max([sum(l) for l in total_lats])
+            curr_ops = float(total_ops) / (float(effec_total_lat) * 1e-9) / 1e12
+            offchip_thr_list[m][t].append(curr_ops) 
+            all_thr.append(curr_ops)
+
+    print(f"dual core sparse throughput with offchip bd: {np.mean(all_thr)} TOPS")
 
 def plot_speedup_vs_sparsity(hw_perf_df: pd.DataFrame, density_df: pd.DataFrame):
     hw_perf_df["total_speedup"] = hw_perf_df["onchip_total_tp"] / hw_perf_df["onchip_comp_tp"]
@@ -1170,6 +1350,8 @@ def sweep_rr_swindow_get_tops(model_name, task_name):
         # extract head id from each member of hwconfig_list following the pattern "hwconfig_h<head_id>.json"
         hwconfig_head_ids = [int(os.path.basename(pa).split("_h")[1].split(".")[0]) for pa in hwconfig_list]
         head_ids[inst] = hwconfig_head_ids
+        # MARK: select only 5 heads temporary
+        # head_ids[inst] = random.sample(hwconfig_head_ids, 5)
         with open(inst_profile_path, "r") as inst_pf:
             inst_pf_dict = json.load(inst_pf)
             seq_lens[inst] = int(inst_pf_dict["seq_len"])
@@ -1194,7 +1376,7 @@ def sweep_rr_swindow_get_tops(model_name, task_name):
 
         # fetch a head
         idx_dat = []
-        print(f"get {len(headgrp_ridx)} heads in total")
+        print(f"get {len(headgrp_ridx)} heads in total, using {len(head_ids[inst_id])} heads")
         for hidx in head_ids[inst_id]:
             src_ridx, src_cidx = headgrp_ridx[hidx], headgrp_cidx[hidx] 
             idx_dat.append([(r, c) for r, c in zip(src_ridx, src_cidx)])
@@ -1202,13 +1384,28 @@ def sweep_rr_swindow_get_tops(model_name, task_name):
         all_inst_dat[inst_id] = idx_dat
 
     # run the experiment
-    out_path = f"./res_fig/block_prune/idxmerge_window_experi/{model_name}-attn-bfp20-{task_name}"
+    out_path = f"./res_fig/block_prune/idxmerge_window_experi.new/{model_name}-attn-bfp20-{task_name}"
     if not os.path.exists(out_path):
         os.makedirs(out_path)
 
-    hw_shapes = [(18, 4, 8), (9, 8, 8), (6, 12, 8), (3, 24, 8), (2, 36, 8),
+    c_list = [4, 8, 12, 24, 36]
+    hw_shapes = []
+    prereq = lambda x1,x2: (x2 >= 8) and ((math.ceil(128./x1) >= 3*x2) or abs(math.ceil(128./x1) - 3*x2) < 20)
+    for c in c_list:
+        r_and_cl_pairs = find_positive_integer_pairs(720//c, prereq)
+        hw_shape = [(r_and_cl[0], c, r_and_cl[1]) for r_and_cl in r_and_cl_pairs]
+        hw_shapes += hw_shape
+
+    # selected shapes:
+    # [(18, 4, 8), (6, 8, 13), (9, 8, 8), (3, 12, 18), (4, 12, 13), (5, 12, 10), (6, 12, 8), (1, 24, 28), (2, 24, 13), (3, 24, 8), (1, 36, 18), (2, 36, 8)]
+    # new shapes:
+    # [(6, 8, 13), (3, 12, 18), (4, 12, 13), (5, 12, 10), (1, 24, 28), (2, 24, 13), (1, 36, 18)]
+    finished_hw_shapes = [(18, 4, 8), (9, 8, 8), (6, 12, 8), (3, 24, 8), (2, 36, 8),
                  (8, 4, 18), (8, 8, 9), (8, 12, 6), (8, 24, 3), (8, 36, 2)]
-    args = [(all_inst_dat, seq_lens, i, out_path) for i in hw_shapes]    
+    
+    new_hw_shapes = [item for item in hw_shapes if item not in finished_hw_shapes]
+    print(new_hw_shapes)
+    args = [(all_inst_dat, seq_lens, i, out_path) for i in new_hw_shapes]    
     with multiprocessing.Pool(processes=10) as pool:
         pool.starmap(rr2spmm_wrap, args)
 
@@ -1332,6 +1529,117 @@ def plot_roofline(hw_perf_df: pd.DataFrame, density_df: pd.DataFrame, hw_size: d
     })
     # Generate plot
     rl.plot(pathlib.Path("./res_fig/block_prune/roofline_plot_diff_s_agg.pdf"))
+
+def plot_thres_tops_score(onchip_res_list: dict[pd.DataFrame], scores_list: dict):
+    # onchip_res_list = dict(sorted(onchip_res_list.items()))
+    # get list of thresholds:
+    thres_list = onchip_df_res_list.keys()
+    # format thres_list to scores_list supported keys
+    thres_list_for_scores = [f"block prune thres (x{i.split('x')[0]}/seq_lenx20)" for i in thres_list]
+
+    # get model list and task list by onchip res
+    models, tasks = [], []
+    for pd_onchip_res in onchip_res_list.values():
+        if models and tasks:
+            models = list(set(pd_onchip_res["model"].unique().tolist()) & set(models))
+            tasks = list(set(pd_onchip_res["task"].unique().tolist()) & set(tasks))
+        else:
+            models = pd_onchip_res["model"].unique().tolist()
+            tasks = pd_onchip_res["task"].unique().tolist()
+
+    print(f"plotter gets models:{models} and tasks:{tasks}")
+
+    # get scores for thres, by models (scores from 1x to nx)
+    avg_scores_by_models = {m:[0]*len(thres_list) for m in models}
+    avg_spars_by_models = {m:[0]*len(thres_list) for m in models}
+    for m in models:
+        for t in tasks:
+            curr_scores = \
+                [scores_list[m][t][thres]["score"] for thres in thres_list_for_scores]
+            avg_scores_by_models[m] = \
+                (np.array(curr_scores) + np.array(avg_scores_by_models[m])).tolist()
+            curr_spars = \
+                [scores_list[m][t][thres]["sparsity"] for thres in thres_list_for_scores]
+            avg_spars_by_models[m] = \
+                (np.array(curr_spars) + np.array(avg_spars_by_models[m])).tolist()
+            
+        avg_scores_by_models[m] = \
+            (np.array(avg_scores_by_models[m]) / len(tasks)).tolist()
+        avg_spars_by_models[m] = \
+            (np.array(avg_spars_by_models[m]) / len(tasks)).tolist()
+    
+    print(avg_scores_by_models)
+    # get list of average tops over tasks, for each model, each threshold
+    avg_tps_by_models = {m:[] for m in models}
+    for thres, onchip_dat in onchip_res_list.items():
+        model_only_dat = onchip_dat.drop(columns=["task", "inst_id"])
+        model_only_dat["comp_speedup"] = \
+            model_only_dat["onchip_comp_tp"] / model_only_dat["dense_tp"]        
+        avg_tp_models = model_only_dat.groupby(["model"]).mean()["comp_speedup"]
+        for m, tp in dict(avg_tp_models).items():
+            avg_tps_by_models[m].append(tp)
+
+    print(avg_tps_by_models)
+
+    # plot 2d tps, score and thres
+    global model_palette
+    sns.set_theme()
+    fig = plt.figure(figsize=(6, 4.5))
+    ax = fig.subplots(1, 1)
+    ax2 = ax.twinx()
+    for m in models:
+        x_data = avg_spars_by_models[m]
+        y_data = avg_scores_by_models[m]
+        z_data = avg_tps_by_models[m]
+        s1 = ax.plot(x_data, y_data,
+                            c=model_palette[m][0],
+                            marker='s',
+                            markersize = 5,
+                            alpha=0.7,
+                            label=m + " (score)",
+                            linestyle="-",
+                            linewidth=2,
+                            )
+        s2 = ax2.plot(x_data, z_data,
+                            c=model_palette[m][0],
+                            marker='o',
+                            markersize = 5,
+                            alpha=0.7,
+                            linestyle="dotted",
+                            linewidth=2,
+                            label=m + " (speedup)")
+
+    ax.set_xlabel('sparsity')
+    ax.set_ylabel('scores\n(solid line)')
+    ax.set_ylim(bottom=0)
+    ax2.set_ylabel('Normalized Throughput Speedup\n(dotted line)')
+    ax2.set_ylim(bottom=1, top=5.5)
+    # ax2.set_ylim(bottom=1, top=10)
+    ax.tick_params(axis='y', which='both', left=False, right=False)
+    ax2.tick_params(axis='y', which='both', left=False, right=False)
+
+    # --- Combine legends ---
+    # Get handles and labels from both axes
+    handles1, labels1 = ax.get_legend_handles_labels()
+    handles2, labels2 = ax2.get_legend_handles_labels()
+    # all_handles = handles1 + handles2
+    # all_labels = labels1 + labels2
+    # hl = sorted(zip(all_labels, all_handles), key=operator.itemgetter(0))
+    all_labels = labels1 + labels2
+    all_handles = handles1 + handles2
+    # all_labels, all_handles = zip(*hl)
+
+    # Create a single legend for the entire figure
+    fig.legend(all_handles, all_labels, loc='lower center', bbox_to_anchor=(0.512, 0.1),  fontsize=9, ncol=2)
+    # fig.legend(all_handles, all_labels, loc='center left', bbox_to_anchor=(0.12, 0.5), fontsize=9)
+    ax.grid(True, axis='y', linestyle='-', alpha=0.7)
+    ax.grid(True, axis='x', linestyle='-', alpha=0.7)
+    ax2.grid(False) 
+
+    output_filename = './res_fig/block_prune/thres_accu_tops_2d.pdf'
+    plt.savefig(output_filename, bbox_inches='tight')
+    plt.clf()
+    plt.close(fig)
  
 
 if __name__ == "__main__":
@@ -1340,33 +1648,39 @@ if __name__ == "__main__":
 
     # inst_idx = 4
     model_names = ["chatglm2-6b-32k", "llama2-7b-chat-4k", "mixtral-8x7b"]
-    task_list = ["multifieldqa_en", "multifieldqa_zh", "passage_retrieval_zh", "qasper", "samsum", "trec", "vcsum"]
-
-    # generate a list with power of 2, from 4 to 5000
-    # swindow_list = [4,8,12,24,36]
+    task_list = ["lcc", "multifieldqa_en", "multifieldqa_zh", "passage_retrieval_zh", "qasper", "samsum", "trec", "vcsum"]
 
     # compute_unique_colidx_ratio(task_list, model_names, swindow_list)
     # onchip_df_res = get_onchip_res(
-    #     "/compas-old/projects/sparse-attention/onchip-5hbm", 
-    #     model_names, task_list, spmm_freq=300.0, tc_core_shape=(6, 12, 8)
+    #     "/compas-old/projects/sparse-attention/micro25/onchip", 
+    #     # "/compas-old/projects/sparse-attention/onchip-5hbm", 
+    #     model_names, task_list, 
+    #     spmm_freq=300.0, 
+    #     tc_core_shape=(6, 12, 8), 
+    #     threshold_postfix="4x"
     # )
-    onchip_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/onchip_res_300mhz.csv")
-    density_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/spars-analysis-onchip-related.csv")
+    # for mname, task in product(model_names, task_list):
+    #      sweep_rr_swindow_get_tops(mname, task)
 
-    # print(density_df_res["swindow"].unique())
+    # onchip_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/onchip_res_300mhz.csv.old")
+    density_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/spars-analysis-onchip-related.csv")
 
     # plot_onchip_res(onchip_df_res)
     # eval_emulator(onchip_df_res, model_names, task_list)
     # plot_unique_colidx_ratio_boxplot_by_task(density_df_res)
     # plot_route_ratio_by_task(density_df_res)
-    # plot_unique_colidx_ratio_by_swindow(density_df_res, 8)
+    plot_unique_colidx_ratio_by_swindow(density_df_res, 8)
     # plot_redunt_colidx_ratio_distribution()
-    plot_speedup_vs_sparsity(onchip_df_res, density_df_res)
+    # plot_speedup_vs_sparsity(onchip_df_res, density_df_res)
     # plot_roofline(onchip_df_res, density_df_res, {"r": 6, "c": 12, "l": 8, "freq": 300})
-    
-    # for mname, task in product(model_names, task_list):
-    #     sweep_rr_swindow_get_tops(mname, task)
 
+    # onchip_df_res_list = {}
+    # for i in ["1x", "2x", "3x", "4x"]:
+    #     onchip_df_res_list[i] = pd.read_csv(f"/compas-old/projects/sparse-attention/micro25/onchip/onchip_res_t{i}_300mhz.csv")
+    # with pathlib.Path("./res_fig/block_prune/formatted_data_longbench.json").open("r") as f:
+    #     prune_score_eval_res = json.load(f)
+    # plot_thres_tops_score(onchip_df_res_list, prune_score_eval_res)
+    
     # attn_path_chatglm = inst_list[0] + ".pt"
     # src_attn = torch.load(attn_path_chatglm).numpy()
     # explore_row_features(src_attn, inst_idx=inst_idx)
