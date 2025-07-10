@@ -15,13 +15,13 @@ from sparsemat_hw_modeling import (
     rr2spmm_fifo_latency_overlap_analysis)
 import matplotlib
 from matplotlib import pyplot as plt
+from matplotlib.patches import Patch
 import os, json, util, pathlib, math
 from itertools import product, chain
 import multiprocessing
 import pandas as pd
 import seaborn as sns
 import heapq
-import operator
 from util import find_positive_integer_pairs
 
 model_palette = {
@@ -1077,6 +1077,244 @@ def get_onchip_res(dat_path, models_name, tasks_name, spmm_freq=300.0, tc_core_s
     df.to_csv(str(outpath.absolute()))
     return df
 
+def get_gemm_onchip_res(
+        dat_path: pathlib.Path, 
+        models_name, 
+        tasks_name, 
+        gemm_freq=300.0
+    ):
+    gemm_cycle_delay = 1./gemm_freq * 1000.
+    mat_b_load_delay_factor = 3.0
+
+    def get_gemm_synth_lat(p: pathlib.Path, force_n_b_blks=-1):
+        res = 0
+        hw_res_path = p / "hwconfig_h0.json"
+
+        if hw_res_path.exists():
+            with hw_res_path.open("r") as f:
+                hw_res = json.load(f)
+
+            total_lat = hw_res["total_lat_counter_res"] * gemm_cycle_delay
+            mat_b_load_lat = hw_res["mat_b_load_counter_res"] * gemm_cycle_delay / mat_b_load_delay_factor
+            n_mat_b_blks = hw_res["mat b col blks"]
+        else:
+            raise FileNotFoundError(f"{str(hw_res_path)} not found!")
+        
+        # pipelining mat b blk loading and computation
+        res = 0
+        # for GQA: force k,v to have only one head
+        if force_n_b_blks > 0:
+            n_mat_b_blks = force_n_b_blks
+        for mat_b_blk_idx in range(n_mat_b_blks):
+            if mat_b_blk_idx == 0:
+                res += mat_b_load_lat
+            else:
+                res += max(mat_b_load_lat, total_lat)
+
+        res += total_lat
+        return res
+
+    # create pandas dataframe with columns: model,  task, onchip_lat, onchip_tp, seq_len
+    df = pd.DataFrame(
+        columns=[
+            "model", 
+            "task", 
+            "inst_id", 
+            "seq_len", 
+            "q_lat",
+            "kv_lat",
+            "qkT_lat",
+            "aV_lat",
+            "o_lat"
+        ]
+    )
+
+    # get the onchip res from the dat_path
+    for model, task in product(models_name, tasks_name):
+        model_task_path = dat_path / f"{model}-attn-bfp20-{task}"
+
+        # get subdirs under model_task_path
+        subdirs = [model_task_path / d for d in os.listdir(model_task_path) if (model_task_path / d).is_dir()]
+        for subdir in subdirs:
+            # get the inst_id from the subdir name
+            inst_id = subdir.name
+            # temporarily skip the random records
+            if inst_id[0:9] != "iiSeqInst":
+                continue 
+            # get the seq_len from the subdir's "inst_profile.json" file
+            with (subdir / "inst_profile.json").open("r") as f:
+                inst_profile = json.load(f)
+                seq_len = inst_profile["seq_len"]
+
+            q_lat = get_gemm_synth_lat(subdir / "qkv")
+            kv_lat = get_gemm_synth_lat(subdir / "qkv", force_n_b_blks=1)
+            qkT_lat = get_gemm_synth_lat(subdir / "qkT")
+            aV_lat = get_gemm_synth_lat(subdir / "aV")
+
+            df.loc[len(df)] = {
+                                "model": model, 
+                                "task": task, 
+                                "inst_id": inst_id, 
+                                "seq_len": seq_len,
+                                "q_lat": q_lat,
+                                "kv_lat": kv_lat,
+                                "qkT_lat": qkT_lat,
+                                "aV_lat": aV_lat,
+                                "o_lat": q_lat
+            }
+
+    outpath = pathlib.Path(dat_path) / pathlib.Path(f"onchip_res_gemms_{int(gemm_freq)}mhz.csv")
+    df.to_csv(str(outpath.absolute()))
+    return df
+
+def plot_stacked_selfattn_ops_latency(
+        gemm_dat: pd.DataFrame, 
+        spmm_dat: pd.DataFrame,
+        n_heads = 32,
+        ):
+    # analyze latency breakdown of a single self-attn
+    gemm_dat["qkv_lat"] = gemm_dat["q_lat"] + gemm_dat["kv_lat"] * 2
+    gemm_dat["qkT_lat"] = gemm_dat["qkT_lat"] * n_heads
+    gemm_dat["aV_lat"] = gemm_dat["aV_lat"] * n_heads
+    gemm_dat["linear_lat"] = gemm_dat["qkv_lat"] + gemm_dat["o_lat"]
+    gemm_dat_inst_mean = gemm_dat.drop(columns=["inst_id"]).groupby(["model", "task"]).mean().reset_index()
+
+    print(gemm_dat_inst_mean.to_markdown())
+
+    # spmm_dat_inst_mean = spmm_dat.drop(columns=["inst_id"]).groupby(["model", "task"]).mean().reset_index()
+    # spmm_dat["avg_aV"] = spmm_dat["onchip_total_lat"] 
+
+    latency_types = ["qkT_lat", "aV_lat", "linear_lat"]
+    # Melt the DataFrame to long format as before
+    df_melted = gemm_dat_inst_mean.melt(
+        id_vars=["model", "task"],
+        value_vars=latency_types,
+        var_name="latency_type",
+        value_name="latency_value"
+    )
+
+    # Ensure consistent order for tasks and models for plotting
+    unique_tasks = gemm_dat_inst_mean['task'].unique()
+    unique_models = gemm_dat_inst_mean['model'].unique()
+
+    # --- Define X-axis positions and labels ---
+    bar_width = 0.8 # Width of each individual model's stacked bar
+    task_margin = 1.0 # Margin between different tasks
+    model_spacing = 0.0 # No margin between models within the same task
+
+    x_positions = []
+    x_labels = []
+    task_x_centers = [] # For placing task labels
+    current_x = 0
+
+    for task in unique_tasks:
+        models_in_task = df_melted[df_melted['task'] == task]['model'].unique()
+        num_models_in_task = len(models_in_task)
+
+        task_start_x = current_x
+        for i, model in enumerate(models_in_task):
+            x_positions.append(current_x)
+            x_labels.append(model) # Label with model name
+            current_x += bar_width + model_spacing # Move to the next model position
+        
+        # Calculate center for task label
+        task_end_x = current_x - model_spacing # End of the last model bar
+        task_x_centers.append((task_start_x + task_end_x - bar_width) / 2 + bar_width/2) # Center of the task group
+        
+        current_x += task_margin # Add margin after the last model of the current task
+
+    # --- Color and Hatch Mappings ---
+    # Colors for models
+    global model_palette
+
+    # Hatches for latency types
+    latency_hatches = {
+        "qkT_lat": "xx",
+        "aV_lat": "o",
+        "linear_lat": "//"
+    }
+
+    # --- Plotting ---
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Group data by (task, model) for plotting
+    grouped_data = df_melted.groupby(['task', 'model'])
+
+    # Iterate through each bar position to draw stacked segments
+    for i, (x_pos, model_label) in enumerate(zip(x_positions, x_labels)):
+        task = gemm_dat_inst_mean.loc[gemm_dat_inst_mean['model'] == model_label, 'task'].iloc[0]
+        
+        # Get the data for the current model within its task
+        current_model_data = df_melted[(df_melted['task'] == task) & (df_melted['model'] == model_label)]
+        
+        bottom_value = 0
+        for lat_type in latency_types:
+            latency_val = current_model_data[current_model_data['latency_type'] == lat_type]['latency_value'].sum()
+            if not pd.isna(latency_val) and latency_val > 0: # Only plot if there's a value
+                ax.bar(
+                    x_pos,
+                    latency_val,
+                    width=bar_width,
+                    bottom=bottom_value,
+                    color=model_palette[model_label],
+                    hatch=latency_hatches[lat_type],
+                    edgecolor='black', # Add black edge for better visibility of hatches
+                    linewidth=0.5
+                )
+                bottom_value += latency_val
+
+    # --- Customizing X-axis ---
+    task_label_positions = []
+    for t_id in range(len(unique_tasks)):
+        task_label_positions.append(x_positions[t_id * len(model_names) + 1])
+    ax.set_xticks(task_label_positions)
+    ax.set_xticklabels(unique_tasks, rotation=15, ha='right')
+    ax.set_xlabel("Tasks", fontsize=12)
+    ax.set_ylabel("Latency (ns)", fontsize=12)
+
+    # Add horizontal lines or text for task separation/labels
+    # We'll use custom text labels for tasks
+    # Get the unique tasks in order
+    unique_tasks_df = df_melted[['task', 'model']].drop_duplicates().sort_values(by=['task', 'model'])
+
+    task_group_boundaries = []
+    current_task = None
+    for i, (idx, row) in enumerate(unique_tasks_df.iterrows()):
+        if row['task'] != current_task:
+            if current_task is not None:
+                task_group_boundaries.append(i - 0.5) # Mark end of previous group
+            task_group_boundaries.append(i - 0.5) # Mark start of new group
+            current_task = row['task']
+    task_group_boundaries.append(len(x_positions) - 0.5) # End of the last group
+
+    ax.tick_params(axis='x', which='minor', bottom=False) # Remove minor ticks
+
+    # Adjust primary x-axis limits to accommodate for the last bar and potential margin
+    ax.set_xlim(-bar_width/2, current_x - task_margin + bar_width/2) # Adjust limits to frame bars nicely
+
+    # --- Create Custom Legends ---
+    # Legend for Latency Types (Hatches)
+    hatch_patches = [
+        Patch(facecolor='white', edgecolor='black', hatch=latency_hatches[lt], label=lt.replace("_lat", ""))
+        for lt in latency_types
+    ]
+    hatch_legend = ax.legend(handles=hatch_patches, title="component", ncol=len(hatch_patches),
+                            bbox_to_anchor=(0.2, 1.12), loc='upper center', borderaxespad=0.)
+
+    # Legend for Models (Colors)
+    color_patches = [
+        Patch(facecolor=model_palette[model][0], edgecolor='black', label=model)
+        for model in unique_models
+    ]
+    color_legend = ax.legend(handles=color_patches, title="Model", ncol=len(color_patches),
+                            bbox_to_anchor=(0.66, 1.12), loc='upper center', borderaxespad=0.)
+
+    ax.add_artist(hatch_legend) # Add the first legend back
+
+    plt.tight_layout() # Adjust layout to make space for legends
+    plt.savefig("./res_fig/dense_lat_ops.pdf")
+
+
 def plot_onchip_res(dat: pd.DataFrame):
     dat["total_speedup"] = dat["onchip_total_tp"] / dat["onchip_comp_tp"]
     dat["comp_speedup"] = dat["onchip_comp_tp"] / dat["dense_tp"]
@@ -1648,6 +1886,7 @@ if __name__ == "__main__":
 
     # inst_idx = 4
     model_names = ["chatglm2-6b-32k", "llama2-7b-chat-4k", "mixtral-8x7b"]
+    # model_names = ["chatglm2-6b-32k"]
     task_list = ["lcc", "multifieldqa_en", "multifieldqa_zh", "passage_retrieval_zh", "qasper", "samsum", "trec", "vcsum"]
 
     # compute_unique_colidx_ratio(task_list, model_names, swindow_list)
@@ -1661,15 +1900,23 @@ if __name__ == "__main__":
     # )
     # for mname, task in product(model_names, task_list):
     #      sweep_rr_swindow_get_tops(mname, task)
+    # get_gemm_onchip_res(
+    #     pathlib.Path("/compas-old/projects/sparse-attention/onchip-5hbm"),
+    #     model_names,
+    #     task_list,
+    #     300
+    # )
 
     # onchip_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/onchip_res_300mhz.csv.old")
-    density_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/spars-analysis-onchip-related.csv")
+    # density_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/spars-analysis-onchip-related.csv")
+    gemm_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/onchip_res_gemms_300mhz.csv")
 
     # plot_onchip_res(onchip_df_res)
+    plot_stacked_selfattn_ops_latency(gemm_df_res, None)
     # eval_emulator(onchip_df_res, model_names, task_list)
     # plot_unique_colidx_ratio_boxplot_by_task(density_df_res)
     # plot_route_ratio_by_task(density_df_res)
-    plot_unique_colidx_ratio_by_swindow(density_df_res, 8)
+    # plot_unique_colidx_ratio_by_swindow(density_df_res, 8)
     # plot_redunt_colidx_ratio_distribution()
     # plot_speedup_vs_sparsity(onchip_df_res, density_df_res)
     # plot_roofline(onchip_df_res, density_df_res, {"r": 6, "c": 12, "l": 8, "freq": 300})
