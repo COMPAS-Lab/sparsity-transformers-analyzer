@@ -36,6 +36,9 @@ def factor_int(n: int):
     if val < val2: val, val2 = val2, val
     return val, val2
 
+def ispow2(n: int):
+    return (n & (n-1) == 0) and n != 0
+
 def get_mat_sparsity(dat):
     '''
     compute the sparsity of a mat
@@ -1596,6 +1599,114 @@ def rr2spmm_fifo_latency_overlap_analysis(
         with open(fpath, 'w') as file:
             json.dump(existing_data, file, indent=2)
 
+def sigma_latency_analysis(
+        inst_list: dict, 
+        seqlen_list: dict, 
+        dpu_shape: tuple[int, int] = (16, 32),
+        n_matb_cols: int = 128,
+        spmm_freq: float = 300.0,
+        out_json_basepath: str = ""):
+    '''
+    calculate runtime in clk cycles for sigma-like design 
+    (M-sta loaded from cascade loading chain, N-str from input ports)
+    '''
+    cycle_delay = 1./spmm_freq * 1000.
+    n_pes, n_dpes = dpu_shape
+
+    assert ispow2(n_pes), "number of PEs must be power of 2"
+
+    # components' latency
+    benes_delay = ceil(log2(n_pes)) * 2.0 + 1
+    compute_delay = n_matb_cols
+
+    res = {}
+    for k in inst_list.keys():
+        i = inst_list[k]
+        perhead_rec = {
+            "total_lat": [], 
+            "total_tops": [], 
+        }
+        l = seqlen_list[k]
+        total_ops = l * l * 2 * n_matb_cols
+        
+        for curr_head in tqdm(i, unit="head"):
+            ## curr_head: (ridx, cidx)
+            
+            ## step 1 row assignment: assigning rows to different PEs
+            # first count appearance of each unique element in [r[0] for r in curr_head]
+            all_row_idx = np.unique([r[0] for r in curr_head])
+            print(f"list of rows: {all_row_idx}")
+            row_counts = {int(i): 0 for i in all_row_idx}
+            for r in curr_head:
+                row_counts[r[0]] += 1
+            print(f"row counts: {row_counts}")
+            remained_blocks = curr_head.copy()
+            dpe_id = 0
+            dpe_scheduled_blks = [[] for _ in range(n_dpes)]
+            while len(remained_blocks) > 0:
+                candidate_blks = []
+                while len(candidate_blks) < n_pes and len(remained_blocks) > 0:
+                    candidate_blks += remained_blocks[0:row_counts[remained_blocks[0][0]]]
+                    remained_blocks = remained_blocks[row_counts[remained_blocks[0][0]]:]
+
+                # if last row in one iteration has more than n_pes blocks,
+                # we need to fragment it into multiple blocks
+                fragmented_iters_to_attach = []
+                if len(candidate_blks) > n_pes:
+                    fragmented_blks = candidate_blks[n_pes:]
+                    candidate_blks = candidate_blks[0:n_pes]
+                    for extra_iters in range(ceil(len(fragmented_blks)/n_pes)):
+                        fragmented_iters_to_attach.append(fragmented_blks[0:n_pes])
+                        fragmented_blks = fragmented_blks[n_pes:]
+
+
+                # assign candidate blocks to current PE
+                dpe_scheduled_blks[dpe_id].append(candidate_blks)
+                if fragmented_iters_to_attach:
+                    dpe_scheduled_blks[dpe_id] += fragmented_iters_to_attach
+
+                dpe_id = (dpe_id + 1) % n_dpes
+
+            ## step 2 evaluate latency of each iteration
+            dpe_iters = []
+            for dpe_id in range(n_dpes):
+                curr_pe_lat = max(benes_delay, 3*n_pes)
+                for iter_blk_id, iter_blks in enumerate(dpe_scheduled_blks[dpe_id]):
+                    curr_pe_lat += max(benes_delay, 3*n_pes, compute_delay)
+                    if iter_blk_id == len(dpe_scheduled_blks[dpe_id]) - 1:
+                        # linear reduce delay depends on the max number of values to 
+                        # accumulate after DOT
+                        row_idx_in_blk = [b[0] for b in iter_blks]
+                        _, accu_list = np.unique(row_idx_in_blk, return_counts=True)
+                        linear_reduce_delay = np.amax(accu_list)
+                        curr_pe_lat += linear_reduce_delay
+
+                dpe_iters.append(curr_pe_lat)
+
+            ## step 3 get max latency of all dpes to be total latency
+            perhead_latency = float(max(dpe_iters)) * cycle_delay
+            perhead_rec["total_lat"].append(perhead_latency)
+            perhead_rec["total_tops"].append(float(total_ops) / (perhead_latency * 1e-9) / 1e12)
+
+        res[k] = perhead_rec
+        res[k]["avg_tops"] = np.mean(perhead_rec["total_tops"])
+
+        fpath = f"{out_json_basepath}/sigma_lat_{n_pes}pe_{n_dpes}dpe.json"
+        if exists(fpath):
+            with open(fpath, 'r') as file:
+                try:
+                    existing_data = json.load(file)
+                    if not isinstance(existing_data, dict):
+                        raise ValueError("The file does not contain a valid JSON object.")
+                except json.JSONDecodeError:
+                    existing_data = {}
+            
+            existing_data.update(res)
+        else:
+            existing_data = res
+
+        with open(fpath, 'w') as file:
+            json.dump(existing_data, file, indent=2)
 
 def main():
     model_name = "llama2-7b-chat-4k"

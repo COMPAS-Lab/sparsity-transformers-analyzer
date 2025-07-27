@@ -12,7 +12,8 @@ from sparsemat_hw_modeling import (
     rr2spmm_latency_overlap_analysis,
     spmm_non_rr_latency_analysis,
     get_tccore_config,
-    rr2spmm_fifo_latency_overlap_analysis)
+    rr2spmm_fifo_latency_overlap_analysis, 
+    sigma_latency_analysis)
 import matplotlib
 from matplotlib import pyplot as plt
 from matplotlib.patches import Patch
@@ -1571,7 +1572,17 @@ def rr2spmm_wrap(all_inst_dat, seq_lens, hw_shape, out_path):
         out_buff_depth=1024,
         out_json_basepath=out_path)
 
-def sweep_rr_swindow_get_tops(model_name, task_name):
+def sigma_wrap(all_inst_dat, seq_lens, hw_shape, out_path): 
+    sigma_latency_analysis(
+        inst_list=all_inst_dat, 
+        seqlen_list=seq_lens, 
+        dpu_shape=hw_shape,
+        n_matb_cols=128,
+        spmm_freq=300.0,
+        out_json_basepath=out_path
+    )
+
+def sweep_rr_swindow_get_tops(model_name, task_name, emulator):
     base_attn_path = f"/compas-old/projects/sparse-attention/{model_name}-attn-bfp20-{task_name}/"
     inst_rlist = sorted(util.get_pts_under_dir(base_attn_path, postfix="npy", datatype="ridx", fname_filter="iiSeqInst"))
     inst_clist = sorted(util.get_pts_under_dir(base_attn_path, postfix="npy", datatype="cidx", fname_filter="iiSeqInst"))
@@ -1622,30 +1633,30 @@ def sweep_rr_swindow_get_tops(model_name, task_name):
         all_inst_dat[inst_id] = idx_dat
 
     # run the experiment
-    out_path = f"./res_fig/block_prune/idxmerge_window_experi.new/{model_name}-attn-bfp20-{task_name}"
+    out_path = f"./res_fig/block_prune/sigma/{model_name}-attn-bfp20-{task_name}"
     if not os.path.exists(out_path):
         os.makedirs(out_path)
 
-    c_list = [4, 8, 12, 24, 36]
-    hw_shapes = []
-    prereq = lambda x1,x2: (x2 >= 8) and ((math.ceil(128./x1) >= 3*x2) or abs(math.ceil(128./x1) - 3*x2) < 20)
-    for c in c_list:
-        r_and_cl_pairs = find_positive_integer_pairs(720//c, prereq)
-        hw_shape = [(r_and_cl[0], c, r_and_cl[1]) for r_and_cl in r_and_cl_pairs]
-        hw_shapes += hw_shape
+    tccore_budget = 720
 
-    # selected shapes:
-    # [(18, 4, 8), (6, 8, 13), (9, 8, 8), (3, 12, 18), (4, 12, 13), (5, 12, 10), (6, 12, 8), (1, 24, 28), (2, 24, 13), (3, 24, 8), (1, 36, 18), (2, 36, 8)]
-    # new shapes:
-    # [(6, 8, 13), (3, 12, 18), (4, 12, 13), (5, 12, 10), (1, 24, 28), (2, 24, 13), (1, 36, 18)]
-    finished_hw_shapes = [(18, 4, 8), (9, 8, 8), (6, 12, 8), (3, 24, 8), (2, 36, 8),
-                 (8, 4, 18), (8, 8, 9), (8, 12, 6), (8, 24, 3), (8, 36, 2)]
-    
-    new_hw_shapes = [item for item in hw_shapes if item not in finished_hw_shapes]
-    print(new_hw_shapes)
-    args = [(all_inst_dat, seq_lens, i, out_path) for i in new_hw_shapes]    
+    # get hw shapes for spmm core
+    # c_list = [4, 8, 12, 24, 36]
+    # hw_shapes = []
+    # prereq = lambda x1,x2: (x2 >= 8) and ((math.ceil(128./x1) >= 3*x2) or abs(math.ceil(128./x1) - 3*x2) < 20)
+    # for c in c_list:
+    #     r_and_cl_pairs = find_positive_integer_pairs(tccore_budget // c, prereq)
+    #     hw_shape = [(r_and_cl[0], c, r_and_cl[1]) for r_and_cl in r_and_cl_pairs]
+    #     hw_shapes += hw_shape
+    # print(hw_shapes)
+
+    # get hw shapes for SIGMA core
+    c_list = [4, 8, 16, 32, 64, 128]
+    hw_shapes = [(c, int(math.floor(tccore_budget / (c+2)))) for c in c_list]    
+    print(hw_shapes)
+
+    args = [(all_inst_dat, seq_lens, i, out_path) for i in hw_shapes]
     with multiprocessing.Pool(processes=10) as pool:
-        pool.starmap(rr2spmm_wrap, args)
+        pool.starmap(emulator, args)
 
 def eval_emulator(dat: pd.DataFrame, models, tasks):
     # get latency records of required config:
@@ -1771,7 +1782,7 @@ def plot_roofline(hw_perf_df: pd.DataFrame, density_df: pd.DataFrame, hw_size: d
 def plot_thres_tops_score(onchip_res_list: dict[pd.DataFrame], scores_list: dict):
     # onchip_res_list = dict(sorted(onchip_res_list.items()))
     # get list of thresholds:
-    thres_list = onchip_df_res_list.keys()
+    thres_list = onchip_res_list.keys()
     # format thres_list to scores_list supported keys
     thres_list_for_scores = [f"block prune thres (x{i.split('x')[0]}/seq_lenx20)" for i in thres_list]
 
@@ -1886,10 +1897,12 @@ if __name__ == "__main__":
 
     # inst_idx = 4
     model_names = ["chatglm2-6b-32k", "llama2-7b-chat-4k", "mixtral-8x7b"]
-    # model_names = ["chatglm2-6b-32k"]
     task_list = ["lcc", "multifieldqa_en", "multifieldqa_zh", "passage_retrieval_zh", "qasper", "samsum", "trec", "vcsum"]
-
+    model_names = ["chatglm2-6b-32k"]
+    task_list = ["lcc"]
+    ## compute effective sparsity and save them to csv
     # compute_unique_colidx_ratio(task_list, model_names, swindow_list)
+    ## processing onchip test results and save them to csv
     # onchip_df_res = get_onchip_res(
     #     "/compas-old/projects/sparse-attention/micro25/onchip", 
     #     # "/compas-old/projects/sparse-attention/onchip-5hbm", 
@@ -1898,8 +1911,12 @@ if __name__ == "__main__":
     #     tc_core_shape=(6, 12, 8), 
     #     threshold_postfix="4x"
     # )
-    # for mname, task in product(model_names, task_list):
-    #      sweep_rr_swindow_get_tops(mname, task)
+    ## processing onchip test for gemm and save them to csv
+    for mname, task in product(model_names, task_list):
+        ## design space explore for spmm
+        # sweep_rr_swindow_get_tops(mname, task, rr2spmm_wrap)
+        ## design space explore for sigma
+        sweep_rr_swindow_get_tops(mname, task, sigma_wrap)
     # get_gemm_onchip_res(
     #     pathlib.Path("/compas-old/projects/sparse-attention/onchip-5hbm"),
     #     model_names,
@@ -1907,12 +1924,15 @@ if __name__ == "__main__":
     #     300
     # )
 
+    ## read processed onchip results
     # onchip_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/onchip_res_300mhz.csv.old")
+    # gemm_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/onchip_res_gemms_300mhz.csv")
+    ## read effective sparsity data
     # density_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/spars-analysis-onchip-related.csv")
-    gemm_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/onchip_res_gemms_300mhz.csv")
 
+    ## plotting figures
     # plot_onchip_res(onchip_df_res)
-    plot_stacked_selfattn_ops_latency(gemm_df_res, None)
+    # plot_stacked_selfattn_ops_latency(gemm_df_res, None)
     # eval_emulator(onchip_df_res, model_names, task_list)
     # plot_unique_colidx_ratio_boxplot_by_task(density_df_res)
     # plot_route_ratio_by_task(density_df_res)
@@ -1921,11 +1941,14 @@ if __name__ == "__main__":
     # plot_speedup_vs_sparsity(onchip_df_res, density_df_res)
     # plot_roofline(onchip_df_res, density_df_res, {"r": 6, "c": 12, "l": 8, "freq": 300})
 
+    ## read onchip results for different thresholds
     # onchip_df_res_list = {}
     # for i in ["1x", "2x", "3x", "4x"]:
     #     onchip_df_res_list[i] = pd.read_csv(f"/compas-old/projects/sparse-attention/micro25/onchip/onchip_res_t{i}_300mhz.csv")
+    ## read longbench scores
     # with pathlib.Path("./res_fig/block_prune/formatted_data_longbench.json").open("r") as f:
     #     prune_score_eval_res = json.load(f)
+    ## plot speedup vs score
     # plot_thres_tops_score(onchip_df_res_list, prune_score_eval_res)
     
     # attn_path_chatglm = inst_list[0] + ".pt"
