@@ -1635,11 +1635,9 @@ def sigma_latency_analysis(
             ## step 1 row assignment: assigning rows to different PEs
             # first count appearance of each unique element in [r[0] for r in curr_head]
             all_row_idx = np.unique([r[0] for r in curr_head])
-            print(f"list of rows: {all_row_idx}")
             row_counts = {int(i): 0 for i in all_row_idx}
             for r in curr_head:
                 row_counts[r[0]] += 1
-            print(f"row counts: {row_counts}")
             remained_blocks = curr_head.copy()
             dpe_id = 0
             dpe_scheduled_blks = [[] for _ in range(n_dpes)]
@@ -1668,23 +1666,24 @@ def sigma_latency_analysis(
                 dpe_id = (dpe_id + 1) % n_dpes
 
             ## step 2 evaluate latency of each iteration
-            dpe_iters = []
-            for dpe_id in range(n_dpes):
-                curr_pe_lat = max(benes_delay, 3*n_pes)
-                for iter_blk_id, iter_blks in enumerate(dpe_scheduled_blks[dpe_id]):
-                    curr_pe_lat += max(benes_delay, 3*n_pes, compute_delay)
-                    if iter_blk_id == len(dpe_scheduled_blks[dpe_id]) - 1:
-                        # linear reduce delay depends on the max number of values to 
-                        # accumulate after DOT
-                        row_idx_in_blk = [b[0] for b in iter_blks]
-                        _, accu_list = np.unique(row_idx_in_blk, return_counts=True)
-                        linear_reduce_delay = np.amax(accu_list)
-                        curr_pe_lat += linear_reduce_delay
+            ## for each step in dpe, collect col idx of the blocks to identify 
+            ## number of iterations for mat be transfer (compute latency)
+            perhead_latency = max(benes_delay, 3*n_pes) # initial latency of the first PE
+            n_mat_a_load_iters = max([len(dpe_blks) for dpe_blks in dpe_scheduled_blks])
+            for mat_a_load_iter_id in range(n_mat_a_load_iters):
+                # for each iteration, figure out how many iterations of mat B loading is needed 
+                required_col_idx = []
+                for dpe_id in range(n_dpes):
+                    if mat_a_load_iter_id < len(dpe_scheduled_blks[dpe_id]):
+                        required_col_idx += [blk[1] for blk in dpe_scheduled_blks[dpe_id][mat_a_load_iter_id]]
+                required_col_idx = np.unique(required_col_idx)
+                n_mat_b_load_iters = ceil(float(len(required_col_idx)) / float(n_pes))
+                # each mat B loading iteration takes 3*n_pes cycles
+                perhead_latency += max(benes_delay, 3*n_pes, compute_delay * n_mat_b_load_iters)
 
-                dpe_iters.append(curr_pe_lat)
+            perhead_latency += n_pes # add final accumulator delay
 
             ## step 3 get max latency of all dpes to be total latency
-            perhead_latency = float(max(dpe_iters)) * cycle_delay
             perhead_rec["total_lat"].append(perhead_latency)
             perhead_rec["total_tops"].append(float(total_ops) / (perhead_latency * 1e-9) / 1e12)
 

@@ -1637,7 +1637,7 @@ def sweep_rr_swindow_get_tops(model_name, task_name, emulator):
     if not os.path.exists(out_path):
         os.makedirs(out_path)
 
-    tccore_budget = 720
+    tccore_budget = 1152 / 2
 
     # get hw shapes for spmm core
     # c_list = [4, 8, 12, 24, 36]
