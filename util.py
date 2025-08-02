@@ -1,6 +1,8 @@
 from os import listdir
 from os.path import isfile
 import json
+from pathlib import Path
+import statistics
 
 def get_pts_under_dir(base_path: str, postfix: str, datatype = None, fname_filter = None) -> list[str]:
     inst_list = []
@@ -78,3 +80,29 @@ def find_positive_integer_pairs(x: int, filter) -> list[tuple[int, int]]:
     pairs.sort()
     
     return pairs
+
+def get_avg_tops_from_emulated_res(fpath: Path):
+    """
+    Extracts the average TOPS from the emulated results file.
+    """
+    avg_res = []
+
+    if fpath.is_file():
+        with fpath.open("r") as f:
+            res = json.load(f)
+            for _, v in res.items():
+                avg_res.append(v.get("avg_tops", 0.0))
+
+    return statistics.mean(avg_res) if avg_res else 0.0
+
+def get_max_tp_for_configs(fpath: Path):
+    all_configs = list(fpath.rglob("*.json"))
+    curr_max_tp, curr_max_tp_config = 0.0, ""
+    for config in all_configs:
+        if config.is_file():
+            avg_tops = get_avg_tops_from_emulated_res(config)
+            if avg_tops > curr_max_tp:
+                curr_max_tp = avg_tops
+                curr_max_tp_config = config.name
+
+    return curr_max_tp, curr_max_tp_config

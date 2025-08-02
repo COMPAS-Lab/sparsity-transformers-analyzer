@@ -13,7 +13,8 @@ from sparsemat_hw_modeling import (
     spmm_non_rr_latency_analysis,
     get_tccore_config,
     rr2spmm_fifo_latency_overlap_analysis, 
-    sigma_latency_analysis)
+    sigma_latency_analysis,
+    naive_roundrobin_latency_analysis)
 import matplotlib
 from matplotlib import pyplot as plt
 from matplotlib.patches import Patch
@@ -1118,9 +1119,6 @@ def get_gemm_onchip_res(
     # create pandas dataframe with columns: model,  task, onchip_lat, onchip_tp, seq_len
     df = pd.DataFrame(
         columns=[
-            "model", 
-            "task", 
-            "inst_id", 
             "seq_len", 
             "q_lat",
             "kv_lat",
@@ -1131,38 +1129,30 @@ def get_gemm_onchip_res(
     )
 
     # get the onchip res from the dat_path
-    for model, task in product(models_name, tasks_name):
-        model_task_path = dat_path / f"{model}-attn-bfp20-{task}"
 
-        # get subdirs under model_task_path
-        subdirs = [model_task_path / d for d in os.listdir(model_task_path) if (model_task_path / d).is_dir()]
-        for subdir in subdirs:
-            # get the inst_id from the subdir name
-            inst_id = subdir.name
-            # temporarily skip the random records
-            if inst_id[0:9] != "iiSeqInst":
-                continue 
-            # get the seq_len from the subdir's "inst_profile.json" file
-            with (subdir / "inst_profile.json").open("r") as f:
-                inst_profile = json.load(f)
-                seq_len = inst_profile["seq_len"]
+    subdirs = [dat_path / d for d in os.listdir(dat_path) if (dat_path / d).is_dir()]
+    for subdir in subdirs:
+        # get the inst_id from the subdir name
+        matmul_type = subdir.name
+        assert matmul_type in ["qkv", "qkT", "aV"], f"Unexpected matmul type: {matmul_type}"
+        # get the seq_len from the subdir's "inst_profile.json" file
+        with (subdir / "inst_profile.json").open("r") as f:
+            inst_profile = json.load(f)
+            seq_len = inst_profile["seq_len"]
 
-            q_lat = get_gemm_synth_lat(subdir / "qkv")
-            kv_lat = get_gemm_synth_lat(subdir / "qkv", force_n_b_blks=1)
-            qkT_lat = get_gemm_synth_lat(subdir / "qkT")
-            aV_lat = get_gemm_synth_lat(subdir / "aV")
+        q_lat = get_gemm_synth_lat(subdir / "qkv")
+        kv_lat = get_gemm_synth_lat(subdir / "qkv", force_n_b_blks=1)
+        qkT_lat = get_gemm_synth_lat(subdir / "qkT")
+        aV_lat = get_gemm_synth_lat(subdir / "aV")
 
-            df.loc[len(df)] = {
-                                "model": model, 
-                                "task": task, 
-                                "inst_id": inst_id, 
-                                "seq_len": seq_len,
-                                "q_lat": q_lat,
-                                "kv_lat": kv_lat,
-                                "qkT_lat": qkT_lat,
-                                "aV_lat": aV_lat,
-                                "o_lat": q_lat
-            }
+        df.loc[len(df)] = {
+                            "seq_len": seq_len,
+                            "q_lat": q_lat,
+                            "kv_lat": kv_lat,
+                            "qkT_lat": qkT_lat,
+                            "aV_lat": aV_lat,
+                            "o_lat": q_lat
+        }
 
     outpath = pathlib.Path(dat_path) / pathlib.Path(f"onchip_res_gemms_{int(gemm_freq)}mhz.csv")
     df.to_csv(str(outpath.absolute()))
@@ -1582,6 +1572,16 @@ def sigma_wrap(all_inst_dat, seq_lens, hw_shape, out_path):
         out_json_basepath=out_path
     )
 
+def naive_wrap(all_inst_dat, seq_lens, hw_shape, out_path): 
+    naive_roundrobin_latency_analysis(
+        inst_list=all_inst_dat, 
+        seqlen_list=seq_lens, 
+        dpu_shape=hw_shape,
+        n_matb_cols=128,
+        spmm_freq=300.0,
+        out_json_basepath=out_path
+    )
+
 def sweep_rr_swindow_get_tops(model_name, task_name, emulator):
     base_attn_path = f"/compas-old/projects/sparse-attention/{model_name}-attn-bfp20-{task_name}/"
     inst_rlist = sorted(util.get_pts_under_dir(base_attn_path, postfix="npy", datatype="ridx", fname_filter="iiSeqInst"))
@@ -1632,30 +1632,29 @@ def sweep_rr_swindow_get_tops(model_name, task_name, emulator):
         
         all_inst_dat[inst_id] = idx_dat
 
+    tccore_budget = 540
     # run the experiment
-    out_path = f"./res_fig/block_prune/sigma/{model_name}-attn-bfp20-{task_name}"
+    out_path = f"./res_fig/block_prune/spmm/{tccore_budget}/{model_name}-attn-bfp20-{task_name}"
     if not os.path.exists(out_path):
         os.makedirs(out_path)
 
-    tccore_budget = 1152 / 2
-
     # get hw shapes for spmm core
-    # c_list = [4, 8, 12, 24, 36]
-    # hw_shapes = []
-    # prereq = lambda x1,x2: (x2 >= 8) and ((math.ceil(128./x1) >= 3*x2) or abs(math.ceil(128./x1) - 3*x2) < 20)
-    # for c in c_list:
-    #     r_and_cl_pairs = find_positive_integer_pairs(tccore_budget // c, prereq)
-    #     hw_shape = [(r_and_cl[0], c, r_and_cl[1]) for r_and_cl in r_and_cl_pairs]
-    #     hw_shapes += hw_shape
-    # print(hw_shapes)
-
-    # get hw shapes for SIGMA core
-    c_list = [4, 8, 16, 32, 64, 128]
-    hw_shapes = [(c, int(math.floor(tccore_budget / (c+2)))) for c in c_list]    
+    c_list = [4, 8, 12, 24, 36]
+    hw_shapes = []
+    prereq = lambda x1,x2: (x2 >= 8) and (x2 <= 32) and ((math.ceil(128./x1) >= 3*x2) or abs(math.ceil(128./x1) - 3*x2) < 20)
+    for c in c_list:
+        r_and_cl_pairs = find_positive_integer_pairs(int(tccore_budget // c), prereq)
+        hw_shape = [(r_and_cl[0], c, r_and_cl[1]) for r_and_cl in r_and_cl_pairs]
+        hw_shapes += hw_shape
     print(hw_shapes)
 
+    # get hw shapes for SIGMA core
+    # c_list = [4, 8, 16, 32]
+    # hw_shapes = [(c, int(math.floor(tccore_budget / (c+2)))) for c in c_list]
+    # print(hw_shapes)
+
     args = [(all_inst_dat, seq_lens, i, out_path) for i in hw_shapes]
-    with multiprocessing.Pool(processes=10) as pool:
+    with multiprocessing.Pool(processes=5) as pool:
         pool.starmap(emulator, args)
 
 def eval_emulator(dat: pd.DataFrame, models, tasks):
@@ -1687,7 +1686,6 @@ def eval_emulator(dat: pd.DataFrame, models, tasks):
             errs.append(err)
 
     print(f"average err: {np.mean(errs):.4f}")
-
 
 
 def plot_roofline(hw_perf_df: pd.DataFrame, density_df: pd.DataFrame, hw_size: dict):
@@ -1914,9 +1912,11 @@ if __name__ == "__main__":
     ## processing onchip test for gemm and save them to csv
     for mname, task in product(model_names, task_list):
         ## design space explore for spmm
-        # sweep_rr_swindow_get_tops(mname, task, rr2spmm_wrap)
+        sweep_rr_swindow_get_tops(mname, task, rr2spmm_wrap)
         ## design space explore for sigma
-        sweep_rr_swindow_get_tops(mname, task, sigma_wrap)
+        # sweep_rr_swindow_get_tops(mname, task, sigma_wrap)
+        ## design space explore for naive round robin
+        # sweep_rr_swindow_get_tops(mname, task, naive_wrap)
     # get_gemm_onchip_res(
     #     pathlib.Path("/compas-old/projects/sparse-attention/onchip-5hbm"),
     #     model_names,

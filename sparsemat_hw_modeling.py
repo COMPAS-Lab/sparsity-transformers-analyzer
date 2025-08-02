@@ -1599,6 +1599,92 @@ def rr2spmm_fifo_latency_overlap_analysis(
         with open(fpath, 'w') as file:
             json.dump(existing_data, file, indent=2)
 
+def naive_roundrobin_latency_analysis(
+        inst_list: dict, 
+        seqlen_list: dict, 
+        dpu_shape: tuple[int, int, int] = (16, 32, 128),
+        n_matb_cols: int = 128,
+        spmm_freq: float = 300.0,
+        out_json_basepath: str = ""):
+    '''
+    calculate runtime in clk cycles for naive design 
+    with data bus from mat b to all cols, each clock serves
+    one column of mat b
+    '''
+    cycle_delay = 1./spmm_freq * 1000.
+    tc_row, tc_col, tc_chain_len = dpu_shape
+    
+    # components' latency
+    first_iter_matb_fetch_delay = tc_chain_len
+    transpose_delay = 3
+    mat_a_load_delay = 3 * tc_chain_len
+    compute_lat = ceil(n_matb_cols / tc_row)
+
+    res = {}
+    for k in inst_list.keys():
+        i = inst_list[k]
+        perhead_rec = {
+            "total_lat": [], 
+            "total_tops": [], 
+        }
+        l = seqlen_list[k]
+        total_ops = l * l * 2 * n_matb_cols
+
+        for curr_head in tqdm(i, unit="head"):
+            ## curr_head: (ridx, cidx)
+            curr_head.sort(key=lambda x: x[0])
+            all_row_idx, row_counts = np.unique([r[0] for r in curr_head], return_counts=True)
+            curr_latency = max(mat_a_load_delay, transpose_delay + first_iter_matb_fetch_delay)
+
+            while(len(all_row_idx) > 0):
+                curr_assigned_blks = {i: [] for i in range(tc_col)}
+                curr_col_grp_lat = 0.0
+                ## step 1 gather all blocks for each row and assign them to a tc col
+                for col_idx in range(tc_col):
+                    ## for each column, assign one row to it to finish
+                    if len(all_row_idx) > 0:
+                        curr_assigned_row_idx = all_row_idx[0]
+                        curr_assigned_row_blk_counts = row_counts[0]
+                        all_row_idx = all_row_idx[1:]
+                        row_counts = row_counts[1:]
+                        # get all blocks for this row
+                        curr_assigned_blks[col_idx].append(curr_head[0:curr_assigned_row_blk_counts])
+                    else:
+                        break
+                ## step 2 count cycles for each iteration
+                for col_idx in range(tc_col):
+                    if len(curr_assigned_blks[col_idx]) > 0:
+                        # for each column, count how many mat b loading iterations are needed
+                        col_n_iters = ceil(float(len(curr_assigned_blks[col_idx])) / float(tc_chain_len))
+                        col_lat = col_n_iters * compute_lat
+                        curr_col_grp_lat += col_lat
+
+                ## step 3 add the max latency of all cols to the total latency
+                curr_latency += max(curr_col_grp_lat, mat_a_load_delay)
+                
+            perhead_rec["total_lat"].append(curr_latency * cycle_delay)
+            perhead_rec["total_tops"].append(float(total_ops) / (curr_latency * cycle_delay * 1e-9) / 1e12)
+
+        res[k] = perhead_rec
+        res[k]["avg_tops"] = np.mean(perhead_rec["total_tops"])
+
+        fpath = f"{out_json_basepath}/naive_lat_r{tc_row}_c{tc_col}_cl{tc_chain_len}.json"
+        if exists(fpath):
+            with open(fpath, 'r') as file:
+                try:
+                    existing_data = json.load(file)
+                    if not isinstance(existing_data, dict):
+                        raise ValueError("The file does not contain a valid JSON object.")
+                except json.JSONDecodeError:
+                    existing_data = {}
+            
+            existing_data.update(res)
+        else:
+            existing_data = res
+
+        with open(fpath, 'w') as file:
+            json.dump(existing_data, file, indent=2)
+
 def sigma_latency_analysis(
         inst_list: dict, 
         seqlen_list: dict, 
@@ -1684,8 +1770,8 @@ def sigma_latency_analysis(
             perhead_latency += n_pes # add final accumulator delay
 
             ## step 3 get max latency of all dpes to be total latency
-            perhead_rec["total_lat"].append(perhead_latency)
-            perhead_rec["total_tops"].append(float(total_ops) / (perhead_latency * 1e-9) / 1e12)
+            perhead_rec["total_lat"].append(perhead_latency * cycle_delay)
+            perhead_rec["total_tops"].append(float(total_ops) / (perhead_latency * cycle_delay * 1e-9) / 1e12)
 
         res[k] = perhead_rec
         res[k]["avg_tops"] = np.mean(perhead_rec["total_tops"])
