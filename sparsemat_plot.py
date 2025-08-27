@@ -42,6 +42,28 @@ def sublist_creator(lst, n):
         heapq.heappush(totals, (total + value, index))
     return lists
 
+def suboptimal_sublist_creator(lst, n, return_indices=False) -> tuple:
+    """
+    naive load balancing algorithm to create 2 sublists
+    """
+    assert n == 2, "Only supports 2 sublists for now"
+    lists, sched_indices = [[], []],  [[], []]
+    lists[0].append(lst[0])
+    sched_indices[0].append(0)
+
+    for idx, value in enumerate(lst[1:]):
+        if sum(lists[0]) <= sum(lists[1]):
+            lists[0].append(value)
+            sched_indices[0].append(idx + 1)
+        else:
+            lists[1].append(value)
+            sched_indices[1].append(idx + 1)
+
+    if return_indices:
+        return lists, sched_indices
+    else:
+        return lists, None
+
 def gen_spmat_by_sparsity(ref_mat: np.array, 
                           target_seqlen: int, 
                           fake_dense_val = 0.4, 
@@ -1079,6 +1101,122 @@ def get_onchip_res(dat_path, models_name, tasks_name, spmm_freq=300.0, tc_core_s
     df.to_csv(str(outpath.absolute()))
     return df
 
+def get_gemm_emulated_res(
+        dat_paths: list[pathlib.Path], 
+        tc_core_shape: tuple[int, int, int],
+        gemm_freq,
+        csv_out_path: pathlib.Path
+    ):
+    # create pandas dataframe with columns: model,  task, onchip_lat, onchip_tp, seq_len
+    df = pd.DataFrame(
+        columns=[
+            "seq_len", 
+            "q_lat",
+            "kv_lat",
+            "qkT_lat",
+            "aV_lat",
+            "o_lat",
+            "q_tops",
+            "kv_tops",
+            "o_tops",
+            "aV_tops",
+            "qkT_tops",
+            "q_gemm_tops",
+            "kv_gemm_tops",
+            "o_gemm_tops",
+            "aV_gemm_tops"
+        ]
+    )
+
+    # get the emulated res from the dat_path
+    workload_types = ["qkv", "qkT", "aV"]
+    rec = {}
+    for dat_path in dat_paths:
+        for workload_type in workload_types:
+            # get the seq_len from the subdir's "inst_profile.json" file
+            with (dat_path / f"{workload_type}/inst_profile.json").open("r") as f:
+                inst_profile = json.load(f)
+                seq_len = inst_profile["seq_len"]
+
+            workload_rp = dat_path / f"{workload_type}_ridx.npy"
+            workload_cp = dat_path / f"{workload_type}_cidx.npy"
+            print(f"loading {str(workload_rp)} and {str(workload_cp)}...")
+            # preprocess index inputs
+            ridx_dat = np.load(workload_rp)
+            cidx_dat = np.load(workload_cp)
+            # extract one head
+            headgrp_ridx, headgrp_cidx = [], []
+            curr_head_ridx, curr_head_cidx = [], []
+            for ridx, cidx in zip(ridx_dat, cidx_dat):
+                if ridx == -1 and cidx == -1:
+                    headgrp_ridx.append(curr_head_ridx.copy())
+                    headgrp_cidx.append(curr_head_cidx.copy())
+                    curr_head_ridx, curr_head_cidx = [], []
+                else:
+                    curr_head_ridx.append(ridx)
+                    curr_head_cidx.append(cidx)
+
+            inst_dat = []
+            src_ridx, src_cidx = headgrp_ridx[0], headgrp_cidx[0] 
+            inst_dat.append([(r, c) for r, c in zip(src_ridx, src_cidx)])
+
+
+            if workload_type == "qkv":
+                res_q = rr2spmm_fifo_latency_overlap_analysis(
+                                                            {"SeqInst0000": inst_dat}, 
+                                                            {"SeqInst0000": seq_len}, 
+                                                            tc_core_shape[1], tc_core_shape, 
+                                                            512, 
+                                                            out_buff_depth=1024,
+                                                            spmm_freq = gemm_freq,
+                                                            rremover_freq = gemm_freq,
+                                                            workload_type="q")
+
+                res_kv = rr2spmm_fifo_latency_overlap_analysis(
+                                                            {"SeqInst0000": inst_dat}, 
+                                                            {"SeqInst0000": seq_len}, 
+                                                            tc_core_shape[1], tc_core_shape, 
+                                                            512, 
+                                                            out_buff_depth=1024,
+                                                            spmm_freq = gemm_freq,
+                                                            rremover_freq = gemm_freq,
+                                                            workload_type="kv")
+                
+                rec["q_lat"] = res_q["SeqInst0000"]["avg_total_lat"]
+                rec["kv_lat"] = res_kv["SeqInst0000"]["avg_total_lat"]
+                rec["o_lat"] = res_q["SeqInst0000"]["avg_total_lat"]
+                rec["q_tops"] = res_q["SeqInst0000"]["avg_tops"]
+                rec["kv_tops"] = res_kv["SeqInst0000"]["avg_tops"]
+                rec["o_tops"] = res_q["SeqInst0000"]["avg_tops"]
+                rec["q_gemm_tops"] = res_q["SeqInst0000"]["dense_avg_tops"]
+                rec["kv_gemm_tops"] = res_kv["SeqInst0000"]["dense_avg_tops"]
+                rec["o_gemm_tops"] = res_q["SeqInst0000"]["dense_avg_tops"]
+
+            else:
+                res = rr2spmm_fifo_latency_overlap_analysis(
+                                                            {"SeqInst0000": inst_dat}, 
+                                                            {"SeqInst0000": seq_len}, 
+                                                            tc_core_shape[1], tc_core_shape, 
+                                                            512, 
+                                                            out_buff_depth=1024,
+                                                            spmm_freq = gemm_freq,
+                                                            rremover_freq = gemm_freq,
+                                                            workload_type=workload_type)
+                rec[f"{workload_type}_lat"] = res["SeqInst0000"]["avg_total_lat"]
+                rec[f"{workload_type}_tops"] = res["SeqInst0000"]["avg_tops"]
+                rec[f"{workload_type}_gemm_tops"] = res["SeqInst0000"]["dense_avg_tops"]
+
+
+        rec["seq_len"] = seq_len
+        df.loc[len(df)] = rec
+
+    if csv_out_path.exists():
+        existing_df = pd.read_csv(str(csv_out_path.absolute()))
+        df = pd.concat([existing_df, df], ignore_index=True)
+    
+    df.to_csv(str(csv_out_path.absolute()))
+    return df
+
 def get_gemm_onchip_res(
         dat_path: pathlib.Path, 
         models_name, 
@@ -1133,8 +1271,10 @@ def get_gemm_onchip_res(
     subdirs = [dat_path / d for d in os.listdir(dat_path) if (dat_path / d).is_dir()]
     for subdir in subdirs:
         # get the inst_id from the subdir name
-        matmul_type = subdir.name
-        assert matmul_type in ["qkv", "qkT", "aV"], f"Unexpected matmul type: {matmul_type}"
+        matmul_type = [(subdir / d).name for d in os.listdir(subdir) if (subdir / d).is_dir()]
+        for t in matmul_type:
+            assert t in ["qkv", "qkT", "aV"], f"Unexpected matmul type: {t}"
+
         # get the seq_len from the subdir's "inst_profile.json" file
         with (subdir / "inst_profile.json").open("r") as f:
             inst_profile = json.load(f)
@@ -1159,152 +1299,56 @@ def get_gemm_onchip_res(
     return df
 
 def plot_stacked_selfattn_ops_latency(
-        gemm_dat: pd.DataFrame, 
-        spmm_dat: pd.DataFrame,
+        gemm_dat: pd.DataFrame,
         n_heads = 32,
+        out_fig_path = pathlib.Path("./res_fig/dense_lat_ops_seqlen.pdf")
         ):
+    # drop all columns in gemm_dat with string values
+    gemm_dat = gemm_dat.select_dtypes(include=["number"])
     # analyze latency breakdown of a single self-attn
     gemm_dat["qkv_lat"] = gemm_dat["q_lat"] + gemm_dat["kv_lat"] * 2
     gemm_dat["qkT_lat"] = gemm_dat["qkT_lat"] * n_heads
     gemm_dat["aV_lat"] = gemm_dat["aV_lat"] * n_heads
     gemm_dat["linear_lat"] = gemm_dat["qkv_lat"] + gemm_dat["o_lat"]
-    gemm_dat_inst_mean = gemm_dat.drop(columns=["inst_id"]).groupby(["model", "task"]).mean().reset_index()
-
-    print(gemm_dat_inst_mean.to_markdown())
-
-    # spmm_dat_inst_mean = spmm_dat.drop(columns=["inst_id"]).groupby(["model", "task"]).mean().reset_index()
-    # spmm_dat["avg_aV"] = spmm_dat["onchip_total_lat"] 
-
-    latency_types = ["qkT_lat", "aV_lat", "linear_lat"]
-    # Melt the DataFrame to long format as before
-    df_melted = gemm_dat_inst_mean.melt(
-        id_vars=["model", "task"],
-        value_vars=latency_types,
-        var_name="latency_type",
-        value_name="latency_value"
-    )
-
-    # Ensure consistent order for tasks and models for plotting
-    unique_tasks = gemm_dat_inst_mean['task'].unique()
-    unique_models = gemm_dat_inst_mean['model'].unique()
-
-    # --- Define X-axis positions and labels ---
-    bar_width = 0.8 # Width of each individual model's stacked bar
-    task_margin = 1.0 # Margin between different tasks
-    model_spacing = 0.0 # No margin between models within the same task
-
-    x_positions = []
-    x_labels = []
-    task_x_centers = [] # For placing task labels
-    current_x = 0
-
-    for task in unique_tasks:
-        models_in_task = df_melted[df_melted['task'] == task]['model'].unique()
-        num_models_in_task = len(models_in_task)
-
-        task_start_x = current_x
-        for i, model in enumerate(models_in_task):
-            x_positions.append(current_x)
-            x_labels.append(model) # Label with model name
-            current_x += bar_width + model_spacing # Move to the next model position
-        
-        # Calculate center for task label
-        task_end_x = current_x - model_spacing # End of the last model bar
-        task_x_centers.append((task_start_x + task_end_x - bar_width) / 2 + bar_width/2) # Center of the task group
-        
-        current_x += task_margin # Add margin after the last model of the current task
+    gemm_dat["total_lat"] = gemm_dat["linear_lat"] + gemm_dat["qkT_lat"] + gemm_dat["aV_lat"]
+    gemm_dat["linear_lat_prop"] = gemm_dat["linear_lat"] / gemm_dat["total_lat"]
+    gemm_dat["qkT_lat_prop"] = gemm_dat["qkT_lat"] / gemm_dat["total_lat"]
+    gemm_dat["aV_lat_prop"] = gemm_dat["aV_lat"] / gemm_dat["total_lat"]
 
     # --- Color and Hatch Mappings ---
     # Colors for models
     global model_palette
 
     # Hatches for latency types
-    latency_hatches = {
-        "qkT_lat": "xx",
-        "aV_lat": "o",
-        "linear_lat": "//"
-    }
+    # average "q_lat", "kv_lat", "qkT_lat", "aV_lat", "o_lat" for different range of "seq_len"
+    bins = [1024, 2048, 4096, 8192, 16384, 32768]
+    gemm_dat["seq_len_bin"] = pd.cut(gemm_dat["seq_len"], bins=bins)
+    gemm_dat_binned_mean = gemm_dat.groupby("seq_len_bin").mean().reset_index()
+    print(gemm_dat_binned_mean.to_markdown())
 
-    # --- Plotting ---
-    fig, ax = plt.subplots(figsize=(10, 6))
+    # plot the binned mean of "qkT_lat", "aV_lat", "o_lat" vs "seq_len_bin" using seaborn and label the bars using latency_hatches
+    # for each mean, plot it to be stacked with previous type
+    sns.set(rc={'figure.figsize':(8, 4.5)}, font_scale=1.2)
+    fig, axes = plt.subplots(1, 1)
+    bar_width = 0.7
+    sns.barplot(gemm_dat, x="seq_len", y="linear_lat_prop", bottom=0,
+                label="Linear", ax=axes, color="C4", width=bar_width)
+    sns.barplot(gemm_dat, x="seq_len", y="aV_lat_prop", 
+                bottom=gemm_dat["linear_lat_prop"],
+                label="Attention × V", ax=axes, color="C5", width=bar_width)
+    sns.barplot(gemm_dat, x="seq_len", y="qkT_lat_prop", 
+                bottom=gemm_dat["linear_lat_prop"] + gemm_dat["aV_lat_prop"],
+                label="Q × Kᵀ", ax=axes, color="C3", width=bar_width)
 
-    # Group data by (task, model) for plotting
-    grouped_data = df_melted.groupby(['task', 'model'])
-
-    # Iterate through each bar position to draw stacked segments
-    for i, (x_pos, model_label) in enumerate(zip(x_positions, x_labels)):
-        task = gemm_dat_inst_mean.loc[gemm_dat_inst_mean['model'] == model_label, 'task'].iloc[0]
-        
-        # Get the data for the current model within its task
-        current_model_data = df_melted[(df_melted['task'] == task) & (df_melted['model'] == model_label)]
-        
-        bottom_value = 0
-        for lat_type in latency_types:
-            latency_val = current_model_data[current_model_data['latency_type'] == lat_type]['latency_value'].sum()
-            if not pd.isna(latency_val) and latency_val > 0: # Only plot if there's a value
-                ax.bar(
-                    x_pos,
-                    latency_val,
-                    width=bar_width,
-                    bottom=bottom_value,
-                    color=model_palette[model_label],
-                    hatch=latency_hatches[lat_type],
-                    edgecolor='black', # Add black edge for better visibility of hatches
-                    linewidth=0.5
-                )
-                bottom_value += latency_val
-
-    # --- Customizing X-axis ---
-    task_label_positions = []
-    for t_id in range(len(unique_tasks)):
-        task_label_positions.append(x_positions[t_id * len(model_names) + 1])
-    ax.set_xticks(task_label_positions)
-    ax.set_xticklabels(unique_tasks, rotation=15, ha='right')
-    ax.set_xlabel("Tasks", fontsize=12)
-    ax.set_ylabel("Latency (ns)", fontsize=12)
-
-    # Add horizontal lines or text for task separation/labels
-    # We'll use custom text labels for tasks
-    # Get the unique tasks in order
-    unique_tasks_df = df_melted[['task', 'model']].drop_duplicates().sort_values(by=['task', 'model'])
-
-    task_group_boundaries = []
-    current_task = None
-    for i, (idx, row) in enumerate(unique_tasks_df.iterrows()):
-        if row['task'] != current_task:
-            if current_task is not None:
-                task_group_boundaries.append(i - 0.5) # Mark end of previous group
-            task_group_boundaries.append(i - 0.5) # Mark start of new group
-            current_task = row['task']
-    task_group_boundaries.append(len(x_positions) - 0.5) # End of the last group
-
-    ax.tick_params(axis='x', which='minor', bottom=False) # Remove minor ticks
-
-    # Adjust primary x-axis limits to accommodate for the last bar and potential margin
-    ax.set_xlim(-bar_width/2, current_x - task_margin + bar_width/2) # Adjust limits to frame bars nicely
-
-    # --- Create Custom Legends ---
-    # Legend for Latency Types (Hatches)
-    hatch_patches = [
-        Patch(facecolor='white', edgecolor='black', hatch=latency_hatches[lt], label=lt.replace("_lat", ""))
-        for lt in latency_types
-    ]
-    hatch_legend = ax.legend(handles=hatch_patches, title="component", ncol=len(hatch_patches),
-                            bbox_to_anchor=(0.2, 1.12), loc='upper center', borderaxespad=0.)
-
-    # Legend for Models (Colors)
-    color_patches = [
-        Patch(facecolor=model_palette[model][0], edgecolor='black', label=model)
-        for model in unique_models
-    ]
-    color_legend = ax.legend(handles=color_patches, title="Model", ncol=len(color_patches),
-                            bbox_to_anchor=(0.66, 1.12), loc='upper center', borderaxespad=0.)
-
-    ax.add_artist(hatch_legend) # Add the first legend back
-
-    plt.tight_layout() # Adjust layout to make space for legends
-    plt.savefig("./res_fig/dense_lat_ops.pdf")
-
+    # set x axis only show numbers in integer
+    # axes.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: int(x)))
+    axes.set_xlabel("Context length")
+    axes.set_ylabel("Normalized GEMM runtime \nin self-attention prefill stage")
+    axes.set_ylim(ymin=0, ymax=1)
+    axes.legend(loc='upper center', ncol=3, bbox_to_anchor=(0.5, 1.18), fancybox=False, columnspacing=0.4)
+    fig.tight_layout()
+    fig.savefig(out_fig_path, bbox_inches='tight')
+    fig.clf()
 
 def plot_onchip_res(dat: pd.DataFrame):
     dat["total_speedup"] = dat["onchip_total_tp"] / dat["onchip_comp_tp"]
@@ -1392,8 +1436,8 @@ def plot_onchip_res(dat: pd.DataFrame):
             seq_len = inst_df["seq_len"].mean()
             total_ops = seq_len * seq_len * 2 * 128 * len(inst_total_lats)
             # balance all loads
-            total_lats = sublist_creator(inst_total_lats, n_queus)
-            total_lats_dense = sublist_creator(inst_total_lats_dense, n_queus)
+            total_lats, _ = suboptimal_sublist_creator(inst_total_lats, n_queus)
+            total_lats_dense, _ = suboptimal_sublist_creator(inst_total_lats_dense, n_queus)
 
             effec_total_lat = max([sum(l) for l in total_lats])
             effec_total_lat_dense = max([sum(l) for l in total_lats_dense])
@@ -1452,15 +1496,16 @@ def plot_onchip_res(dat: pd.DataFrame):
             seq_len = inst_df["seq_len"].mean()
             total_ops = seq_len * seq_len * 2 * 128 * len(inst_total_lats)
             total_lats = [[] for q in range(n_queus)]
+            lats_wo_bload, sched_indices = suboptimal_sublist_creator(inst_total_lats, n_queus, True)
             for q in range(n_queus):
-                hlist = list(range(len(inst_total_lats)))[q:len(inst_total_lats):n_queus]
-                for hidx in range(len(hlist) + 1):
+                for hidx in range(len(lats_wo_bload[q]) + 1):
                     if hidx == 0:
-                        total_lats[q].append(inst_load_lats[hlist[hidx]])
-                    elif hidx == (len(hlist)):
-                        total_lats[q].append(inst_total_lats[hlist[-1]])
+                        total_lats[q].append(inst_load_lats[sched_indices[q][hidx]])
+                    elif hidx == (len(lats_wo_bload[q])):
+                        total_lats[q].append(inst_total_lats[sched_indices[q][-1]])
                     else:
-                        total_lats[q].append(max(inst_load_lats[hlist[hidx-1]], inst_total_lats[hlist[hidx]]))
+                        total_lats[q].append(
+                            max(inst_load_lats[sched_indices[q][hidx-1]], inst_total_lats[sched_indices[q][hidx]]))
 
             effec_total_lat = max([sum(l) for l in total_lats])
             curr_ops = float(total_ops) / (float(effec_total_lat) * 1e-9) / 1e12
@@ -1554,35 +1599,79 @@ def plot_speedup_vs_sparsity(hw_perf_df: pd.DataFrame, density_df: pd.DataFrame)
     print(correlations)
 
 
-def rr2spmm_wrap(all_inst_dat, seq_lens, hw_shape, out_path): 
+def rr2spmm_wrap(all_inst_dat, seq_lens, hw_shape, freq, folding_factor, out_path): 
     rr2spmm_fifo_latency_overlap_analysis(
         all_inst_dat, seq_lens, 
         hw_shape[1], hw_shape, 
         512, 
         out_buff_depth=1024,
+        spmm_freq = freq,
+        rremover_freq = freq,
         out_json_basepath=out_path)
 
-def sigma_wrap(all_inst_dat, seq_lens, hw_shape, out_path): 
+def sigma_wrap(all_inst_dat, seq_lens, hw_shape, freq, folding_factor, out_path): 
     sigma_latency_analysis(
         inst_list=all_inst_dat, 
         seqlen_list=seq_lens, 
         dpu_shape=hw_shape,
         n_matb_cols=128,
-        spmm_freq=300.0,
+        transpose_folding_factor=folding_factor,
+        spmm_freq=freq,
         out_json_basepath=out_path
     )
 
-def naive_wrap(all_inst_dat, seq_lens, hw_shape, out_path): 
+def naive_wrap(all_inst_dat, seq_lens, hw_shape, freq, folding_factor, out_path): 
     naive_roundrobin_latency_analysis(
         inst_list=all_inst_dat, 
         seqlen_list=seq_lens, 
         dpu_shape=hw_shape,
         n_matb_cols=128,
-        spmm_freq=300.0,
+        spmm_freq=freq,
         out_json_basepath=out_path
     )
 
-def sweep_rr_swindow_get_tops(model_name, task_name, emulator):
+def dense_wrap(all_inst_dat, seq_lens, hw_shape, freq, folding_factor, out_path):
+    tc_row, tc_col, tc_chain_len = hw_shape
+    res = {}
+    for inst_id in all_inst_dat.keys():
+        seq_len = seq_lens[inst_id]
+        fake_dense_data = np.ones((seq_len, seq_len))
+        fake_dense_data = np.tril(fake_dense_data)
+        total_ops = seq_len * seq_len * 128 * 2
+        dense_model = hw_modeling.StratixDpuModel(seq_len, seq_len, seq_len, 128,
+                                                    exp_dat=fake_dense_data, 
+                                                    freq=freq, num_tcs=tc_col * tc_row * (tc_chain_len + 2), 
+                                                    tcc_array_shape=(tc_row, tc_col), tcc_chainlen=tc_chain_len)
+        dense_model.set_tccore_size(20)
+        dense_flops, dense_lat, dense_util = \
+            dense_model.tensor_fpga21_mat_sparse_flops(fake_dense_data, sparse_block_size=20)
+        
+        dense_res = PerfData()
+        dense_res.total_lat += dense_lat
+        dense_res.add_data(dense_util, "util")
+        dense_res.set_flops(total_ops)
+
+        res[inst_id] = {"total_lat": [dense_res.total_lat], "total_tops": [dense_res.total_flops]}
+        res[inst_id]["avg_tops"] = dense_res.total_flops
+
+    fpath = f"{out_path}/base_lat_r{tc_row}_c{tc_col}_cl{tc_chain_len}.json"
+    if os.path.exists(fpath):
+        with open(fpath, 'r') as file:
+            try:
+                existing_data = json.load(file)
+                if not isinstance(existing_data, dict):
+                    raise ValueError("The file does not contain a valid JSON object.")
+            except json.JSONDecodeError:
+                existing_data = {}
+        
+        existing_data.update(res)
+    else:
+        existing_data = res
+
+    with open(fpath, 'w') as file:
+        json.dump(existing_data, file, indent=2)
+
+def sweep_rr_swindow_get_tops(model_name, task_name, tccore_budget, emulator, out_path):
     base_attn_path = f"/compas-old/projects/sparse-attention/{model_name}-attn-bfp20-{task_name}/"
     inst_rlist = sorted(util.get_pts_under_dir(base_attn_path, postfix="npy", datatype="ridx", fname_filter="iiSeqInst"))
     inst_clist = sorted(util.get_pts_under_dir(base_attn_path, postfix="npy", datatype="cidx", fname_filter="iiSeqInst"))
@@ -1632,28 +1721,58 @@ def sweep_rr_swindow_get_tops(model_name, task_name, emulator):
         
         all_inst_dat[inst_id] = idx_dat
 
-    tccore_budget = 540
     # run the experiment
-    out_path = f"./res_fig/block_prune/spmm/{tccore_budget}/{model_name}-attn-bfp20-{task_name}"
     if not os.path.exists(out_path):
         os.makedirs(out_path)
 
-    # get hw shapes for spmm core
-    c_list = [4, 8, 12, 24, 36]
-    hw_shapes = []
-    prereq = lambda x1,x2: (x2 >= 8) and (x2 <= 32) and ((math.ceil(128./x1) >= 3*x2) or abs(math.ceil(128./x1) - 3*x2) < 20)
-    for c in c_list:
-        r_and_cl_pairs = find_positive_integer_pairs(int(tccore_budget // c), prereq)
-        hw_shape = [(r_and_cl[0], c, r_and_cl[1]) for r_and_cl in r_and_cl_pairs]
-        hw_shapes += hw_shape
-    print(hw_shapes)
+    if tccore_budget > 0.0:
+        if emulator is rr2spmm_wrap:
+            # get hw shapes for spmm core
+            c_list = [4, 8, 12, 24, 36]
+            hw_shapes = []
+            prereq = lambda x1,x2: (x2 >= 8) and (x2 <= 32) and ((math.ceil(128./x1) >= 3*x2) or abs(math.ceil(128./x1) - 3*x2) < 40)
+            for c in c_list:
+                r_and_cl_pairs = find_positive_integer_pairs(int(tccore_budget // c), prereq)
+                hw_shape = [(r_and_cl[0], c, r_and_cl[1]) for r_and_cl in r_and_cl_pairs]
+                hw_shapes += hw_shape
+            print(hw_shapes)
 
-    # get hw shapes for SIGMA core
-    # c_list = [4, 8, 16, 32]
-    # hw_shapes = [(c, int(math.floor(tccore_budget / (c+2)))) for c in c_list]
-    # print(hw_shapes)
+        if (emulator is naive_wrap) or (emulator is dense_wrap):
+            # get hw shapes for naive and baseline core
+            c_list = [4, 8, 12, 24, 36]
+            hw_shapes = []
+            prereq = lambda x1,x2: (x2 >= 8) and (x2 <= 32) and (128.0/x1 > 2)
+            for c in c_list:
+                r_and_cl_pairs = find_positive_integer_pairs(int(tccore_budget // c), prereq)
+                hw_shape = [(r_and_cl[0], c, r_and_cl[1]) for r_and_cl in r_and_cl_pairs]
+                hw_shapes += hw_shape
+            print(hw_shapes)
+        
+        if emulator is sigma_wrap:
+            # get hw shapes for SIGMA core
+            c_list = [4, 8, 16, 32]
+            hw_shapes = [(c, int(math.floor(tccore_budget / (c+2)))) for c in c_list]
+            print(hw_shapes)
 
-    args = [(all_inst_dat, seq_lens, i, out_path) for i in hw_shapes]
+        freqs = [300.0] * len(hw_shapes)
+    else:
+        ## or specify a shape
+        ## shapes for naive
+        # hw_shapes = [(3,4,8), (6,4,8), (9,4,8), (12,4,8), (15,4,8), (18,4,8), (21,4,8), 
+        #             (24,4,8), (27,4,8), (30,4,8), (36,4,8), (45,4,8), (54,4,8), (63,4,8), (36, 8, 8)]
+        # freqs = [320.0, 320.0, 320.0, 320.0, 300.0, 330.0, 310.0, 310.0, 300.0, 290.0, 290.0, 270.0, 230.0, 230.0, 190.0]
+        # shapes for baseline
+        hw_shapes = [(1,4,15), (3,4,15), (3,8,12), (3,12,13), (4,12,11), (2,24,13), (1,36,21),
+                     (2,24,18), (3,24,13), (2,36,15), (2,36,18), (2,36,23), (6,36,8), (7,36,8), (8,36,8)]
+        freqs = [370, 310, 310, 300, 300, 240, 250, 250, 260, 240, 220, 200, 150, 140, 140]
+        hw_shapes = [(2, 24, 13)]
+        freqs = [260]
+        folding_factor = [0] * len(freqs)
+        # hw_shapes = [(16, 70), (16, 60), (16, 54), (16, 44), (16, 36), (16, 30), (32, 10), (32, 6), (32, 2)]
+        # freqs = [100, 120, 150, 190, 220, 240, 210, 260, 330]
+        # folding_factor = [4, 4, 8, 8, 8, 8, 4, 4, 4]
+    
+    args = [(all_inst_dat, seq_lens, i, freq, ff, out_path) for i, ff, freq in zip(hw_shapes, folding_factor, freqs)]
     with multiprocessing.Pool(processes=5) as pool:
         pool.starmap(emulator, args)
 
@@ -1671,7 +1790,6 @@ def eval_emulator(dat: pd.DataFrame, models, tasks):
                 lat_dat[mname][taskname][inst] = sparse_lat_profile[inst]["avg_tops"]
 
     # get latency records of onchip res
-    
     dat["total_speedup"] = dat["onchip_total_tp"] / dat["onchip_comp_tp"]
     dat["comp_speedup"] = dat["onchip_comp_tp"] / dat["dense_tp"]
     # delete the "inst_id" column
@@ -1883,56 +2001,165 @@ def plot_thres_tops_score(onchip_res_list: dict[pd.DataFrame], scores_list: dict
     ax.grid(True, axis='x', linestyle='-', alpha=0.7)
     ax2.grid(False) 
 
-    output_filename = './res_fig/block_prune/thres_accu_tops_2d.pdf'
+    output_filename = './res_fig/block_prune/thres_accu_tops.pdf'
     plt.savefig(output_filename, bbox_inches='tight')
     plt.clf()
     plt.close(fig)
- 
+
+def plot_scaling(dat: pathlib.Path, designs: list[str]):
+    raw_dat = pd.read_csv(dat)
+    selected_dat = raw_dat[raw_dat["type"].isin(designs)]
+    selected_dat["TOPs per BRAM"] = selected_dat["avg. throughput"] / selected_dat["BRAM util"]
+    selected_dat["TOPs per Tensor Block"] = selected_dat["avg. throughput"] / selected_dat["tensor block util"]
+    selected_dat["TOPs per ALM"] = selected_dat["avg. throughput"] / selected_dat["ALM util"]
+
+    sns.set_theme()
+    fig = plt.figure(figsize=(7, 4.5))
+    ax = fig.subplots(1, 1)
+    sns.lineplot(data=selected_dat, x="tensor block util", y="avg. throughput", ax=ax, hue="type", marker="s")
+    ax.set_xlabel('#Tensor Blocks')
+    ax.set_ylabel('Average Throughput (TOPS)')
+    ax.set_xlim(xmin=0)
+    ax.set_ylim(ymin=0)
+    ax.legend().set_title(None)
+    plt.grid(True)
+    output_filename = './res_fig/block_prune/scaling_analysis_tops.pdf'
+    plt.savefig(output_filename, bbox_inches='tight')
+    plt.clf()
+    plt.close(fig)
+
+    sns.set_theme()
+    fig = plt.figure(figsize=(7, 4.5))
+    ax = fig.subplots(1, 1)
+    sns.lineplot(data=selected_dat, x="tensor block util", y="TOPs per BRAM", ax=ax, hue="type", marker="s")
+    ax.set_xlabel('#Tensor Blocks')
+    ax.set_ylabel('Average Throughput (TOPS) per M20K')
+    ax.set_xlim(xmin=0)
+    ax.set_ylim(ymin=0)
+    ax.legend().set_title(None)
+    plt.grid(True)
+    output_filename = './res_fig/block_prune/scaling_analysis_bram.pdf'
+    plt.savefig(output_filename, bbox_inches='tight')
+    plt.clf()
+    plt.close(fig)
+
+    sns.set_theme()
+    fig = plt.figure(figsize=(7, 4.5))
+    ax = fig.subplots(1, 1)
+    sns.lineplot(data=selected_dat, x="tensor block util", y="TOPs per Tensor Block", ax=ax, hue="type", marker="s")
+    ax.set_xlabel('#Tensor Blocks')
+    ax.set_ylabel('Average Throughput (TOPS) per Tensor Block')
+    ax.set_xlim(xmin=0)
+    ax.set_ylim(ymin=0)
+    ax.legend().set_title(None)
+    plt.grid(True)
+    output_filename = './res_fig/block_prune/scaling_analysis_tbs.pdf'
+    plt.savefig(output_filename, bbox_inches='tight')
+    plt.clf()
+    plt.close(fig)
+
+    sns.set_theme()
+    fig = plt.figure(figsize=(7, 4.5))
+    ax = fig.subplots(1, 1)
+    sns.lineplot(data=selected_dat, x="tensor block util", y="TOPs per ALM", ax=ax, hue="type", marker="s")
+    ax.set_xlabel('#Tensor Blocks')
+    ax.set_ylabel('Average Throughput (TOPS) per ALM')
+    ax.set_xlim(xmin=0)
+    ax.set_ylim(ymin=0)
+    ax.legend().set_title(None)
+    plt.grid(True)
+    output_filename = './res_fig/block_prune/scaling_analysis_alms.pdf'
+    plt.savefig(output_filename, bbox_inches='tight')
+    plt.clf()
+    plt.close(fig)
 
 if __name__ == "__main__":
-    # hardware config
-    # hw_shapes = get_tccore_config((range(9, 18, 1)), 864, 11*16)
-
-    # inst_idx = 4
     model_names = ["chatglm2-6b-32k", "llama2-7b-chat-4k", "mixtral-8x7b"]
     task_list = ["lcc", "multifieldqa_en", "multifieldqa_zh", "passage_retrieval_zh", "qasper", "samsum", "trec", "vcsum"]
-    model_names = ["chatglm2-6b-32k"]
-    task_list = ["lcc"]
+    # model_names = ["chatglm2-6b-32k"]
+    # task_list = ["lcc"]
     ## compute effective sparsity and save them to csv
     # compute_unique_colidx_ratio(task_list, model_names, swindow_list)
     ## processing onchip test results and save them to csv
+    # for prune_thres in ["1x", "2x", "3x", "4x"]:
+    #     onchip_df_res = get_onchip_res(
+    #         "/compas-old/projects/sparse-attention/micro25/onchip", 
+    #         model_names, task_list, 
+    #         spmm_freq=300.0, 
+    #         tc_core_shape=(6, 12, 8), 
+    #         threshold_postfix=prune_thres
+    #     )
+
+    ## processing onchip test results for 3x threshold for chatglm2, and 1x for the other two
     # onchip_df_res = get_onchip_res(
-    #     "/compas-old/projects/sparse-attention/micro25/onchip", 
-    #     # "/compas-old/projects/sparse-attention/onchip-5hbm", 
+    #     "/compas-old/projects/sparse-attention/onchip-5hbm", 
     #     model_names, task_list, 
-    #     spmm_freq=300.0, 
+    #     spmm_freq=270.0, 
     #     tc_core_shape=(6, 12, 8), 
-    #     threshold_postfix="4x"
+    #     threshold_postfix=""
     # )
-    ## processing onchip test for gemm and save them to csv
-    for mname, task in product(model_names, task_list):
-        ## design space explore for spmm
-        sweep_rr_swindow_get_tops(mname, task, rr2spmm_wrap)
-        ## design space explore for sigma
-        # sweep_rr_swindow_get_tops(mname, task, sigma_wrap)
-        ## design space explore for naive round robin
-        # sweep_rr_swindow_get_tops(mname, task, naive_wrap)
+
+    ## getting best config for different hw impl
+    # for mname, task in product(model_names, task_list):
+    #     # for tc_budget in [68, 204, 336, 540, 624, 720, 840, 960, 1080, 1248, 1440, 1800, 2160, 2520]:
+        # for tc_budget in [1260]:
+    #         # design space explore for spmm
+    #         sweep_rr_swindow_get_tops(mname, task, tc_budget, rr2spmm_wrap, 
+    #                               f"./res_fig/block_prune/spmm/{tc_budget}/{mname}-attn-bfp20-{task}")
+            # # design space explore for sigma
+            # sweep_rr_swindow_get_tops(mname, task, tc_budget, sigma_wrap, 
+            #                       f"./res_fig/block_prune/sigma/{tc_budget}/{mname}-attn-bfp20-{task}")
+    #         # design space explore for naive round robin
+    #         sweep_rr_swindow_get_tops(mname, task, tc_budget, naive_wrap, 
+    #                               f"./res_fig/block_prune/naive/{tc_budget}/{mname}-attn-bfp20-{task}")
+    #         # design space explore for gemm
+    #         sweep_rr_swindow_get_tops(mname, task, tc_budget, dense_wrap, 
+    #                               f"./res_fig/block_prune/dense/{tc_budget}/{mname}-attn-bfp20-{task}")
+
+    ## getting best config for different hw impl
+    # for mname, task in product(model_names, task_list):
+        # design space explore for spmm
+        # sweep_rr_swindow_get_tops(mname, task, 0.0, rr2spmm_wrap, 
+        #                           f"./res_fig/block_prune/spmm/{mname}-attn-bfp20-{task}")
+        # design space explore for sigma
+        # sweep_rr_swindow_get_tops(mname, task, 0.0, sigma_wrap, 
+        #                           f"./res_fig/block_prune/sigma/{mname}-attn-bfp20-{task}")
+        # design space explore for naive round robin
+        # sweep_rr_swindow_get_tops(mname, task, 0.0, naive_wrap, 
+        #                           f"./res_fig/block_prune/naive/{mname}-attn-bfp20-{task}")
+        # design space explore for gemm
+        # sweep_rr_swindow_get_tops(mname, task, 0.0, dense_wrap, 
+        #                           f"./res_fig/block_prune/dense/{mname}-attn-bfp20-{task}")
+
+    ## processing test for gemm and save them to csv
+    # gemm_path_list = [
+    #     pathlib.Path(f"/compas-old/projects/sparse-attention/onchip-5hbm/synth-gemm/seq_len_{i}")
+    #     for i in [32768]
+    # ]
     # get_gemm_onchip_res(
-    #     pathlib.Path("/compas-old/projects/sparse-attention/onchip-5hbm"),
+    #     pathlib.Path("/compas-old/projects/sparse-attention/onchip-5hbm/synth-gemm"),
     #     model_names,
     #     task_list,
     #     300
     # )
+    # get_gemm_emulated_res(
+    #     gemm_path_list, 
+    #     (6, 12, 8), 300, 
+    #     pathlib.Path(f"/compas-old/projects/sparse-attention/onchip-5hbm/synth-gemm/emulated_res_gemms_300mhz.csv")
+    # )
 
     ## read processed onchip results
-    # onchip_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/onchip_res_300mhz.csv.old")
+    # onchip_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/onchip_res_270mhz.csv")
     # gemm_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/onchip_res_gemms_300mhz.csv")
+    # gemm_emulated_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/synth-gemm/emulated_res_gemms_300mhz.csv")
     ## read effective sparsity data
     # density_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/spars-analysis-onchip-related.csv")
 
+    # print(gemm_emulated_df_res)
     ## plotting figures
     # plot_onchip_res(onchip_df_res)
-    # plot_stacked_selfattn_ops_latency(gemm_df_res, None)
+    # plot_stacked_selfattn_ops_latency(gemm_df_res, out_fig_path=pathlib.Path("./res_fig/dense_lat_ops_seqlen.pdf"))
+    # plot_stacked_selfattn_ops_latency(gemm_emulated_df_res, out_fig_path=pathlib.Path("./res_fig/dense_lat_ops_seqlen_emulated.pdf"))
     # eval_emulator(onchip_df_res, model_names, task_list)
     # plot_unique_colidx_ratio_boxplot_by_task(density_df_res)
     # plot_route_ratio_by_task(density_df_res)
@@ -1941,15 +2168,17 @@ if __name__ == "__main__":
     # plot_speedup_vs_sparsity(onchip_df_res, density_df_res)
     # plot_roofline(onchip_df_res, density_df_res, {"r": 6, "c": 12, "l": 8, "freq": 300})
 
-    ## read onchip results for different thresholds
-    # onchip_df_res_list = {}
-    # for i in ["1x", "2x", "3x", "4x"]:
-    #     onchip_df_res_list[i] = pd.read_csv(f"/compas-old/projects/sparse-attention/micro25/onchip/onchip_res_t{i}_300mhz.csv")
-    ## read longbench scores
-    # with pathlib.Path("./res_fig/block_prune/formatted_data_longbench.json").open("r") as f:
-    #     prune_score_eval_res = json.load(f)
-    ## plot speedup vs score
-    # plot_thres_tops_score(onchip_df_res_list, prune_score_eval_res)
+    # # read onchip results for different thresholds
+    onchip_df_res_list = {}
+    for i in ["1x", "2x", "3x", "4x"]:
+        onchip_df_res_list[i] = pd.read_csv(f"/compas-old/projects/sparse-attention/micro25/onchip/onchip_res_t{i}_300mhz.csv")
+    # # read longbench scores
+    with pathlib.Path("./res_fig/block_prune/formatted_data_longbench.json").open("r") as f:
+        prune_score_eval_res = json.load(f)
+    # # plot speedup vs score
+    plot_thres_tops_score(onchip_df_res_list, prune_score_eval_res)
+    ## plot scaling results
+    # plot_scaling(pathlib.Path("./res_fig/block_prune/scaling_test.csv"), ["Ours", "SIGMA", "Naive", "Dense"])
     
     # attn_path_chatglm = inst_list[0] + ".pt"
     # src_attn = torch.load(attn_path_chatglm).numpy()
@@ -1980,6 +2209,6 @@ if __name__ == "__main__":
     # profile_list.append("res_fig/block_prune/spmm_worr_lat_diff.json")
     # plot_rr_spmm_lat(profile_list, 28, 32, 
     #                  f"res_fig/block_prune/spmm_rr_lat_profile_r{nrows}_c{ncols}_l{chain_len}.json")
-
+ 
     exit()
     

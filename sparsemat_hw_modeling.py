@@ -1459,16 +1459,17 @@ def rr2spmm_fifo_latency_overlap_analysis(
         tc_core_shape: tuple[int, int, int] = (4, 12, 12),
         fifo_depth: int = 400,
         out_buff_depth: int = 0,
-        out_json_basepath: str = ""):
+        spmm_freq: float = 300.0,
+        rremover_freq: float = 300.0,
+        out_json_basepath: str = "",
+        workload_type: str = "aV"):
     '''
     check if the spmm operation can overlap with redundancy removal based on the 
-    block pruned sparse attention
+    block pruned sparse matmul (default op is aV)
     '''
-    spmm_freq, rremover_freq = 300.0, 300.0
     spmm_cycle_delay, rremover_cycle_delay = 1./spmm_freq * 1000., 1./rremover_freq * 1000.
     tc_row, tc_col, tc_chain_len = tc_core_shape
     transpose_ram_fold_factor = 2
-    matB_rotate_delay = ceil(log2(ceil(128/tc_core_shape[0])/transpose_ram_fold_factor)) + 2
 
     res = {}
     for k in inst_list.keys():
@@ -1485,7 +1486,13 @@ def rr2spmm_fifo_latency_overlap_analysis(
             "tbc_load_lat": [],
         }
         l = seqlen_list[k]
-        total_ops = l * l * 2 * 128
+
+        workload_shape = {"q": (l, 4096, 4096), "kv": (l, 4096, 128), "qkT": (l, 128, l), "aV": (l, l, 128)}
+        total_ops = workload_shape[workload_type][0] * \
+                       workload_shape[workload_type][1] * \
+                       workload_shape[workload_type][2] * 2
+        matB_rotate_delay = \
+            ceil(log2(ceil(workload_shape[workload_type][2]/tc_core_shape[0])/transpose_ram_fold_factor)) + 2
         
         for curr_head in tqdm(i, unit="head"):
             #split block ids into many row groups
@@ -1503,13 +1510,13 @@ def rr2spmm_fifo_latency_overlap_analysis(
                 if row_grps_for_spmm:
                     for spmm_row_grp in row_grps_for_spmm:
                         curr_cols_loading_iters = ceil(float(spmm_row_grp.shape[0]) / tc_chain_len)
-                        tbc_total_compute_cycles += ceil(128.0 / tc_row) * curr_cols_loading_iters
+                        tbc_total_compute_cycles += ceil(workload_shape[workload_type][2] / tc_row) * curr_cols_loading_iters
                         tbc_total_load_cycles += (tc_chain_len) * 3 * curr_cols_loading_iters
                         if curr_cols_loading_iters > 1:
-                            spmm_latency += max((tc_chain_len) * 3, ceil(128.0 / tc_row)) \
+                            spmm_latency += max((tc_chain_len) * 3, ceil(workload_shape[workload_type][2] / tc_row)) \
                                                 * curr_cols_loading_iters
                         else:
-                            spmm_latency += (ceil(128.0 / tc_row) + matB_rotate_delay) * curr_cols_loading_iters
+                            spmm_latency += (ceil(workload_shape[workload_type][2] / tc_row) + matB_rotate_delay) * curr_cols_loading_iters
 
 
                 # compute index generation latency
@@ -1543,11 +1550,12 @@ def rr2spmm_fifo_latency_overlap_analysis(
             perhead_latdiff_rec["tbc_compute_lat"].append(tbc_total_compute_cycles * spmm_cycle_delay)
             perhead_latdiff_rec["tbc_load_lat"].append(tbc_total_load_cycles * spmm_cycle_delay)
             # compute output size
-            out_size = l * 128
+            out_size = workload_shape[workload_type][0] * workload_shape[workload_type][2]
             effective_out_size = out_size - tc_row * tc_col * out_buff_depth
             out_size *= (24 / 8)
             effective_out_size *= (24 / 8)
-            out_bfp12_comprate = (128.0 / 20*(88+12)) / (128.0*(24+12))
+            out_bfp12_comprate = \
+                (workload_shape[workload_type][2] / 20*(88+12)) / (workload_shape[workload_type][2] * (24+12))
             # compute output bd
             out_bd_req = out_size / (float(spmm_lat_cycles) * 1.0 / (spmm_freq * 1e6)) / 1e9
             out_bd_wbuff_req = effective_out_size / (float(spmm_lat_cycles) * 1.0 / (spmm_freq * 1e6)) / 1e9
@@ -1559,10 +1567,14 @@ def rr2spmm_fifo_latency_overlap_analysis(
             perhead_latdiff_rec["total_tops"].append(spmm_rr_actual_flops)
 
         # get dense res
-        fake_dense_data = np.ones((l, l))
-        fake_dense_data = np.tril(fake_dense_data)
-        dense_model = hw_modeling.StratixDpuModel(l, l, l, 128, exp_dat=fake_dense_data, 
-                                                  freq=300.0, num_tcs=tc_col * tc_row * (tc_chain_len + 2), 
+        fake_dense_data = np.ones((workload_shape[workload_type][0], workload_shape[workload_type][1]))
+        # fake_dense_data = np.tril(fake_dense_data)
+        dense_model = hw_modeling.StratixDpuModel(workload_shape[workload_type][0], 
+                                                  workload_shape[workload_type][1], 
+                                                  workload_shape[workload_type][1], 
+                                                  workload_shape[workload_type][2], 
+                                                  exp_dat=fake_dense_data, 
+                                                  freq=spmm_freq, num_tcs=tc_col * tc_row * (tc_chain_len + 2), 
                                                   tcc_array_shape=(tc_row, tc_col), tcc_chainlen=tc_chain_len)
         dense_model.set_tccore_size(TCCORE_SIZE)
         dense_flops, dense_lat, dense_util = \
@@ -1575,6 +1587,7 @@ def rr2spmm_fifo_latency_overlap_analysis(
 
         res[k] = perhead_latdiff_rec
         res[k]["avg_tops"] = np.mean(perhead_latdiff_rec["total_tops"])
+        res[k]["avg_total_lat"] = np.mean(perhead_latdiff_rec["total_lat"])
         res[k]["dense_avg_tops"] = dense_res.avg_data("flops")
         res[k]["max_out_bd_req"] = np.amax(perhead_latdiff_rec["out_bd_req"])
         res[k]["max_out_bd_wbuffer_req"] = np.amax(perhead_latdiff_rec["out_bd_wbuffer_req"])
@@ -1582,22 +1595,27 @@ def rr2spmm_fifo_latency_overlap_analysis(
         res[k]["avg_tbc_load_lat"] = np.mean(perhead_latdiff_rec["tbc_load_lat"])
         res[k]["avg_tbc_compute_lat"] = np.mean(perhead_latdiff_rec["tbc_compute_lat"])
 
-        fpath = f"{out_json_basepath}/spmm_rr_lat_diff_wfifo_{fifo_depth}_r{tc_row}_c{tc_col}_cl{tc_chain_len}.json"
-        if exists(fpath):
-            with open(fpath, 'r') as file:
-                try:
-                    existing_data = json.load(file)
-                    if not isinstance(existing_data, dict):
-                        raise ValueError("The file does not contain a valid JSON object.")
-                except json.JSONDecodeError:
-                    existing_data = {}
-            
-            existing_data.update(res)
+        if out_json_basepath == "":
+            pass
         else:
-            existing_data = res
+            fpath = f"{out_json_basepath}/spmm_rr_lat_diff_wfifo_{fifo_depth}_r{tc_row}_c{tc_col}_cl{tc_chain_len}.json"
+            if exists(fpath):
+                with open(fpath, 'r') as file:
+                    try:
+                        existing_data = json.load(file)
+                        if not isinstance(existing_data, dict):
+                            raise ValueError("The file does not contain a valid JSON object.")
+                    except json.JSONDecodeError:
+                        existing_data = {}
+                
+                existing_data.update(res)
+            else:
+                existing_data = res
 
-        with open(fpath, 'w') as file:
-            json.dump(existing_data, file, indent=2)
+            with open(fpath, 'w') as file:
+                json.dump(existing_data, file, indent=2)
+
+    return res
 
 def naive_roundrobin_latency_analysis(
         inst_list: dict, 
@@ -1648,14 +1666,19 @@ def naive_roundrobin_latency_analysis(
                         all_row_idx = all_row_idx[1:]
                         row_counts = row_counts[1:]
                         # get all blocks for this row
-                        curr_assigned_blks[col_idx].append(curr_head[0:curr_assigned_row_blk_counts])
+                        blks = curr_head[0:curr_assigned_row_blk_counts]
+                        curr_assigned_blks[col_idx].append(curr_assigned_row_blk_counts)
+                        curr_head = curr_head[curr_assigned_row_blk_counts:]
+                        # forcely check if assigned blks are having the same row idx as curr_assigned_row_idx
+                        if not all([blk[0] == curr_assigned_row_idx for blk in blks]):
+                            raise ValueError("Assigned blocks do not match the expected row index.")
                     else:
                         break
                 ## step 2 count cycles for each iteration
                 for col_idx in range(tc_col):
                     if len(curr_assigned_blks[col_idx]) > 0:
                         # for each column, count how many mat b loading iterations are needed
-                        col_n_iters = ceil(float(len(curr_assigned_blks[col_idx])) / float(tc_chain_len))
+                        col_n_iters = sum([ceil(b / float(tc_chain_len)) for b in curr_assigned_blks[col_idx]])
                         col_lat = col_n_iters * compute_lat
                         curr_col_grp_lat += col_lat
 
@@ -1690,6 +1713,7 @@ def sigma_latency_analysis(
         seqlen_list: dict, 
         dpu_shape: tuple[int, int] = (16, 32),
         n_matb_cols: int = 128,
+        transpose_folding_factor: int = 2, 
         spmm_freq: float = 300.0,
         out_json_basepath: str = ""):
     '''
@@ -1754,7 +1778,8 @@ def sigma_latency_analysis(
             ## step 2 evaluate latency of each iteration
             ## for each step in dpe, collect col idx of the blocks to identify 
             ## number of iterations for mat be transfer (compute latency)
-            perhead_latency = max(benes_delay, 3*n_pes) # initial latency of the first PE
+            mat_b_transpose_latency = n_pes * transpose_folding_factor # initial latency of first mat b transpose
+            perhead_latency = max(benes_delay, 3*n_pes, mat_b_transpose_latency) # initial latency of the first PE
             n_mat_a_load_iters = max([len(dpe_blks) for dpe_blks in dpe_scheduled_blks])
             for mat_a_load_iter_id in range(n_mat_a_load_iters):
                 # for each iteration, figure out how many iterations of mat B loading is needed 
@@ -1765,7 +1790,7 @@ def sigma_latency_analysis(
                 required_col_idx = np.unique(required_col_idx)
                 n_mat_b_load_iters = ceil(float(len(required_col_idx)) / float(n_pes))
                 # each mat B loading iteration takes 3*n_pes cycles
-                perhead_latency += max(benes_delay, 3*n_pes, compute_delay * n_mat_b_load_iters)
+                perhead_latency += max(benes_delay, 3*n_pes, mat_b_transpose_latency, compute_delay * n_mat_b_load_iters)
 
             perhead_latency += n_pes # add final accumulator delay
 
