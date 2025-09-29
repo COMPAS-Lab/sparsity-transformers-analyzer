@@ -106,3 +106,14 @@ def get_max_tp_for_configs(fpath: Path):
                 curr_max_tp_config = config.name
 
     return curr_max_tp, curr_max_tp_config
+
+def get_avg_tops_from_emulated_res_across_all_tasks(
+        base_res_path: Path, model_lists: list[str], task_lists: list[str], fname: str):
+
+    all_avg_tops = []
+    for model, task in zip(model_lists, task_lists):
+        fpath = base_res_path / f"{model}-attn-bfp20-{task}" / fname
+        avg_tops = get_avg_tops_from_emulated_res(fpath)
+        all_avg_tops.append(avg_tops)
+
+    return statistics.mean(all_avg_tops) if all_avg_tops else 0.0

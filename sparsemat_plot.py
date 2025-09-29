@@ -487,7 +487,7 @@ def plot_unique_colidx_ratio_boxplot_by_task(records: pd.DataFrame):
     global MODEL_PALETTE
 
     # boxplot with errorbars 
-    sns.set(rc={'figure.figsize': (21, 6)}, font_scale=1.3)
+    sns.set(rc={'figure.figsize': (10, 6)}, font_scale=1.3)
     sns.set_style("whitegrid", {'grid.linestyle': '--'})
     fig, axes = plt.subplots(2, 1)
     plt.subplots_adjust(hspace=0.2)
@@ -500,7 +500,8 @@ def plot_unique_colidx_ratio_boxplot_by_task(records: pd.DataFrame):
         legend=True,
         palette={k:v[1] for k, v in zip(MODEL_PALETTE.keys(), MODEL_PALETTE.values())},
         gap=.1,
-        flierprops={"alpha": 0.5},
+        width=0.9,
+        flierprops={"alpha": 0.3},
         whis=[1,99], 
         ax=axes[0]
     )
@@ -519,7 +520,7 @@ def plot_unique_colidx_ratio_boxplot_by_task(records: pd.DataFrame):
         err_kws={'linewidth': 5},
         ax=errorbar_ax,
         legend=False,
-        dodge=0.53,
+        dodge=0.6,
         linestyle="none",
         palette={k:v[0] for k, v in zip(MODEL_PALETTE.keys(), MODEL_PALETTE.values())},
     )
@@ -540,6 +541,7 @@ def plot_unique_colidx_ratio_boxplot_by_task(records: pd.DataFrame):
         hue = "model",
         legend=False,
         palette={k:v[1] for k, v in zip(MODEL_PALETTE.keys(), MODEL_PALETTE.values())},
+        width=0.9,
         gap=.1,
         flierprops={"alpha": 0.5},
         whis=[1,99], 
@@ -556,7 +558,7 @@ def plot_unique_colidx_ratio_boxplot_by_task(records: pd.DataFrame):
         err_kws={'linewidth': 5},
         ax=errorbar_ax,
         legend=False,
-        dodge=0.53,
+        dodge=0.6,
         linestyle="none",
         palette={k:v[0] for k, v in zip(MODEL_PALETTE.keys(), MODEL_PALETTE.values())},
     )
@@ -566,7 +568,12 @@ def plot_unique_colidx_ratio_boxplot_by_task(records: pd.DataFrame):
     axes[1].set_xlabel("Tasks")
     errorbar_ax.set_xticklabels([])
     errorbar_ax.set_xlabel("")
-    errorbar_ax.tick_params(top=False) 
+    errorbar_ax.tick_params(top=False, bottom=False)
+    labels = [label.get_text() for label in axes[1].get_xticklabels()]
+    original_ticks = axes[1].get_xticks()
+    axes[1].set_xticklabels(labels, rotation=30, ha='right')
+    axes[1].set_xticks([ox + 0.2 for ox in original_ticks])
+    axes[1].tick_params(top=False, bottom=False)
     sns.move_legend(axes[0], "upper center", ncol=3, bbox_to_anchor=(0.5, 1.25))
     plt.savefig(f"./res_fig/block_prune/effective_sparsity_boxplot.png", bbox_inches='tight')
 
@@ -1376,17 +1383,19 @@ def plot_onchip_res(dat: pd.DataFrame):
 
     # plot normalized speed up
     # set the plot size to be 16,  6 for seaborn barplot
-    sns.set(rc={'figure.figsize':(18, 4.5)}, font_scale=1.3)
+    sns.set(rc={'figure.figsize':(8, 4.5)}, font_scale=1.3)
     fig, axes = plt.subplots(1, 1)
     curr_model_palette = {k:MODEL_PALETTE[k][0] for k in MODEL_PALETTE.keys()}
-    sns.barplot(dat_mean, x="task", y="comp_speedup", hue="model", width=0.4, 
+    sns.barplot(dat_mean, x="task", y="comp_speedup", hue="model", width=0.65, 
                         palette=curr_model_palette, ax=axes)    
     labels = [label.get_text() for label in axes.get_xticklabels()]
-    axes.set_xticklabels(labels, rotation=10)
-    axes.set_ylabel("Average normalized throughput\n of heads")
+    original_ticks = axes.get_xticks()
+    axes.set_xticklabels(labels, rotation=30, ha='right')
+    axes.set_xticks([ox + 0.2 for ox in original_ticks])
+    axes.set_ylabel("Average normalized\n throughput of heads")
     axes.set_xlabel("Tasks")
     axes.set_ylim(ymin=0, ymax=5.5)
-    axes.legend(loc="upper center", ncol=3)
+    axes.legend(loc="upper center", ncol=3, bbox_to_anchor=(0.5, 1.15))
     fig.savefig("./res_fig/block_prune/onchip_res_total_speedup.pdf", bbox_inches='tight')
     fig.clf()
 
@@ -1402,24 +1411,6 @@ def plot_onchip_res(dat: pd.DataFrame):
     axes.legend(title=None)
     sns.move_legend(axes, "upper center", ncol=3, bbox_to_anchor=(0.5, 1.09))
     fig.savefig("./res_fig/block_prune/onchip_res_total_speedup_vertical.pdf", bbox_inches='tight')
-    fig.clf()
-
-    # plot speedup vs seq len
-    sns.set(rc={'figure.figsize':(15, 15)}, font_scale=3.5)
-    fig, axes = plt.subplots(1, 1)
-
-    sns.scatterplot(dat_inst_mean, x="seq_len", y="comp_speedup",
-                    s=300, alpha=0.8, hue="model", style="model", 
-                    palette=curr_model_palette, ax=axes, legend=True)
-        
-    axes.set_ylabel("Average normalized throughput\n per instance")
-    axes.set_xlabel("Context length")
-    axes.set_ylim(ymin=-0.1, ymax=5.5)
-    axes.set_xlim(xmin=-0.1)
-    axes.legend(title=None)
-    sns.move_legend(axes, "upper center", ncol=3, bbox_to_anchor=(0.5, 1.15))
-
-    fig.savefig("./res_fig/block_prune/onchip_res_speedup_vs_seqlen.pdf", bbox_inches='tight')
     fig.clf()
 
     # calculate onchip and offchip bandwidth
@@ -1558,6 +1549,25 @@ def plot_speedup_vs_sparsity(hw_perf_df: pd.DataFrame, density_df: pd.DataFrame)
     axes.set_xlim(xmin=-0.01, xmax=1)
 
     fig.savefig("./res_fig/block_prune/speedup_vs_sparsity.pdf", dpi=1200, bbox_inches='tight')
+    fig.clf()
+
+    # plot speedup vs seq len
+    dat_inst_mean = hw_perf_df.groupby(["model", "task", "inst_id"]).mean()
+    sns.set(rc={'figure.figsize':(15, 15)}, font_scale=3.5)
+    fig, axes = plt.subplots(1, 1)
+
+    sns.scatterplot(dat_inst_mean, x="seq_len", y="comp_speedup",
+                    s=300, alpha=0.8, hue="model", style="model", 
+                    palette=curr_model_palette, ax=axes, legend=True)
+        
+    axes.set_ylabel("Average normalized throughput\n per instance")
+    axes.set_xlabel("Context length")
+    axes.set_ylim(ymin=-0.1, ymax=5.5)
+    axes.set_xlim(xmin=-0.1)
+    axes.legend(title=None)
+    sns.move_legend(axes, "upper center", ncol=3, bbox_to_anchor=(0.5, 1.15))
+
+    fig.savefig("./res_fig/block_prune/onchip_res_speedup_vs_seqlen.pdf", bbox_inches='tight')
     fig.clf()
 
     sns.set(rc={'figure.figsize':(15, 15)}, font_scale=3.4)
@@ -1757,6 +1767,7 @@ def sweep_rr_swindow_get_tops(model_name, task_name, tccore_budget, emulator, ou
             print(hw_shapes)
 
         freqs = [300.0] * len(hw_shapes)
+        folding_factor = [2] * len(hw_shapes)
     else:
         ## or specify a shape
         if emulator is naive_wrap:
@@ -1770,8 +1781,12 @@ def sweep_rr_swindow_get_tops(model_name, task_name, tccore_budget, emulator, ou
             # shapes for baseline
             hw_shapes = [(1,4,15), (3,4,15), (3,8,12), (3,12,13), (4,12,11), (2,24,13), (1,36,21),
                         (2,24,18), (3,24,13), (2,36,15), (2,36,18), (2,36,23), (6,36,8), (7,36,8), (8,36,8)]
-            freqs = [370, 310, 310, 300, 300, 240, 250, 250, 260, 240, 220, 200, 150, 140, 140]
+            freqs = [370, 320, 310, 300, 300, 260, 250, 250, 230, 240, 220, 200, 150, 140, 120]
             folding_factor = [2] * len(hw_shapes)
+            # this config is for sigma validation
+            # hw_shapes = [(4, 4, 15)]
+            # freqs = [300]
+            # folding_factor = [1]
 
         if emulator is rr2spmm_wrap:
             # shapes for spmm
@@ -1785,6 +1800,10 @@ def sweep_rr_swindow_get_tops(model_name, task_name, tccore_budget, emulator, ou
             hw_shapes = [(16, 70), (16, 60), (16, 54), (16, 44), (16, 36), (16, 30), (32, 10), (32, 6), (32, 2)]
             freqs = [100, 120, 150, 190, 220, 240, 210, 260, 330]
             folding_factor = [4, 4, 8, 8, 8, 8, 4, 4, 4]
+            # this config is for sigma validation
+            # hw_shapes = [(32, 8)]
+            # freqs = [300]
+            # folding_factor = [1]
     
     args = [(all_inst_dat, seq_lens, i, freq, ff, out_path) for i, ff, freq in zip(hw_shapes, folding_factor, freqs)]
     with multiprocessing.Pool(processes=7) as pool:
@@ -2033,223 +2052,68 @@ def plot_scaling(dat: pathlib.Path, designs: list[str]):
 
         return hue_colors.get(label_name, None)
 
-    raw_dat = pd.read_csv(dat / "scaling_test.csv")
-    raw_dat_freqonly = pd.read_csv(dat / "scaling_test_freqonly.csv")
+    raw_dat = pd.read_csv(dat / "scaling_test_all.csv")
+    raw_dat_freqonly = pd.read_csv(dat / "scaling_test_all.csv")
     selected_dat = raw_dat[raw_dat["type"].isin(designs)]
     selected_dat_freqonly = raw_dat_freqonly[raw_dat_freqonly["type"].isin(designs)]
-    # selected_dat["TOPs per BRAM"] = selected_dat["avg. throughput"] / selected_dat["BRAM util"]
-    # selected_dat["TOPs per Tensor Block"] = selected_dat["avg. throughput"] / selected_dat["tensor block util"]
-    # selected_dat["TOPs per ALM"] = selected_dat["avg. throughput"] / selected_dat["ALM util"]
-    # selected_dat["n_cores_by_tensor_block"] = NX10_RESOURCES["tensor block"] // selected_dat["tensor block util"]
-    # selected_dat["n_cores_by_ALM"] = NX10_RESOURCES["alm"] // selected_dat["ALM util"]
-    # selected_dat["n_cores_by_BRAM"] = NX10_RESOURCES["m20k"] // selected_dat["BRAM util"]
-    # selected_dat["tensor_block_util"] = selected_dat["tensor block util"] / NX10_RESOURCES["tensor block"]
-    # selected_dat["alm_util"] = selected_dat["ALM util"] / NX10_RESOURCES["alm"]
-    # selected_dat["bram_util"] = selected_dat["BRAM util"] / NX10_RESOURCES["m20k"] 
-    # selected_dat["max_utilized_res"] = selected_dat[["tensor_block_util", "alm_util", "bram_util"]].max(axis=1)
-    # selected_dat["min_cores"] = selected_dat[["n_cores_by_tensor_block", "n_cores_by_ALM", "n_cores_by_BRAM"]].min(axis=1)
-    # selected_dat["tops_on_min_cores"] = selected_dat["avg. throughput"] * selected_dat["min_cores"]
-    # selected_dat["bram_per_tblk"] = selected_dat["BRAM util"] / selected_dat["tensor block util"]
 
-    print(selected_dat.to_markdown())
     # find out failing pnr points
     failed_pnr_points = selected_dat[selected_dat["pass P\&R"] == False]
-    
-    sns.set_theme()
-    fig = plt.figure(figsize=(9, 4.5))
-    ax = fig.subplots(1, 2)
-    sns.lineplot(data=selected_dat, x="tensor block util", y="avg. throughput", ax=ax[0], hue="type", marker="s", alpha=0.8)
-    # mark failed pnr points
-    x_coord, y_coord = [], []
-    for fail_idx, fail_row in failed_pnr_points.iterrows():
-        x_coord += [fail_row["tensor block util"]]
-        y_coord += [fail_row["avg. throughput"]]
+    succeeded_pnr_points = selected_dat[selected_dat["pass P\&R"] == True]
+    failed_pnr_points_freqonly = selected_dat_freqonly[selected_dat_freqonly["pass P\&R"] == False]
+    succeeded_pnr_points_freqonly = selected_dat_freqonly[selected_dat_freqonly["pass P\&R"] == True]
 
-    color = get_existing_color_by_label_name(ax[0], fail_row["type"])
-    ax[0].plot(x_coord, y_coord, marker='X', linestyle='None', color=color, alpha=0.8,
-             markeredgewidth=0, markersize=10, zorder=10, label='Designs failed to route', clip_on=False)
+    type_palette = palette_dict = \
+        {type_name: f"C{idx+4}" for idx, type_name in enumerate(succeeded_pnr_points["type"].unique().tolist())}
+
+    sns.set_theme()
+    sns.set(font_scale=1.3)
+    fig = plt.figure(figsize=(10, 6.5))
+    plt.subplots_adjust(wspace=0.25)
+    ax = fig.subplots(1, 2)
+    markersize = 9.5
+    sns.lineplot(data=succeeded_pnr_points, x="tensor block util", y="avg. throughput all", 
+                 ax=ax[0], hue="type", marker="s", alpha=0.8, palette=type_palette, markersize=markersize)
+    # mark failed pnr points for different designs
+    for d in designs:
+        failed_pnr_points_d = failed_pnr_points[failed_pnr_points["type"] == d]
+        if not failed_pnr_points_d.empty:
+            x_coord, y_coord = [], []
+            x_coord += [succeeded_pnr_points[succeeded_pnr_points["type"] == d].iloc[0]["tensor block util"]]
+            y_coord += [succeeded_pnr_points[succeeded_pnr_points["type"] == d].iloc[0]["avg. throughput all"]]
+            x_coord += [failed_pnr_points_d.iloc[-1]["tensor block util"]]
+            y_coord += [failed_pnr_points_d.iloc[-1]["avg. throughput all"]]
+
+            color = get_existing_color_by_label_name(ax[0], d)
+            ax[0].plot(x_coord, y_coord, marker='None', linestyle='--', color=color, alpha=0.8,
+                    markeredgewidth=0, markersize=markersize+3, zorder=10, clip_on=False)
+            ax[0].plot(x_coord[-1:], y_coord[-1:], marker='X', linestyle='None', color=color, alpha=0.8,
+                    markeredgewidth=0, markersize=markersize+3, zorder=10, label='Designs failed to route', clip_on=False)
+        
     ax[0].set_xlabel('#Tensor Blocks')
     ax[0].set_ylabel('Average Throughput (TOPS)')
     ax[0].set_xlim(xmin=0)
     ax[0].set_ylim(ymin=0)
     plt.grid(True)
 
-    # sns.set_theme()
-    # fig = plt.figure(figsize=(7, 4.5))
-    # ax = fig.subplots(1, 1)
-    # sns.lineplot(data=selected_dat, x="tensor block util", y="TOPs per BRAM", ax=ax, hue="type", marker="s")
-    # ax.set_xlabel('#Tensor Blocks')
-    # ax.set_ylabel('Average Throughput (TOPS) per M20K')
-    # ax.set_xlim(xmin=0)
-    # ax.set_ylim(ymin=0)
-    # ax.legend().set_title(None)
-    # plt.grid(True)
-    # output_filename = base_out_path / 'scaling_analysis_bram.pdf'
-    # plt.savefig(output_filename, bbox_inches='tight')
-    # plt.clf()
-    # plt.close(fig)
+    sns.lineplot(data=succeeded_pnr_points_freqonly, x="tensor block util", y="freq", 
+                 ax=ax[1], hue="type", marker="s", alpha=0.8, palette=type_palette, markersize=markersize)
+    # mark failed pnr points for different designs
+    for d in designs:
+        failed_pnr_points_d = failed_pnr_points_freqonly[failed_pnr_points_freqonly["type"] == d]
+        if not failed_pnr_points_d.empty:
+            x_coord, y_coord = [], []
+            x_coord += [succeeded_pnr_points_freqonly[succeeded_pnr_points_freqonly["type"] == d].iloc[0]["tensor block util"]]
+            y_coord += [succeeded_pnr_points_freqonly[succeeded_pnr_points_freqonly["type"] == d].iloc[0]["freq"]]
+            x_coord += [failed_pnr_points_d.iloc[-1]["tensor block util"]]
+            y_coord += [failed_pnr_points_d.iloc[-1]["freq"]]
 
-    # sns.set_theme()
-    # fig = plt.figure(figsize=(7, 4.5))
-    # ax = fig.subplots(1, 1)
-    # sns.lineplot(data=selected_dat, x="tensor block util", y="TOPs per Tensor Block", ax=ax, hue="type", marker="s")
-    # ax.set_xlabel('#Tensor Blocks')
-    # ax.set_ylabel('Average Throughput (TOPS) per Tensor Block')
-    # ax.set_xlim(xmin=0)
-    # ax.set_ylim(ymin=0)
-    # ax.legend().set_title(None)
-    # plt.grid(True)
-    # output_filename = base_out_path / 'scaling_analysis_tbs.pdf'
-    # plt.savefig(output_filename, bbox_inches='tight')
-    # plt.clf()
-    # plt.close(fig)
-
-    # sns.set_theme()
-    # fig = plt.figure(figsize=(7, 4.5))
-    # ax = fig.subplots(1, 1)
-    # sns.lineplot(data=selected_dat, x="tensor block util", y="TOPs per ALM", ax=ax, hue="type", marker="s")
-    # ax.set_xlabel('#Tensor Blocks')
-    # ax.set_ylabel('Average Throughput (TOPS) per ALM')
-    # ax.set_xlim(xmin=0)
-    # ax.set_ylim(ymin=0)
-    # ax.legend().set_title(None)
-    # plt.grid(True)
-    # output_filename = base_out_path / 'scaling_analysis_alms.pdf'
-    # plt.savefig(output_filename, bbox_inches='tight')
-    # plt.clf()
-    # plt.close(fig)
-
-    # sns.set_theme()
-    # fig = plt.figure(figsize=(7, 4.5))
-    # ax = fig.subplots(1, 1)
-    # sns.lineplot(data=selected_dat, x="tensor block util", y="tops_on_min_cores", ax=ax, hue="type", marker="s")
-    # ax.set_xlabel('#Tensor Blocks')
-    # ax.set_ylabel('Ideal Many-core Throughput (TOPS)')
-    # ax.set_xlim(xmin=0)
-    # ax.set_ylim(ymin=0)
-    # ax.legend().set_title(None)
-    # plt.grid(True)
-    # output_filename = base_out_path / 'scaling_analysis_many_cores.pdf'
-    # plt.savefig(output_filename, bbox_inches='tight')
-    # plt.clf()
-    # plt.close(fig)
-
-    # sns.set_theme()
-    # fig = plt.figure(figsize=(7, 4.5))
-    # ax = fig.subplots(1, 1)
-    # sns.lineplot(data=selected_dat, x="min_cores", y="tops_on_min_cores", ax=ax, hue="type", marker="s")
-    # ax.set_xlabel('#Cores')
-    # ax.set_ylabel('Ideal Many-core Throughput (TOPS)')
-    # ax.set_xlim(xmin=0)
-    # ax.set_ylim(ymin=0)
-    # ax.legend().set_title(None)
-    # plt.grid(True)
-    # output_filename = base_out_path / 'scaling_analysis_many_cores_eff.pdf'
-    # plt.savefig(output_filename, bbox_inches='tight')
-    # plt.clf()
-    # plt.close(fig)
-
-    # sns.set_theme()
-    # fig = plt.figure(figsize=(7, 4.5))
-    # ax = fig.subplots(1, 1)
-    # sns.lineplot(data=selected_dat, x="max_utilized_res", y="avg. throughput", ax=ax, hue="type", marker="s")
-    # ax.set_xlabel('Max Utilized Resource')
-    # ax.set_ylabel('Single Core Throughput (TOPS)')
-    # ax.set_xlim(xmin=0)
-    # ax.set_ylim(ymin=0)
-    # ax.legend().set_title(None)
-    # plt.grid(True)
-    # output_filename = base_out_path / 'scaling_analysis_many_cores_eff_2.pdf'
-    # plt.savefig(output_filename, bbox_inches='tight')
-    # plt.clf()
-    # plt.close(fig)
-
-    # sns.set_theme()
-    # fig = plt.figure(figsize=(7, 4.5))
-    # ax = fig.subplots(1, 1)
-    # sns.lineplot(data=selected_dat, x="tensor block util", y="ALM util", ax=ax, hue="type", marker="s")
-    # ax.set_xlabel('#Tensor Blocks')
-    # ax.set_ylabel('ALM Utilization')
-    # ax.set_xlim(xmin=0)
-    # ax.set_ylim(ymin=0)
-    # ax.legend().set_title(None)
-    # plt.grid(True)
-    # output_filename = base_out_path / 'scaling_analysis_routing_util_alm.pdf'
-    # plt.savefig(output_filename, bbox_inches='tight')
-    # plt.clf()
-    # plt.close(fig)
-
-    # sns.set_theme()
-    # fig = plt.figure(figsize=(7, 4.5))
-    # ax = fig.subplots(1, 1)
-    # sns.lineplot(data=selected_dat, x="tensor block util", y="total grid length", ax=ax, hue="type", marker="s")
-    # ax.set_xlabel('#Tensor Blocks')
-    # ax.set_ylabel('Routing Length (#grids crossed)')
-    # ax.set_xlim(xmin=0)
-    # ax.set_ylim(ymin=0)
-    # ax.legend().set_title(None)
-    # plt.grid(True)
-    # output_filename = base_out_path / 'scaling_analysis_routing_len.pdf'
-    # plt.savefig(output_filename, bbox_inches='tight')
-    # plt.clf()
-    # plt.close(fig)
-
-    # sns.set_theme()
-    # fig = plt.figure(figsize=(7, 4.5))
-    # ax = fig.subplots(1, 1)
-    # sns.lineplot(data=selected_dat, x="total grid length", y="avg. throughput", ax=ax, hue="type", marker="s")
-    # ax.set_xlabel('Routing Length (#grids crossed)')
-    # ax.set_ylabel('Average Throughput (TOPS)')
-    # ax.set_xlim(xmin=0)
-    # ax.set_ylim(ymin=0)
-    # ax.legend().set_title(None)
-    # plt.grid(True)
-    # output_filename = base_out_path / 'scaling_analysis_routing_len_tops.pdf'
-    # plt.savefig(output_filename, bbox_inches='tight')
-    # plt.clf()
-    # plt.close(fig)
-
-    # sns.set_theme()
-    # fig = plt.figure(figsize=(7, 4.5))
-    # ax = fig.subplots(1, 1)
-    # sns.lineplot(data=selected_dat, x="ALM util", y="avg. throughput", ax=ax, hue="type", marker="s")
-    # ax.set_xlabel('ALM Utilization')
-    # ax.set_ylabel('Average Throughput (TOPS)')
-    # ax.set_xlim(xmin=0)
-    # ax.set_ylim(ymin=0)
-    # ax.legend().set_title(None)
-    # plt.grid(True)
-    # output_filename = base_out_path / 'scaling_analysis_alms.pdf'
-    # plt.savefig(output_filename, bbox_inches='tight')
-    # plt.clf()
-    # plt.close(fig)
-
-    # sns.set_theme()
-    # fig = plt.figure(figsize=(7, 4.5))
-    # ax = fig.subplots(1, 1)
-    # sns.lineplot(data=selected_dat, x="tensor block util", y="bram_per_tblk", ax=ax, hue="type", marker="s")
-    # ax.set_xlabel('#Tensor Blocks')
-    # ax.set_ylabel('BRAM per Tensor Block')
-    # ax.set_xlim(xmin=0)
-    # ax.set_ylim(ymin=0)
-    # ax.legend().set_title(None)
-    # plt.grid(True)
-    # output_filename = base_out_path / 'scaling_analysis_bram_per_tblk.pdf'
-    # plt.savefig(output_filename, bbox_inches='tight')
-    # plt.clf()
-    # plt.close(fig)
-
-    sns.lineplot(data=selected_dat_freqonly, x="tensor block util", y="freq", ax=ax[1], hue="type", marker="s", alpha=0.8)
-    # mark failed pnr points
-    x_coord, y_coord = [], []
-    for fail_idx, fail_row in failed_pnr_points.iterrows():
-        x_coord += [fail_row["tensor block util"]]
-        y_coord += [fail_row["freq"]]
-
-    color = get_existing_color_by_label_name(ax[1], fail_row["type"])
-    ax[1].plot(x_coord, y_coord, marker='X', linestyle='None', color=color, alpha=0.8,
-             markeredgewidth=0, markersize=10, zorder=10, label='Designs failed to route', clip_on=False)
-
+            color = get_existing_color_by_label_name(ax[1], d)
+            ax[1].plot(x_coord, y_coord, marker='None', linestyle='--', color=color, alpha=0.8,
+                    markeredgewidth=0, markersize=markersize+3, zorder=10, clip_on=False)
+            ax[1].plot(x_coord[-1:], y_coord[-1:], marker='X', linestyle='None', color=color, alpha=0.8,
+                    markeredgewidth=0, markersize=markersize+3, zorder=10, label='Designs failed to route', clip_on=False)
+            
     ax[1].set_xlabel('#Tensor Blocks')
     ax[1].set_ylabel('Frequency (MHz)')
     ax[1].set_xlim(xmin=0)
@@ -2273,9 +2137,9 @@ def plot_scaling(dat: pathlib.Path, designs: list[str]):
             unique_labels.append(label)
             unique_handles.append(handle)
     # Create a single legend for the entire figure, put it on the top center
-    fig.legend(unique_handles, unique_labels, loc='upper center', bbox_to_anchor=(0.5, 1.01),  fontsize=10, ncol=3)
+    fig.legend(unique_handles, unique_labels, loc='upper center', bbox_to_anchor=(0.5, 0.97), ncol=len(unique_labels))
 
-    output_filename = base_out_path / 'scaling_analysis_tops_freq.pdf'
+    output_filename = base_out_path / 'scaling_analysis_tops_freq_new.pdf'
     plt.savefig(output_filename, bbox_inches='tight')
     plt.clf()
     plt.close(fig)
@@ -2283,8 +2147,7 @@ def plot_scaling(dat: pathlib.Path, designs: list[str]):
 if __name__ == "__main__":
     model_names = ["chatglm2-6b-32k", "llama2-7b-chat-4k", "mixtral-8x7b"]
     task_list = ["lcc", "multifieldqa_en", "multifieldqa_zh", "passage_retrieval_zh", "qasper", "samsum", "trec", "vcsum"]
-    # model_names = ["chatglm2-6b-32k"]
-    # task_list = ["lcc"]
+
     ## compute effective sparsity and save them to csv
     # compute_unique_colidx_ratio(task_list, model_names, swindow_list)
     ## processing onchip test results and save them to csv
@@ -2308,21 +2171,21 @@ if __name__ == "__main__":
 
     # getting best config for different hw impl
     # for mname, task in product(model_names, task_list):
-    #     for tc_budget in [68, 204, 336, 540, 624, 720, 840, 960, 1080, 1248, 1440, 1800, 2160, 2520]:
-    #         # design space explore for spmm
-    #         sweep_rr_swindow_get_tops(mname, task, tc_budget, rr2spmm_wrap, 
-    #                               f"./res_fig/block_prune/spmm/{tc_budget}/{mname}-attn-bfp20-{task}")
-    #         # design space explore for sigma
-    #         sweep_rr_swindow_get_tops(mname, task, tc_budget, sigma_wrap, 
-    #                               f"./res_fig/block_prune/sigma/{tc_budget}/{mname}-attn-bfp20-{task}")
-    #         # design space explore for naive round robin
-    #         sweep_rr_swindow_get_tops(mname, task, tc_budget, naive_wrap, 
-    #                               f"./res_fig/block_prune/naive/{tc_budget}/{mname}-attn-bfp20-{task}")
-    #         # design space explore for gemm
-    #         sweep_rr_swindow_get_tops(mname, task, tc_budget, dense_wrap, 
-    #                               f"./res_fig/block_prune/dense/{tc_budget}/{mname}-attn-bfp20-{task}")
+        # for tc_budget in [68, 204, 336, 540, 624, 720, 840, 960, 1080, 1248, 1440, 1800, 2160, 2520]:
+            # # design space explore for spmm
+            # sweep_rr_swindow_get_tops(mname, task, tc_budget, rr2spmm_wrap, 
+            #                         f"./res_fig/block_prune/spmm/{tc_budget}/{mname}-attn-bfp20-{task}")
+            # # design space explore for sigma
+            # sweep_rr_swindow_get_tops(mname, task, tc_budget, sigma_wrap, 
+            #                         f"./res_fig/block_prune/sigma/{tc_budget}/{mname}-attn-bfp20-{task}")
+            # # design space explore for naive round robin
+            # sweep_rr_swindow_get_tops(mname, task, tc_budget, naive_wrap, 
+            #                         f"./res_fig/block_prune/naive/{tc_budget}/{mname}-attn-bfp20-{task}")
+            # # design space explore for gemm
+            # sweep_rr_swindow_get_tops(mname, task, tc_budget, dense_wrap, 
+            #                         f"./res_fig/block_prune/dense/{tc_budget}/{mname}-attn-bfp20-{task}")
 
-    ## getting best config for different hw impl
+    ## getting throughput for different hw impl
     # for mname, task in product(model_names, task_list):
         # design space explore for spmm
         # sweep_rr_swindow_get_tops(mname, task, 0.0, rr2spmm_wrap, 
@@ -2355,11 +2218,11 @@ if __name__ == "__main__":
     # )
 
     ## read processed onchip results
-    # onchip_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/onchip_res_270mhz.csv")
+    onchip_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/onchip_res_300mhz.csv")
     # gemm_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/onchip_res_gemms_300mhz.csv")
     # gemm_emulated_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/synth-gemm/emulated_res_gemms_300mhz.csv")
     ## read effective sparsity data
-    # density_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/spars-analysis-onchip-related.csv")
+    density_df_res = pd.read_csv("/compas-old/projects/sparse-attention/onchip-5hbm/spars-analysis-onchip-related.csv")
 
     # print(gemm_emulated_df_res)
     ## plotting figures
@@ -2371,7 +2234,7 @@ if __name__ == "__main__":
     # plot_route_ratio_by_task(density_df_res)
     # plot_unique_colidx_ratio_by_swindow(density_df_res, 8)
     # plot_redunt_colidx_ratio_distribution()
-    # plot_speedup_vs_sparsity(onchip_df_res, density_df_res)
+    plot_speedup_vs_sparsity(onchip_df_res, density_df_res)
     # plot_roofline(onchip_df_res, density_df_res, {"r": 6, "c": 12, "l": 8, "freq": 300})
 
     # # read onchip results for different thresholds
@@ -2384,8 +2247,8 @@ if __name__ == "__main__":
     # # plot speedup vs score
     # plot_thres_tops_score(onchip_df_res_list, prune_score_eval_res)
     ## plot scaling results
-    plot_scaling(pathlib.Path("./res_fig/block_prune/scaling_analysis"), 
-                 ["Block-agg. SpMM", "SIGMA SpMM", "Non-block-agg. SpMM", "GEMM"])
+    # plot_scaling(pathlib.Path("./res_fig/block_prune/scaling_analysis"), 
+    #              ["Block-agg. SpMM", "SIGMA SpMM", "GEMM"])
     
     # attn_path_chatglm = inst_list[0] + ".pt"
     # src_attn = torch.load(attn_path_chatglm).numpy()
