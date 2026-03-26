@@ -497,16 +497,16 @@ def plot_unique_colidx_ratio_boxplot_by_task(records: pd.DataFrame):
         x = "tasks", 
         y = "effective sparsity",
         hue = "model",
-        legend=True,
+        legend=False,
         palette={k:v[1] for k, v in zip(MODEL_PALETTE.keys(), MODEL_PALETTE.values())},
         gap=.1,
         width=0.9,
         flierprops={"alpha": 0.3},
         whis=[1,99], 
-        ax=axes[0]
+        ax=axes[1]
     )
 
-    errorbar_ax = axes[0].twiny()
+    errorbar_ax = axes[1].twiny()
     mean_sparsity = selected_records[["model", "tasks", "effective sparsity"]] \
                         .groupby(["model", "tasks"]).mean()["effective sparsity"]
     print(f"{mean_sparsity}")
@@ -524,12 +524,10 @@ def plot_unique_colidx_ratio_boxplot_by_task(records: pd.DataFrame):
         linestyle="none",
         palette={k:v[0] for k, v in zip(MODEL_PALETTE.keys(), MODEL_PALETTE.values())},
     )
-    axes[0].set(ylim=(-0.01, 1.01))
-    axes[0].legend(title=None)
-    axes[0].set_xticklabels([])
-    axes[0].set_xlabel("")
-    axes[0].set_ylabel("Effective sparsity")
-    axes[0].tick_params(bottom=False)
+    axes[1].set(ylim=(-0.01, 1.01))
+    axes[1].set_ylabel("Effective sparsity")
+    axes[1].set_xlabel("Tasks")
+    errorbar_ax.set_xlim(axes[1].get_xlim())
     errorbar_ax.set_xticklabels([])
     errorbar_ax.set_xlabel("")
     errorbar_ax.tick_params(top=False) 
@@ -539,16 +537,16 @@ def plot_unique_colidx_ratio_boxplot_by_task(records: pd.DataFrame):
         x = "tasks", 
         y = "original sparsity",
         hue = "model",
-        legend=False,
+        legend=True,
         palette={k:v[1] for k, v in zip(MODEL_PALETTE.keys(), MODEL_PALETTE.values())},
         width=0.9,
         gap=.1,
         flierprops={"alpha": 0.5},
         whis=[1,99], 
-        ax=axes[1]
+        ax=axes[0]
     )
 
-    errorbar_ax = axes[1].twiny()
+    errorbar_ax = axes[0].twiny()
     sns.pointplot(
         data=selected_records, 
         x="tasks", 
@@ -563,24 +561,51 @@ def plot_unique_colidx_ratio_boxplot_by_task(records: pd.DataFrame):
         palette={k:v[0] for k, v in zip(MODEL_PALETTE.keys(), MODEL_PALETTE.values())},
     )
 
-    axes[1].set(ylim=(-0.01, 1.01))
-    axes[1].set_ylabel("Pre-aggregation sparsity")
-    axes[1].set_xlabel("Tasks")
+    axes[0].set(ylim=(-0.01, 1.01))
+    axes[0].set_ylabel("Pre-aggregation sparsity")
+    axes[0].set_xlabel("")
+    axes[0].set_xticklabels([])
+    axes[0].tick_params(bottom=False)
+    axes[0].legend(title=None)
+    errorbar_ax.set_xlim(axes[0].get_xlim())
     errorbar_ax.set_xticklabels([])
     errorbar_ax.set_xlabel("")
     errorbar_ax.tick_params(top=False, bottom=False)
+
     labels = [label.get_text() for label in axes[1].get_xticklabels()]
     original_ticks = axes[1].get_xticks()
     axes[1].set_xticklabels(labels, rotation=30, ha='right')
     axes[1].set_xticks([ox + 0.2 for ox in original_ticks])
     axes[1].tick_params(top=False, bottom=False)
     sns.move_legend(axes[0], "upper center", ncol=3, bbox_to_anchor=(0.5, 1.25))
-    plt.savefig(f"./res_fig/block_prune/effective_sparsity_boxplot.png", bbox_inches='tight')
+    plt.savefig(f"./res_fig/block_prune/effective_sparsity_boxplot_highdpi.png", dpi=400, bbox_inches='tight')
+
+    # plot mixed-task version of the plot
+    # sns.set(rc={'figure.figsize': (10, 6)}, font_scale=1.3)
+    # sns.set_style("whitegrid", {'grid.linestyle': '--'})
+    # fig, axes = plt.subplots(1, 1)
+    # plt.subplots_adjust(hspace=0.2)
+
+    # use sns barplot to plot average of the sparsity on y axis
+    # distinguish the original sparsity and effective sparsity on x axis
+    # using "model" as hue
+    # plot_df = selected_records.melt(id_vars="model", value_vars=["original sparsity", "effective sparsity"], 
+    #                                var_name="Sparsity Type", value_name="Sparsity")
+    # sns.barplot(data=plot_df, x="Sparsity Type", y="Sparsity", hue="model", ax=axes,
+    #             errorbar="sd", err_kws={'linewidth': 5},
+    #             palette={k: v[0] for k, v in zip(MODEL_PALETTE.keys(), MODEL_PALETTE.values())})
+    # axes.set_ylim(0, 1)
+    # axes.set_ylabel("Average attention head sparsity")
+    # axes.set_xlabel("")
+    # axes.set_xticklabels(["Before block aggregation", "After block aggregation"])
+    # axes.legend(title=None)
+    # sns.move_legend(axes, "upper center", ncol=3, bbox_to_anchor=(0.5, 1.15))
+    # plt.savefig(f"./res_fig/block_prune/effective_sparsity_boxplot_mixed_task_highdpi.png", dpi=200, bbox_inches='tight')
 
     # vertical version of the boxplot
     sns.set(rc={'figure.figsize': (10, 11)}, font_scale=1.3)
     sns.set_style("whitegrid", {'grid.linestyle': '--'})
-    fig, axes = plt.subplots(1,2)
+    fig, axes = plt.subplots(1,1)
     plt.subplots_adjust(wspace=0.1)
 
     lm = sns.boxplot(
@@ -593,10 +618,10 @@ def plot_unique_colidx_ratio_boxplot_by_task(records: pd.DataFrame):
         gap=.1,
         flierprops={"alpha": 0.5},
         whis=[1,99], 
-        ax=axes[0]
+        ax=axes
     )
 
-    errorbar_ax = axes[0].twiny()
+    errorbar_ax = axes.twinx()
     sns.pointplot(
         data=selected_records, 
         x= "effective sparsity",
@@ -611,35 +636,40 @@ def plot_unique_colidx_ratio_boxplot_by_task(records: pd.DataFrame):
         palette={k:v[0] for k, v in zip(MODEL_PALETTE.keys(), MODEL_PALETTE.values())},
     )
     
-    labels = [label.get_text() for label in axes[0].get_yticklabels()]
-    axes[0].set_yticklabels(labels, rotation=40)
-    axes[0].set(xlim=(-0.01, 1.01))
-    axes[0].set_xlabel("Effective sparsity")
-    axes[0].set_ylabel("Tasks")
-    axes[0].tick_params(bottom=False)
-    axes[0].legend(title=None)
+    # labels = [label.get_text() for label in axes.get_yticklabels()]
+    # axes.set_yticklabels(labels, rotation=40)
+    axes.set(xlim=(-0.01, 1.01))
+    axes.set_xlabel("Effective sparsity")
+    axes.set_ylabel("Tasks")
+    axes.tick_params(bottom=False)
+    axes.legend(title=None)
+    errorbar_ax.set_xlim(axes.get_xlim())
     errorbar_ax.grid(visible=False)
-    errorbar_ax.set_xticklabels([])
-    errorbar_ax.set_xlabel("")
+    errorbar_ax.set_yticklabels([])
+    errorbar_ax.set_ylabel("")
     errorbar_ax.tick_params(top=False) 
-    sns.move_legend(axes[0], "upper center", ncol=3, bbox_to_anchor=(1.06, 1.07))
-    # plt.savefig(f"./res_fig/block_prune/effective_sparsity_boxplot_vertical_upper.png", bbox_inches='tight', dpi=400)
+    sns.move_legend(axes, "upper center", ncol=3, bbox_to_anchor=(0.5, 1.06))
+    plt.savefig(f"./res_fig/block_prune/effective_sparsity_boxplot_vertical_upper.png", bbox_inches='tight', dpi=400)
 
-    # fig, axes = plt.subplots(1,1)
+    sns.set(rc={'figure.figsize': (10, 11)}, font_scale=1.3)
+    sns.set_style("whitegrid", {'grid.linestyle': '--'})
+    fig, axes = plt.subplots(1,1)
+    plt.subplots_adjust(wspace=0.1)
+
     lm = sns.boxplot(
         data=selected_records, 
         x = "original sparsity",
         y = "tasks",
         hue = "model",
-        legend=False,
+        legend=True,
         palette={k:v[1] for k, v in zip(MODEL_PALETTE.keys(), MODEL_PALETTE.values())},
         gap=.1,
         flierprops={"alpha": 0.5},
         whis=[1,99], 
-        ax=axes[1]
+        ax=axes
     )
 
-    errorbar_ax = axes[1].twiny()
+    errorbar_ax = axes.twinx()
     sns.pointplot(
         data=selected_records, 
         x="original sparsity", 
@@ -653,16 +683,17 @@ def plot_unique_colidx_ratio_boxplot_by_task(records: pd.DataFrame):
         linestyle="none",
         palette={k:v[0] for k, v in zip(MODEL_PALETTE.keys(), MODEL_PALETTE.values())},
     )
-    axes[1].set(xlim=(-0.01, 1.01))
-    axes[1].set_xlabel("Pre-aggregation sparsity")
-    axes[1].set_ylabel("")
-    axes[1].set_yticklabels([])
+    axes.set(xlim=(-0.01, 1.01))
+    axes.set_xlabel("Pre-aggregation sparsity")
+    axes.set_ylabel("Tasks")
+    axes.legend(title=None)
+    errorbar_ax.set_xlim(axes.get_xlim())
     errorbar_ax.grid(visible=False)
-    errorbar_ax.set_xticklabels([])
-    errorbar_ax.set_xlabel("")
+    errorbar_ax.set_yticklabels([])
+    errorbar_ax.set_ylabel("")
     errorbar_ax.tick_params(top=False) 
-    # sns.move_legend(axes, "upper center", ncol=3, bbox_to_anchor=(0.5, 1.05))
-    plt.savefig(f"./res_fig/block_prune/effective_sparsity_boxplot_vertical_2col.png", bbox_inches='tight', dpi=400)
+    sns.move_legend(axes, "upper center", ncol=3, bbox_to_anchor=(0.5, 1.06))
+    plt.savefig(f"./res_fig/block_prune/effective_sparsity_boxplot_vertical_lower.png", bbox_inches='tight', dpi=400)
 
 
 def plot_route_ratio_by_task(records: pd.DataFrame):
@@ -1370,7 +1401,7 @@ def plot_onchip_res(dat: pd.DataFrame):
     dat = dat.drop(columns=["inst_id"])
     # calculate the mean of onchip_tp of different inst_id for the same model and task
     dat_mean = dat.groupby(["model", "task"]).mean()
-    # print(f"speedup by tasks: {dat_mean.to_string()}")
+    print(f"speedup by tasks: {dat_mean.to_string()}")
     dat_overall_mean = dat.drop(columns=["task"]).groupby("model").mean().reset_index()
     print(f"over all speedup by models: \n{dat_overall_mean[['model', 'onchip_comp_tp']].to_markdown()}")
 
@@ -1386,8 +1417,14 @@ def plot_onchip_res(dat: pd.DataFrame):
     sns.set(rc={'figure.figsize':(8, 4.5)}, font_scale=1.3)
     fig, axes = plt.subplots(1, 1)
     curr_model_palette = {k:MODEL_PALETTE[k][0] for k in MODEL_PALETTE.keys()}
-    sns.barplot(dat_mean, x="task", y="comp_speedup", hue="model", width=0.65, 
-                        palette=curr_model_palette, ax=axes)    
+    sns.barplot(dat, x="task", y="comp_speedup", hue="model", width=0.65, 
+                        palette=curr_model_palette, ax=axes, 
+                        errorbar="se", capsize=0.4, 
+                        err_kws={
+                            'linewidth': 1.2,
+                            'color': 'black'
+    })
+
     labels = [label.get_text() for label in axes.get_xticklabels()]
     original_ticks = axes.get_xticks()
     axes.set_xticklabels(labels, rotation=30, ha='right')
@@ -1396,21 +1433,21 @@ def plot_onchip_res(dat: pd.DataFrame):
     axes.set_xlabel("Tasks")
     axes.set_ylim(ymin=0, ymax=5.5)
     axes.legend(loc="upper center", ncol=3, bbox_to_anchor=(0.5, 1.15))
-    fig.savefig("./res_fig/block_prune/onchip_res_total_speedup.pdf", bbox_inches='tight')
+    fig.savefig("./res_fig/block_prune/onchip_res_total_speedup_err.pdf", bbox_inches='tight')
     fig.clf()
 
     # vertical version of the same plot as above
     sns.set(rc={'figure.figsize':(8, 8)}, font_scale=1.3)
     fig, axes = plt.subplots(1, 1)
     
-    sns.barplot(dat_mean, x="comp_speedup", y="task", hue="model", width=0.8, 
-                        palette=curr_model_palette, ax=axes, legend=True)
+    sns.barplot(dat, x="comp_speedup", y="task", hue="model", width=0.8, 
+                        palette=curr_model_palette, ax=axes, errorbar="se", capsize=0.2, legend=True)
     axes.set_ylabel("Tasks")
     axes.set_xlabel("Average normalized throughput of heads")
     axes.set_xlim(xmin=0, xmax=4.5)
     axes.legend(title=None)
     sns.move_legend(axes, "upper center", ncol=3, bbox_to_anchor=(0.5, 1.09))
-    fig.savefig("./res_fig/block_prune/onchip_res_total_speedup_vertical.pdf", bbox_inches='tight')
+    fig.savefig("./res_fig/block_prune/onchip_res_total_speedup_vertical_err.pdf", bbox_inches='tight')
     fig.clf()
 
     # calculate onchip and offchip bandwidth
@@ -1527,47 +1564,61 @@ def plot_speedup_vs_sparsity(hw_perf_df: pd.DataFrame, density_df: pd.DataFrame)
     models = ["llama2-7b-chat-4k", "chatglm2-6b-32k", "mixtral-8x7b"]
     tasks = ["lcc", "multifieldqa_en", "multifieldqa_zh", "passage_retrieval_zh", "qasper", "samsum", "trec", "vcsum"]
     
-    sns.set(rc={'figure.figsize':(15, 15)}, font_scale=3.4)
-    fig, axes = plt.subplots(1, 1)
+    sns.set_theme()
+    sns.set(font_scale=1.5)
+    fig = plt.figure(figsize=(10, 6.5))
+    plt.subplots_adjust(wspace=0.3)
+    axes = fig.subplots(1, 2)
     dat_sampled = dat.groupby('model').apply(lambda x: x.sample(n=200, random_state=42)).reset_index(drop=True)
     sns.scatterplot(
         dat_sampled, 
         x="effec head sparsity", 
         y="comp_speedup", 
-        s=400, 
-        ax=axes,
+        s=150, 
+        ax=axes[0],
         alpha=0.65,
         hue="model",
         palette=curr_model_palette,
-        style="model",
-        legend=False,
+        style="model"
     )
     
-    axes.set_ylabel("Normalized throughput per head")
-    axes.set_xlabel(f"Effective sparsity per head")
-    axes.set_ylim(ymin=-0.01)
-    axes.set_xlim(xmin=-0.01, xmax=1)
-
-    fig.savefig("./res_fig/block_prune/speedup_vs_sparsity.pdf", dpi=1200, bbox_inches='tight')
-    fig.clf()
+    axes[0].set_ylabel("Normalized throughput per head")
+    axes[0].set_xlabel(f"Effective sparsity per head")
+    axes[0].set_ylim(ymin=-0.01)
+    axes[0].set_xlim(xmin=-0.01, xmax=1)
 
     # plot speedup vs seq len
     dat_inst_mean = hw_perf_df.groupby(["model", "task", "inst_id"]).mean()
-    sns.set(rc={'figure.figsize':(15, 15)}, font_scale=3.5)
-    fig, axes = plt.subplots(1, 1)
-
     sns.scatterplot(dat_inst_mean, x="seq_len", y="comp_speedup",
-                    s=300, alpha=0.8, hue="model", style="model", 
-                    palette=curr_model_palette, ax=axes, legend=True)
+                    s=150, alpha=0.8, hue="model", style="model", 
+                    palette=curr_model_palette, ax=axes[1])
         
-    axes.set_ylabel("Average normalized throughput\n per instance")
-    axes.set_xlabel("Context length")
-    axes.set_ylim(ymin=-0.1, ymax=5.5)
-    axes.set_xlim(xmin=-0.1)
-    axes.legend(title=None)
-    sns.move_legend(axes, "upper center", ncol=3, bbox_to_anchor=(0.5, 1.15))
+    axes[1].set_ylabel("Average normalized throughput\n per instance")
+    axes[1].set_xlabel("Context length")
+    axes[1].set_ylim(ymin=-0.01, ymax=5.5)
+    axes[1].set_xlim(xmin=-0.01)
 
-    fig.savefig("./res_fig/block_prune/onchip_res_speedup_vs_seqlen.pdf", bbox_inches='tight')
+
+    axes[0].legend().set_visible(False)
+    axes[1].legend().set_visible(False)
+    # enable and put legend on the top of entire figure
+    # first get legends from both subplots, and keep only one for each label
+    # then put them together and create a new legend for the entire figure
+    handles1, labels1 = axes[0].get_legend_handles_labels()
+    handles2, labels2 = axes[1].get_legend_handles_labels()
+    all_handles = handles1 + handles2
+    all_labels = labels1 + labels2
+    hl = zip(all_labels, all_handles)
+    all_labels, all_handles = zip(*hl)
+    unique_labels, unique_handles = [], []
+    for label, handle in zip(all_labels, all_handles):
+        if label not in unique_labels:
+            unique_labels.append(label)
+            unique_handles.append(handle)
+    # Create a single legend for the entire figure, put it on the top center
+    fig.legend(unique_handles, unique_labels, loc='upper center', bbox_to_anchor=(0.5, 0.97), ncol=len(unique_labels))
+
+    fig.savefig("./res_fig/block_prune/speedup_and_spar_and_seqlen.pdf", bbox_inches='tight')
     fig.clf()
 
     sns.set(rc={'figure.figsize':(15, 15)}, font_scale=3.4)
@@ -1966,7 +2017,10 @@ def plot_thres_tops_score(onchip_res_list: dict[pd.DataFrame], scores_list: dict
         avg_spars_by_models[m] = \
             (np.array(avg_spars_by_models[m]) / len(tasks)).tolist()
     
+    print("avg_scores")
     print(avg_scores_by_models)
+    print("avg_spars")
+    print(avg_spars_by_models)
     # get list of average tops over tasks, for each model, each threshold
     avg_tps_by_models = {m:[] for m in models}
     for thres, onchip_dat in onchip_res_list.items():
@@ -2068,9 +2122,9 @@ def plot_scaling(dat: pathlib.Path, designs: list[str]):
 
     sns.set_theme()
     sns.set(font_scale=1.3)
-    fig = plt.figure(figsize=(10, 6.5))
+    fig = plt.figure(figsize=(6.5, 12))
     plt.subplots_adjust(wspace=0.25)
-    ax = fig.subplots(1, 2)
+    ax = fig.subplots(2, 1)
     markersize = 9.5
     sns.lineplot(data=succeeded_pnr_points, x="tensor block util", y="avg. throughput all", 
                  ax=ax[0], hue="type", marker="s", alpha=0.8, palette=type_palette, markersize=markersize)
@@ -2137,9 +2191,9 @@ def plot_scaling(dat: pathlib.Path, designs: list[str]):
             unique_labels.append(label)
             unique_handles.append(handle)
     # Create a single legend for the entire figure, put it on the top center
-    fig.legend(unique_handles, unique_labels, loc='upper center', bbox_to_anchor=(0.5, 0.97), ncol=len(unique_labels))
+    fig.legend(unique_handles, unique_labels, loc='upper center', bbox_to_anchor=(0.5, 0.97), ncol=2)
 
-    output_filename = base_out_path / 'scaling_analysis_tops_freq_new.pdf'
+    output_filename = base_out_path / 'scaling_analysis_tops_freq.pdf'
     plt.savefig(output_filename, bbox_inches='tight')
     plt.clf()
     plt.close(fig)
@@ -2230,25 +2284,25 @@ if __name__ == "__main__":
     # plot_stacked_selfattn_ops_latency(gemm_df_res, out_fig_path=pathlib.Path("./res_fig/dense_lat_ops_seqlen.pdf"))
     # plot_stacked_selfattn_ops_latency(gemm_emulated_df_res, out_fig_path=pathlib.Path("./res_fig/dense_lat_ops_seqlen_emulated.pdf"))
     # eval_emulator(onchip_df_res, model_names, task_list)
-    # plot_unique_colidx_ratio_boxplot_by_task(density_df_res)
+    plot_unique_colidx_ratio_boxplot_by_task(density_df_res)
     # plot_route_ratio_by_task(density_df_res)
     # plot_unique_colidx_ratio_by_swindow(density_df_res, 8)
     # plot_redunt_colidx_ratio_distribution()
-    plot_speedup_vs_sparsity(onchip_df_res, density_df_res)
+    # plot_speedup_vs_sparsity(onchip_df_res, density_df_res)
     # plot_roofline(onchip_df_res, density_df_res, {"r": 6, "c": 12, "l": 8, "freq": 300})
 
     # # read onchip results for different thresholds
     # onchip_df_res_list = {}
     # for i in ["1x", "2x", "3x", "4x"]:
     #     onchip_df_res_list[i] = pd.read_csv(f"/compas-old/projects/sparse-attention/micro25/onchip/onchip_res_t{i}_300mhz.csv")
-    # # # read longbench scores
+    # # read longbench scores
     # with pathlib.Path("./res_fig/block_prune/formatted_data_longbench.json").open("r") as f:
     #     prune_score_eval_res = json.load(f)
     # # plot speedup vs score
     # plot_thres_tops_score(onchip_df_res_list, prune_score_eval_res)
     ## plot scaling results
-    # plot_scaling(pathlib.Path("./res_fig/block_prune/scaling_analysis"), 
-    #              ["Block-agg. SpMM", "SIGMA SpMM", "GEMM"])
+    plot_scaling(pathlib.Path("./res_fig/block_prune/scaling_analysis"), 
+                 ["Block-agg. SpMM", "SIGMA SpMM", "GEMM"])
     
     # attn_path_chatglm = inst_list[0] + ".pt"
     # src_attn = torch.load(attn_path_chatglm).numpy()
